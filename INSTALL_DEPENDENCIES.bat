@@ -6,16 +6,9 @@ title NASCAR Modding App - install packages
 rem You normally do not need this file: START_APP.bat installs the packages by
 rem itself on first run. Use this when you want to install or repair them alone.
 
-set "PYEXE="
-for %%C in ("py -3" "python" "python3") do (
-  if not defined PYEXE (
-    for /f "delims=" %%V in ('%%~C -c "print('PYOK')" 2^>nul') do (
-      if "%%V"=="PYOK" set "PYEXE=%%~C"
-    )
-  )
-)
+call "%~dp0FIND_PYTHON.bat"
 
-if not defined PYEXE (
+if not defined PYTHON_CMD if not defined PYTHON_FOUND (
   echo.
   echo   Python was not found on this PC.
   echo.
@@ -28,30 +21,33 @@ if not defined PYEXE (
   exit /b 1
 )
 
-for /f "delims=" %%V in ('%PYEXE% -c "import sys;print(str(sys.version_info[0])+chr(46)+str(sys.version_info[1]))" 2^>nul') do set "PYVER=%%V"
-echo Found Python %PYVER% via "%PYEXE%".
-echo.
-
-%PYEXE% -c "import sys;raise SystemExit(0 if sys.version_info>=(3,10) else 1)" >nul 2>nul
-if errorlevel 1 (
-  echo   Python %PYVER% is too old. Python 3.10 or newer is needed.
+if not defined PYTHON_CMD (
+  echo   Python was found, but no Python 3.10 or newer interpreter could run.
+  echo   Detected versions:
+  py -3 --version 2>nul
+  python --version 2>nul
+  python3 --version 2>nul
   echo   Install a current version from  https://www.python.org/downloads/
   echo.
   pause
   exit /b 1
 )
 
-echo Installing Flask, Pillow and NumPy...
+for /f "delims=" %%V in ('%PYTHON_CMD% -c "import sys;print(str(sys.version_info[0])+chr(46)+str(sys.version_info[1]))" 2^>nul') do set "PYVER=%%V"
+echo Found Python %PYVER% via "%PYTHON_CMD%".
 echo.
-%PYEXE% -m pip install --upgrade pip
-%PYEXE% -m pip install -r requirements.txt
+
+echo Installing native desktop and legacy compatibility dependencies...
+echo.
+%PYTHON_CMD% -m pip install --upgrade pip
+%PYTHON_CMD% -m pip install -r requirements.txt
 if errorlevel 1 goto failed
 
-%PYEXE% -c "import flask, PIL, numpy" >nul 2>nul
+%PYTHON_CMD% -c "import flask, PIL, numpy, PySide6, OpenGL" >nul 2>nul
 if errorlevel 1 goto failed
 
 echo.
-echo   All three packages are installed and working.
+echo   All required packages are installed and working.
 echo   You can now run START_APP.bat.
 echo.
 pause

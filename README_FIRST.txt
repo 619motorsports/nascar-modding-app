@@ -1,15 +1,26 @@
-NASCAR MODDING APP v1.0.2
+NASCAR MODDING APP - NATIVE DESKTOP
 
 QUICK START
-1. Extract the entire folder.
-2. Run START_APP.bat.
-3. If prompted, run INSTALL_DEPENDENCIES.bat once.
-4. Choose your NASCAR 15 installation folder.
-
-UPDATING FROM AN OLDER VERSION
-Installed mods remain in the game files. Open v1.0.2, choose the same NASCAR 15 folder, and the app scans the live game files for existing paints, added schemes, and menu thumbnails. Importing old app settings is optional and is only needed for interface preferences, favorites, saved source images, or edit history.
+1. Extract the entire folder outside OneDrive.
+2. Packaged release: run NASCARModdingApp.exe (Python is not required).
+   Source checkout: run START_APP.bat with Python 3.10 or newer.
+3. Choose NASCAR The Game: 2013, NASCAR '14, or NASCAR 15.
+4. Select the game folder that contains the data folder.
 
 SAFETY
-Close NASCAR 15 before applying or restoring changes. The app creates safety backups before writing.
+Close the game before applying or restoring changes. The app keeps pristine
+archive/index backups and verifies every edit after writing.
 
-See TROUBLESHOOTING.txt if the app does not start or cannot find the game.
+ADVANCED LEGACY TOOLS
+START_LEGACY_WEB_APP.bat opens the old web compatibility interface for advanced
+audio, duplicate/custom schedule-event, and team-asset workflows not yet in the native UI.
+Raw indexed-resource/repoint, interface-text, paired backup/restore, Player/AI
+racing controls, and exact-field game-database workflows are available directly
+in the native app, along with decoded texture-bank export and guarded replacement.
+Driver-name and AI-rating edits still use the same shared backend.
+
+NTG 2013
+The active mapping is the 2013 season. SPRINTNUMS2012 and other dormant 2012
+leftovers are not mixed into the editable 2013 roster.
+
+See README.md and TROUBLESHOOTING.txt for more information.

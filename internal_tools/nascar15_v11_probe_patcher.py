@@ -15,8 +15,15 @@ from __future__ import annotations
 import argparse
 import shutil
 import struct
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+try:
+    from nascar_modding.core.cdf import read_cdf
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from nascar_modding.core.cdf import read_cdf
 
 
 TRACK_ALIASES = {
@@ -74,43 +81,16 @@ class CdfEntry:
     entry_offset: int
 
 
-def find_string_base(cdf: bytes) -> int:
-    marker = b"NAS4\\LANG\\"
-    pos = cdf.find(marker)
-    if pos < 0:
-        raise ValueError("Could not find cdfiles string table marker NAS4\\LANG\\")
-    # Name offsets in this cdfiles format are relative to one byte before the
-    # first visible string. Earlier NASCAR 15 tools call this the string base.
-    return pos - 1
-
-
 def read_cdfiles(cdfiles_path: Path) -> dict[str, CdfEntry]:
-    cdf = cdfiles_path.read_bytes()
-    if cdf[:4] != b"filC":
-        raise ValueError("cdfiles.dat does not start with filC")
-
-    count = struct.unpack_from("<I", cdf, 0x20)[0]
-    string_base = find_string_base(cdf)
     entries: dict[str, CdfEntry] = {}
-
-    for i in range(count):
-        entry_offset = 0x40 + i * 32
-        if entry_offset + 32 > len(cdf):
-            break
-
-        _typ, name_off, size, _u1, _u2, archive_offset, _flags, _u3 = struct.unpack_from(
-            "<IIIIIIII", cdf, entry_offset
+    for entry in read_cdf(cdfiles_path):
+        entries[entry.name.upper()] = CdfEntry(
+            entry.index,
+            entry.name,
+            entry.size,
+            entry.archive_offset,
+            entry.record_offset,
         )
-        name_pos = string_base + name_off
-        if not (0 <= name_pos < len(cdf)):
-            continue
-        end = cdf.find(b"\x00", name_pos)
-        if end < 0:
-            continue
-
-        name = cdf[name_pos:end].decode("latin1", "replace")
-        entries[name.upper()] = CdfEntry(i, name, size, archive_offset, entry_offset)
-
     return entries
 
 

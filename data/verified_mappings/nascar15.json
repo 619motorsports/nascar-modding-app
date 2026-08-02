@@ -1,0 +1,224 @@
+{
+  "format": "nascar-modding-app-live-mapping-audit-v2",
+  "generated_utc": "2026-08-01T20:44:42.253218+00:00",
+  "game_id": "nascar15",
+  "game_name": "NASCAR 15",
+  "install_folder": "NASCAR 15",
+  "profile": {
+    "content_season": 2015,
+    "season_prefix": "15",
+    "required_archives": [
+      "0",
+      "2"
+    ],
+    "paint_primary_archive": "2",
+    "number_container": "SPRINTNUMS2015.ARC",
+    "series_uid": 25040,
+    "livery_style": "numbered_season",
+    "primary_livery_patterns": [
+      "^LIVERY_(14|15)_(\\d+[A-Z]?)_(.+?)\\.ARC$"
+    ],
+    "dormant_livery_patterns": [],
+    "dormant_number_containers": []
+  },
+  "indexes": [
+    {
+      "archive": "0",
+      "archive_size": 751620800,
+      "index_file": "cdfiles.dat",
+      "index_size": 146831,
+      "index_sha256": "99db345bcdd2124eeb50107eb1d64b7aa1e6fd91d2eea789785a6be680a15ad7",
+      "entries": 1489,
+      "layouts": {
+        "A": 1489
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "1",
+      "archive_size": 469848784,
+      "index_file": "cdfiles1.dat",
+      "index_size": 81693,
+      "index_sha256": "de7fab6cae5ae3ac643dcc8172d1cbb597b3cb718d8d6bffc32ec3b7c38566ec",
+      "entries": 852,
+      "layouts": {
+        "B": 852
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "2",
+      "archive_size": 684331936,
+      "index_file": "cdfiles2.dat",
+      "index_size": 21031,
+      "index_sha256": "bbed6694754d195d239b11645e4a2126b89dc261274f67fde3fdd565db320d98",
+      "entries": 196,
+      "layouts": {
+        "B": 196
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "3",
+      "archive_size": 856798096,
+      "index_file": "cdfiles3.dat",
+      "index_size": 48463,
+      "index_sha256": "4fff5bc2e4e35aa730155433a6d3a56f63b4099fa1d01445421d7bd16b013af2",
+      "entries": 479,
+      "layouts": {
+        "B": 479
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "4",
+      "archive_size": 1092130816,
+      "index_file": "cdfiles4.dat",
+      "index_size": 5103,
+      "index_sha256": "9a983bc111caf60760b5ec5b3e8991e44b59372243d0e5e33bef3c043722a119",
+      "entries": 50,
+      "layouts": {
+        "B": 50
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "5",
+      "archive_size": 1005256160,
+      "index_file": "cdfiles5.dat",
+      "index_size": 4063,
+      "index_sha256": "9f59f0453c568a92c212c090ed8e3483f05c77a870a0d9c6a4a277ae350a03d8",
+      "entries": 39,
+      "layouts": {
+        "B": 39
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "6",
+      "archive_size": 1321619016,
+      "index_file": "cdfiles6.dat",
+      "index_size": 5824,
+      "index_sha256": "0696f99d10f0c77b849d858796628ffaa0dfe184d35fceaf67b6b5566c55871e",
+      "entries": 58,
+      "layouts": {
+        "B": 58
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "7",
+      "archive_size": 298676936,
+      "index_file": "cdfiles7.dat",
+      "index_size": 1847,
+      "index_sha256": "b268c9fccf2d497950c4f90bf2e081493526c024524a9ba83b4d6a37b4f84352",
+      "entries": 15,
+      "layouts": {
+        "B": 15
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "314",
+      "archive_size": 300096,
+      "index_file": "cdfiles314.dat",
+      "index_size": 3389,
+      "index_sha256": "9e073bfe24728ec26181d8dfc1a9e87dbf06ef5ad70a35e50bcf5e11b8bf1e7d",
+      "entries": 34,
+      "layouts": {
+        "B": 34
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "544386974",
+      "archive_size": 129215992,
+      "index_file": "cdfiles544386974.dat",
+      "index_size": 8977,
+      "index_sha256": "685ab7684e25ce93c6ca1c05b280c33235cd9a9b3a16f75ed9c9561744737d05",
+      "entries": 73,
+      "layouts": {
+        "B": 73
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "1467326216",
+      "archive_size": 57429576,
+      "index_file": "cdfiles1467326216.dat",
+      "index_size": 4311,
+      "index_sha256": "5b70be4933cef6b9c2ce91be449f4cad8252639f0a3595fdc0b83f93e5f17c85",
+      "entries": 33,
+      "layouts": {
+        "B": 33
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "3189127741",
+      "archive_size": 143573952,
+      "index_file": "cdfiles3189127741.dat",
+      "index_size": 9899,
+      "index_sha256": "c4ed8bd17c941959ebc616e022007e28a412195ea9d31b2f890948fdc7c1a940",
+      "entries": 81,
+      "layouts": {
+        "B": 81
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "3464285874",
+      "archive_size": 71786936,
+      "index_file": "cdfiles3464285874.dat",
+      "index_size": 5259,
+      "index_sha256": "9d777189b0ba86a330c8a8708d553c9ce6f6246a9d052130a41e4ed02b5e88c0",
+      "entries": 41,
+      "layouts": {
+        "B": 41
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "3706994145",
+      "archive_size": 32191272,
+      "index_file": "cdfiles3706994145.dat",
+      "index_size": 2471,
+      "index_sha256": "7cb94f306909f661cb2b82936a1ee4244a50c507685472701c48af3e3e6fc846",
+      "entries": 17,
+      "layouts": {
+        "B": 17
+      },
+      "out_of_bounds": []
+    }
+  ],
+  "facts": {
+    "total_entries": 3457,
+    "expected_livery_entries": 100,
+    "dormant_livery_entries": 0,
+    "number_container_hits": [
+      {
+        "archive": "0",
+        "name": "SPRINTNUMS2015.ARC"
+      }
+    ],
+    "database_hits": {
+      "DB_GAME_LOCAL_SCRIPT.PYC": [
+        "0"
+      ],
+      "DB_AICONFIG_SCRIPT.PYC": [
+        "0"
+      ]
+    },
+    "body_models": [
+      {
+        "archive": "3",
+        "name": "NASCAR6_BODY0_0.ARC",
+        "size": 6368981,
+        "magic": "ARCC",
+        "verified": true
+      }
+    ]
+  },
+  "ok": true,
+  "errors": []
+}

@@ -1,97 +1,83 @@
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
-title NASCAR Modding App
+title NASCAR Modding App - Native Desktop
 
-rem ---------------------------------------------------------------- find Python
-rem Try the py launcher first, then python, then python3. Each candidate must
-rem actually print PYOK: the Microsoft Store ships a "python.exe" stub that
-rem silently opens the Store instead of running anything.
-set "PYEXE="
-for %%C in ("py -3" "python" "python3") do (
-  if not defined PYEXE (
-    for /f "delims=" %%V in ('%%~C -c "print('PYOK')" 2^>nul') do (
-      if "%%V"=="PYOK" set "PYEXE=%%~C"
-    )
-  )
+rem One bootstrap owns both launch modes. START_LEGACY_WEB_APP.bat passes
+rem --legacy; normal launches open the native Qt desktop application.
+if /I "%~1"=="--legacy" goto find_python
+
+rem Packaged releases do not require Python. Support both an extracted release
+rem folder and a repository checkout containing a local PyInstaller build.
+if exist "%~dp0NASCARModdingApp.exe" (
+  "%~dp0NASCARModdingApp.exe"
+  goto finished
+)
+if exist "%~dp0dist\NASCARModdingApp\NASCARModdingApp.exe" (
+  "%~dp0dist\NASCARModdingApp\NASCARModdingApp.exe"
+  goto finished
 )
 
-if not defined PYEXE (
+:find_python
+call "%~dp0FIND_PYTHON.bat"
+
+if not defined PYTHON_CMD if defined PYTHON_FOUND (
   echo.
-  echo   Python was not found on this PC.
-  echo.
-  echo   1. Download Python from  https://www.python.org/downloads/
-  echo   2. IMPORTANT: on the first setup screen, tick
-  echo        "Add python.exe to PATH"
-  echo   3. Finish the installer, then run this file again.
-  echo.
-  echo   If you installed Python from the Microsoft Store, install it from
-  echo   python.org instead - the Store version cannot see this folder properly.
+  echo   Python was found, but no Python 3.10 or newer interpreter could run.
+  echo   Detected versions:
+  py -3 --version 2>nul
+  python --version 2>nul
+  python3 --version 2>nul
   echo.
   pause
   exit /b 1
 )
 
-rem ------------------------------------------------------- check the version
-%PYEXE% -c "import sys;raise SystemExit(0 if sys.version_info>=(3,10) else 1)" >nul 2>nul
-if errorlevel 1 (
+if not defined PYTHON_CMD (
   echo.
-  echo   The selected Python version is too old for this app.
-  %PYEXE% --version
-  echo   Python 3.10 or newer is needed.
-  echo.
-  echo   Install a current version from  https://www.python.org/downloads/
-  echo   and tick "Add python.exe to PATH" during setup.
+  echo   Python 3.10 or newer was not found.
+  echo   Install it from https://www.python.org/downloads/ and enable PATH.
   echo.
   pause
   exit /b 1
 )
 
-rem --------------------------------------------- make sure the packages exist
-%PYEXE% -c "import flask, PIL, numpy" >nul 2>nul
+%PYTHON_CMD% -c "import flask, PIL, numpy, PySide6, OpenGL" >nul 2>nul
 if errorlevel 1 (
   echo.
-  echo   First run: installing the three Python packages this app needs
-  echo   ^(Flask, Pillow, NumPy^). This needs an internet connection and
-  echo   usually takes under a minute.
+  echo   First run: installing the desktop dependencies...
   echo.
-  %PYEXE% -m pip install --upgrade pip >nul 2>nul
-  %PYEXE% -m pip install -r requirements.txt
-  echo.
-  %PYEXE% -c "import flask, PIL, numpy" >nul 2>nul
-  if errorlevel 1 (
-    echo.
-    echo   The packages still are not available.
-    echo.
-    echo   Most common causes:
-    echo     - No internet connection, or a company/school network blocking pip
-    echo     - Antivirus blocking the download
-    echo     - Python installed without the "Add python.exe to PATH" option
-    echo.
-    echo   See TROUBLESHOOTING.txt. To retry by hand, run:
-    echo     %PYEXE% -m pip install -r requirements.txt
-    echo.
-    pause
-    exit /b 1
-  )
-  echo   Packages installed.
-  echo.
+  %PYTHON_CMD% -m pip install -r requirements.txt
+  if errorlevel 1 goto dependency_failed
+  %PYTHON_CMD% -c "import flask, PIL, numpy, PySide6, OpenGL" >nul 2>nul
+  if errorlevel 1 goto dependency_failed
 )
 
-rem ------------------------------------------------------------------ run it
-echo Starting the app. A browser tab should open by itself.
-echo Leave this window open while you use the app.
-echo.
-%PYEXE% app.py
-set "RC=%ERRORLEVEL%"
+if /I "%~1"=="--legacy" goto legacy
 
+echo Starting the native desktop app...
+%PYTHON_CMD% native_app.py
+goto finished
+
+:legacy
+title NASCAR Modding App - Legacy Web Compatibility
+echo Starting the legacy web compatibility interface...
+echo Use this only for advanced workflows not yet present in the native app.
+%PYTHON_CMD% app.py
+goto finished
+
+:dependency_failed
 echo.
-if not "%RC%"=="0" (
-  echo   The app stopped with an error ^(code %RC%^).
-  echo   The lines above this message say why. See TROUBLESHOOTING.txt.
-) else (
-  echo   The app has stopped.
-)
+echo   Dependency installation failed. See TROUBLESHOOTING.txt.
 echo.
 pause
+exit /b 1
+
+:finished
+set "RC=%ERRORLEVEL%"
+if not "%RC%"=="0" (
+  echo.
+  echo   The app stopped with error code %RC%.
+  pause
+)
 exit /b %RC%

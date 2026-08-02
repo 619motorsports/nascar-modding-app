@@ -1,9 +1,14 @@
-NASCAR MODDING APP v1.0 - TROUBLESHOOTING
+NASCAR MODDING APP - NATIVE DESKTOP TROUBLESHOOTING
 =========================================
 
-Start here: run START_APP.bat. It finds Python, installs the packages it needs on
-first run, and leaves its window open with an explanation if anything goes wrong.
-You do not need to run INSTALL_DEPENDENCIES.bat first.
+Packaged release: run NASCARModdingApp.exe. It includes Python and all required
+packages, so no Python installation is needed. Keep the complete extracted
+folder together; do not move only the EXE out of it.
+
+Source checkout: run START_APP.bat. It finds Python, installs the packages it
+needs on first run, and opens the native desktop window. Browser and port
+sections below apply only to START_LEGACY_WEB_APP.bat. You do not need to run
+INSTALL_DEPENDENCIES.bat first.
 
 If something fails, the black window stays open and the last few lines say why.
 Those lines are the useful part - please include them in any bug report.
@@ -12,6 +17,9 @@ Those lines are the useful part - please include them in any bug report.
 -------------------------------------------------------------------------------
 "Python was not found on this PC"
 -------------------------------------------------------------------------------
+This message applies only to a source checkout. A packaged release should start
+NASCARModdingApp.exe directly and does not use Python from the PC.
+
 1. Go to  https://www.python.org/downloads/
 2. Download the latest Windows installer.
 3. On the FIRST setup screen, tick "Add python.exe to PATH". This is the step
@@ -28,12 +36,15 @@ python.org as well - the launcher prefers the real one automatically.
 -------------------------------------------------------------------------------
 Python 3.10 or newer is required. Install a current version from python.org
 (ticking "Add python.exe to PATH"). You do not need to uninstall the old one.
+Python 3.13 is supported. FIND_PYTHON.bat probes the interpreter itself instead
+of comparing the printed version as text.
 
 
 -------------------------------------------------------------------------------
 The packages will not install
 -------------------------------------------------------------------------------
-The app needs three packages: Flask, Pillow and NumPy. If installing them fails:
+The app needs PySide6, PyOpenGL, Pillow, NumPy, and Flask for legacy compatibility.
+If installing them fails:
 
   - Check you have an internet connection. The first run needs one; after that
     the app works offline.
@@ -54,7 +65,7 @@ Use START_APP.bat instead.
 
 
 -------------------------------------------------------------------------------
-"The app is already running"
+LEGACY WEB ONLY: "The app is already running"
 -------------------------------------------------------------------------------
 You started it twice. The second copy notices the first and just opens the
 browser tab. Nothing is wrong. To stop the app, close the black window.
@@ -64,7 +75,7 @@ If port 8151 is taken by unrelated software, the app moves to 8152 (and up to
 
 
 -------------------------------------------------------------------------------
-The browser tab does not open
+LEGACY WEB ONLY: The browser tab does not open
 -------------------------------------------------------------------------------
 Open it yourself:  http://127.0.0.1:8151
 If the window printed a different port, use that number instead.
@@ -72,9 +83,9 @@ You can turn the automatic tab off or on in Settings.
 
 
 -------------------------------------------------------------------------------
-"Choose NASCAR 15 or NASCAR '14 before using the app"
+"Choose a supported NASCAR game before using the app"
 -------------------------------------------------------------------------------
-Normal on a first run: pick your game on the selector screen. The app ships with
+Normal on a first run: pick NTG 2013, NASCAR '14, or NASCAR 15. The app ships with
 no saved paths on purpose, so it never points at someone else's install.
 
 

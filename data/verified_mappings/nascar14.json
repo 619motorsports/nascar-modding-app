@@ -1,0 +1,419 @@
+{
+  "format": "nascar-modding-app-live-mapping-audit-v2",
+  "generated_utc": "2026-08-01T20:44:41.242196+00:00",
+  "game_id": "nascar14",
+  "game_name": "NASCAR '14",
+  "install_folder": "NASCAR 14",
+  "profile": {
+    "content_season": 2014,
+    "season_prefix": "14",
+    "required_archives": [
+      "0",
+      "7",
+      "8"
+    ],
+    "paint_primary_archive": "7",
+    "number_container": "SPRINTNUMS2014.ARC",
+    "series_uid": 22538,
+    "livery_style": "numbered_season",
+    "primary_livery_patterns": [
+      "^LIVERY_(14|15)_(\\d+[A-Z]?)_(.+?)\\.ARC$"
+    ],
+    "dormant_livery_patterns": [],
+    "dormant_number_containers": []
+  },
+  "indexes": [
+    {
+      "archive": "0",
+      "archive_size": 1610450088,
+      "index_file": "cdfiles.dat",
+      "index_size": 199675,
+      "index_sha256": "893168374f3e0d4c2cd90f7beb10433917dde7fe2b4c2842efad445c13866ed6",
+      "entries": 1993,
+      "layouts": {
+        "A": 1993
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "1",
+      "archive_size": 781329416,
+      "index_file": "cdfiles1.dat",
+      "index_size": 128949,
+      "index_sha256": "235cb9720c774729cb7e40a7d37f4b141b748a332113fd8d7bb74b677d1d6e00",
+      "entries": 1258,
+      "layouts": {
+        "B": 1258
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "4",
+      "archive_size": 1388881184,
+      "index_file": "cdfiles4.dat",
+      "index_size": 6352,
+      "index_sha256": "473da9658f4b925c360df61b282560477973efb4e586c6e775fcc89126670fde",
+      "entries": 63,
+      "layouts": {
+        "B": 63
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "5",
+      "archive_size": 2224494360,
+      "index_file": "cdfiles5.dat",
+      "index_size": 9059,
+      "index_sha256": "33042823dfb250bc85d674c529cbaad4e65c714b2104fe545b7c1af5a8377514",
+      "entries": 85,
+      "layouts": {
+        "B": 85
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "6",
+      "archive_size": 1997748352,
+      "index_file": "cdfiles6.dat",
+      "index_size": 8192,
+      "index_sha256": "9cdc079eb035597e214fd1d74c2c42d5cc991990a00d61b62c623a5d4e2104ab",
+      "entries": 82,
+      "layouts": {
+        "B": 82
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "7",
+      "archive_size": 773134952,
+      "index_file": "cdfiles7.dat",
+      "index_size": 98852,
+      "index_sha256": "660db81cc4ab3b190c31b2debc6290f499aff6def6b9f772f211bfe11757eb3e",
+      "entries": 1013,
+      "layouts": {
+        "B": 1013
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "8",
+      "archive_size": 1244160608,
+      "index_file": "cdfiles8.dat",
+      "index_size": 27244,
+      "index_sha256": "fcbe2cdc3b3e57e66e0afa3280f8e245b571581534f2c85b033d4d4a466b0ec2",
+      "entries": 252,
+      "layouts": {
+        "B": 252
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "314",
+      "archive_size": 300096,
+      "index_file": "cdfiles314.dat",
+      "index_size": 3389,
+      "index_sha256": "420b576b4b2d1e9af4d37dbef05591c7f815000491b0986c27445050dc6125dc",
+      "entries": 34,
+      "layouts": {
+        "B": 34
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "58649204",
+      "archive_size": 8201656,
+      "index_file": "cdfiles58649204.dat",
+      "index_size": 4725,
+      "index_sha256": "c3f2eaabe20be45e57acaa96125313794f1b4fbb362dbb58a94c871a991d4604",
+      "entries": 37,
+      "layouts": {
+        "B": 37
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "361858145",
+      "archive_size": 1520,
+      "index_file": "cdfiles361858145.dat",
+      "index_size": 532,
+      "index_sha256": "d1a6d0f5ada2aa7e50f2bb91423fb52734c55bcedc0f0e1c1fe4e86e85e07513",
+      "entries": 2,
+      "layouts": {
+        "B": 2
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "367143795",
+      "archive_size": 43072104,
+      "index_file": "cdfiles367143795.dat",
+      "index_size": 3355,
+      "index_sha256": "ad54fb297788a2479602c88ada826794f5bae149e0eecd02db5849f9568fcbea",
+      "entries": 25,
+      "layouts": {
+        "B": 25
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "810661168",
+      "archive_size": 50250800,
+      "index_file": "cdfiles810661168.dat",
+      "index_size": 3895,
+      "index_sha256": "a00442c62f7486c0fba5b2fd2790bd5839499786afc9113799c2afdc870880dd",
+      "entries": 29,
+      "layouts": {
+        "B": 29
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "877033269",
+      "archive_size": 114858312,
+      "index_file": "cdfiles877033269.dat",
+      "index_size": 8111,
+      "index_sha256": "61ca7f73fd3b2ccd4b91f5241cf39b05ac9c159259fdd3b42693989c233952c1",
+      "entries": 65,
+      "layouts": {
+        "B": 65
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "1029858546",
+      "archive_size": 22944856,
+      "index_file": "cdfiles1029858546.dat",
+      "index_size": 1788,
+      "index_sha256": "e4a026fc83b39e816ba2217b7f1038358d5fac11af8c7bf0cf6e8e8711f93bfa",
+      "entries": 11,
+      "layouts": {
+        "B": 11
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "1206991227",
+      "archive_size": 22944864,
+      "index_file": "cdfiles1206991227.dat",
+      "index_size": 1803,
+      "index_sha256": "98dfd3eb6559c146e3b8044302b0cc1e3136914ed5ceb81c5e97f6fb3ea81573",
+      "entries": 11,
+      "layouts": {
+        "B": 11
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "1452738621",
+      "archive_size": 50250696,
+      "index_file": "cdfiles1452738621.dat",
+      "index_size": 3805,
+      "index_sha256": "4fc3b503c1a608f6bc74ac6d7ef569ce9ab80dc35fa9d09ebf0fe1727d9b637a",
+      "entries": 29,
+      "layouts": {
+        "B": 29
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "1954142946",
+      "archive_size": 6984248,
+      "index_file": "cdfiles1954142946.dat",
+      "index_size": 4277,
+      "index_sha256": "8c68e0ce724f9aeb48f5ac706396a61d95c41eeec6de5ebe01bdcd66d8024d40",
+      "entries": 32,
+      "layouts": {
+        "B": 32
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "1959432815",
+      "archive_size": 64607904,
+      "index_file": "cdfiles1959432815.dat",
+      "index_size": 4725,
+      "index_sha256": "b7025828da9e3ea930cf642e0c8c72ec87dd0880e8bd7b739e525e0853133210",
+      "entries": 37,
+      "layouts": {
+        "B": 37
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "2068516024",
+      "archive_size": 86143800,
+      "index_file": "cdfiles2068516024.dat",
+      "index_size": 6185,
+      "index_sha256": "7fbee1387084934a7c07c594b015e7d2707bd2676f17c73001059e1b072c9542",
+      "entries": 49,
+      "layouts": {
+        "B": 49
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "2272656774",
+      "archive_size": 64607960,
+      "index_file": "cdfiles2272656774.dat",
+      "index_size": 4785,
+      "index_sha256": "42f4e22108bbff0fb2cba32d974b73c1ee3529a7efaed14b5cb42241eb9472bf",
+      "entries": 37,
+      "layouts": {
+        "B": 37
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "2337548327",
+      "archive_size": 50250792,
+      "index_file": "cdfiles2337548327.dat",
+      "index_size": 3861,
+      "index_sha256": "b108702e918be185d347cbf3ade882eacf9fce559d6bebaf30afd7ba5adc8ba8",
+      "entries": 29,
+      "layouts": {
+        "B": 29
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "2908952298",
+      "archive_size": 57429416,
+      "index_file": "cdfiles2908952298.dat",
+      "index_size": 4329,
+      "index_sha256": "ebb65272495c9d4d6aae9c5dc0fa95c4a5b05d79825b9c4e1ecf7f830f3a1858",
+      "entries": 33,
+      "layouts": {
+        "B": 33
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "2932172423",
+      "archive_size": 1544520,
+      "index_file": "cdfiles2932172423.dat",
+      "index_size": 928,
+      "index_sha256": "40be9214adcedfe7eb2161c81e9e064799613efee299545a628bf17e4038b33b",
+      "entries": 4,
+      "layouts": {
+        "B": 4
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "2960276931",
+      "archive_size": 43072136,
+      "index_file": "cdfiles2960276931.dat",
+      "index_size": 3365,
+      "index_sha256": "875858a3573728fc0b978b8f6fa06194c86e781f66875b23b16da06b2be34e0c",
+      "entries": 25,
+      "layouts": {
+        "B": 25
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "3796000002",
+      "archive_size": 81949552,
+      "index_file": "cdfiles3796000002.dat",
+      "index_size": 6141,
+      "index_sha256": "6c63c9322f0ee587332119ff6d88eed0854cf98dd35e260862ab2484c3e07c8e",
+      "entries": 49,
+      "layouts": {
+        "B": 49
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "3983575896",
+      "archive_size": 7497640,
+      "index_file": "cdfiles3983575896.dat",
+      "index_size": 4516,
+      "index_sha256": "ea37f66a29bc8efb3e9d19f938b0be43db57b62b60b3c3c0f969df694bf6a588",
+      "entries": 34,
+      "layouts": {
+        "B": 34
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "4050573134",
+      "archive_size": 53235064,
+      "index_file": "cdfiles4050573134.dat",
+      "index_size": 4301,
+      "index_sha256": "2d6fd8d8ac8b03d9e4690a0ddd8e058f2a2466db8a6145bc66f53610b96531ba",
+      "entries": 33,
+      "layouts": {
+        "B": 33
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "4199990137",
+      "archive_size": 1512,
+      "index_file": "cdfiles4199990137.dat",
+      "index_size": 533,
+      "index_sha256": "38f51d5208a33d0d9fc67f7af96257ebc1286e8b18624e0f1248f8f8decb96e6",
+      "entries": 2,
+      "layouts": {
+        "B": 2
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "4257476342",
+      "archive_size": 57429376,
+      "index_file": "cdfiles4257476342.dat",
+      "index_size": 4297,
+      "index_sha256": "7b1e53f52bc1799dac61fca984e9c6528d2132c4de015f6b3b4f04d77f4e5296",
+      "entries": 33,
+      "layouts": {
+        "B": 33
+      },
+      "out_of_bounds": []
+    }
+  ],
+  "facts": {
+    "total_entries": 5386,
+    "expected_livery_entries": 102,
+    "dormant_livery_entries": 0,
+    "number_container_hits": [
+      {
+        "archive": "0",
+        "name": "SPRINTNUMS2014.ARC"
+      }
+    ],
+    "database_hits": {
+      "DB_GAME_LOCAL_SCRIPT.PYC": [
+        "0"
+      ],
+      "DB_AICONFIG_SCRIPT.PYC": [
+        "0"
+      ]
+    },
+    "body_models": [
+      {
+        "archive": "0",
+        "name": "NASCAR5_BODY0_0.ARC",
+        "size": 7799886,
+        "magic": "ARCC",
+        "verified": true
+      },
+      {
+        "archive": "0",
+        "name": "NASCAR4_BODY0_0.ARC",
+        "size": 7764077,
+        "magic": "ARCC",
+        "verified": true
+      },
+      {
+        "archive": "0",
+        "name": "NASCAR3_BODY0_0.ARC",
+        "size": 5908515,
+        "magic": "ARCC",
+        "verified": true
+      }
+    ]
+  },
+  "ok": true,
+  "errors": []
+}

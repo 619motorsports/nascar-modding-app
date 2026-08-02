@@ -4,6 +4,8 @@ import re, struct, zlib
 import numpy as np
 from PIL import Image
 
+TEXTURE_DECODER_REVISION = 'aligned-rows-v4'
+
 # ---------- DXT5 ----------
 def _565(r,g,b):
     return ((r>>3).astype(np.uint16)<<11)|((g>>2).astype(np.uint16)<<5)|(b>>3).astype(np.uint16)
@@ -19,16 +21,16 @@ def swap_dxt5_halves(payload):
     return out+payload[len(out):]
 
 def dxt5_decode(payload,W,H):
-    N=(W//4)*(H//4)
+    BW=max(1,(W+3)//4);BH=max(1,(H+3)//4);N=BW*BH
     b=np.frombuffer(payload[:N*16],np.uint8).reshape(N,16)
     a0=b[:,0].astype(np.int32); a1=b[:,1].astype(np.int32)
     abits=np.zeros(N,dtype=np.uint64)
     for i in range(6): abits |= b[:,2+i].astype(np.uint64)<<(8*i)
     apal=np.zeros((N,8),np.int32); apal[:,0]=a0; apal[:,1]=a1
     g=a0>a1
-    for i in range(1,7): apal[:,1+i]=np.where(g,((7-i)*a0+i*a1)//7,0)
+    for i in range(1,7): apal[:,1+i]=np.where(g,((7-i)*a0+i*a1+3)//7,0)
     ng=~g
-    for i in range(1,5): apal[ng,1+i]=((5-i)*a0[ng]+i*a1[ng])//5
+    for i in range(1,5): apal[ng,1+i]=((5-i)*a0[ng]+i*a1[ng]+2)//5
     apal[ng,6]=0; apal[ng,7]=255
     aidx=np.stack([((abits>>(3*i))&7).astype(np.int64) for i in range(16)],1)
     alpha=np.take_along_axis(apal,aidx,1)
@@ -37,11 +39,11 @@ def dxt5_decode(payload,W,H):
     c1=cb[:,2].astype(np.uint16)|(cb[:,3].astype(np.uint16)<<8)
     bits=sum(cb[:,4+i].astype(np.uint32)<<(8*i) for i in range(4))
     p0=_rgb(c0);p1=_rgb(c1)
-    pal=np.stack([p0,p1,(2*p0+p1)//3,(p0+2*p1)//3],1).astype(np.uint8)
+    pal=np.stack([p0,p1,(2*p0+p1+1)//3,(p0+2*p1+1)//3],1).astype(np.uint8)
     idx=np.stack([(bits>>(2*i))&3 for i in range(16)],1)
     px=np.take_along_axis(pal,idx[:,:,None].astype(np.int64),1)
-    rgb=px.reshape(H//4,W//4,4,4,3).transpose(0,2,1,3,4).reshape(H,W,3)
-    al=alpha.reshape(H//4,W//4,4,4).transpose(0,2,1,3).reshape(H,W).astype(np.uint8)
+    rgb=px.reshape(BH,BW,4,4,3).transpose(0,2,1,3,4).reshape(BH*4,BW*4,3)[:H,:W]
+    al=alpha.reshape(BH,BW,4,4).transpose(0,2,1,3).reshape(BH*4,BW*4)[:H,:W].astype(np.uint8)
     return np.dstack([rgb,al[:,:,None]])
 
 def dxt5_encode(img_rgba):
@@ -128,6 +130,37 @@ def _legacy_resolve_dims(w1,h1,dsz,bpb,known=None):
 
 def _bc_size(w,h,bpb):
     return max(1,(int(w)+3)//4)*max(1,(int(h)+3)//4)*bpb
+
+
+def _surface_storage(width,height,fmt,data_size,mip_count):
+    """Return the game's aligned base-row layout independently of mip/slack bytes."""
+    width=int(width);height=int(height);data_size=int(data_size);mip_count=int(mip_count)
+    if fmt in ('DXT1','DXT5'):
+        bytes_per_unit=8 if fmt=='DXT1' else 16
+        logical_width=max(1,(width+3)//4);logical_height=max(1,(height+3)//4)
+        tight_pitch=logical_width*bytes_per_unit
+        row_pitch=max(tight_pitch,256 if fmt=='DXT1' else 512)
+    else:
+        bytes_per_unit=4 if fmt=='A8R8G8B8' else 2
+        logical_width=max(1,width);logical_height=max(1,height)
+        tight_pitch=logical_width*bytes_per_unit
+        row_pitch=max(256,((tight_pitch+127)//128)*128)
+    # Unknown/custom records can be tightly packed. Never stride beyond the
+    # bytes claimed by the base surface when the aligned layout cannot fit.
+    if row_pitch*logical_height>data_size:
+        row_pitch=tight_pitch
+    stored_width=row_pitch//bytes_per_unit
+    stored_height=(data_size//row_pitch if row_pitch and data_size%row_pitch==0
+                   else logical_height)
+    return {
+        'needed':tight_pitch*logical_height,
+        'row_pitch':row_pitch,
+        'stored_width':stored_width,
+        'stored_height':stored_height,
+        'surface_layout':(
+            'padded_rows' if row_pitch>tight_pitch else 'tight_base'
+        ),
+    }
 
 def _primary_resolve_dims(w1,h1,dsz,bpb,known=None):
     if known is not None and _bc_size(known[0],known[1],bpb) <= int(dsz):
@@ -304,9 +337,7 @@ def _parse_multi_arc_primary(arc,known_dims=None):
         else:
             code=struct.unpack_from('<I',fmt_raw)[0]
             if code==0x19:
-                fmt='DXT1'
-                if known_dims is not None:w,h=map(int,known_dims)
-                else:w,h=int(w1)*4,int(h1)*4
+                fmt='A1R5G5B5';w,h=int(w1),int(h1)
             elif code==0x15:
                 fmt='A8R8G8B8';w,h=int(w1),int(h1)
             else:
@@ -322,8 +353,9 @@ def _parse_multi_arc_primary(arc,known_dims=None):
         if not name.startswith('texture_record_'):resolved_names+=1
         if name in used:name=f'{name}__r{rec["index"]}'
         used.add(name)
-        bpb=8 if fmt=='DXT1' else 16 if fmt=='DXT5' else 4
-        needed=_bc_size(w,h,bpb) if fmt in ('DXT1','DXT5') else int(w)*int(h)*4
+        storage=_surface_storage(w,h,fmt,data_size,mip_count)
+        needed=storage['needed'];row_pitch=storage['row_pitch']
+        stored_width=storage['stored_width'];stored_height=storage['stored_height']
         # The preceding 0xFF identity row plus this 0x01 row are the logical
         # 32-byte table record used by the historical template builders.
         # FIX (v1.0.2-dev9): the logical 32-byte record is the 0xFF identity row
@@ -342,6 +374,8 @@ def _parse_multi_arc_primary(arc,known_dims=None):
         if len(pair)==16:pair=b'\0'*16+pair;pair_start=rec['record_pos']-16
         entries.append(dict(index=logical_index,name=name,data_off=rec['data_off'],name_ref=rec['name_ref'],
             w=w,h=h,fmt=fmt,needed=needed,payload_abs=payload_abs,payload_size=payload_size,
+            row_pitch=row_pitch,stored_width=stored_width,stored_height=stored_height,
+            surface_layout=storage['surface_layout'],
             mip_count=mip_count,data_size=int(data_size),
             header_abs=a,chunk_start=a,chunk_end=a+rec['size'],record_size=rec['size'],
             physical_record_index=rec['index'],table_start=pair_start,table_record=pair,
@@ -431,7 +465,7 @@ def _score_parse(arc,entries):
         if ps<=0 or pa<0 or pa+ps>len(arc):return -1
         spans.append((pa,pa+ps))
         if not str(e['name']).startswith('texture_record_'):score+=5
-        if e['fmt'] in ('DXT1','DXT5','A8R8G8B8'):score+=1
+        if e['fmt'] in ('DXT1','DXT5','A8R8G8B8','A1R5G5B5'):score+=1
         if any(arc[pa:pa+min(ps,64)]):score+=1
     spans.sort()
     for (_,end),(nxt,_) in zip(spans,spans[1:]):
@@ -454,7 +488,7 @@ def parse_multi_arc(arc,known_dims=None):
     return usable[0][2],usable[0][3]
 
 def _dxt1_decode(payload,W,H):
-    N=(W//4)*(H//4)
+    BW=max(1,(W+3)//4);BH=max(1,(H+3)//4);N=BW*BH
     a=np.frombuffer(payload[:N*8],np.uint8).reshape(N,8)
     c0=a[:,0].astype(np.uint16)|(a[:,1].astype(np.uint16)<<8)
     c1=a[:,2].astype(np.uint16)|(a[:,3].astype(np.uint16)<<8)
@@ -464,21 +498,46 @@ def _dxt1_decode(payload,W,H):
     pal=np.stack([p0,p1,p2,p3],1).astype(np.uint8)
     idx=np.stack([(bits>>(2*i))&3 for i in range(16)],1)
     px=np.take_along_axis(pal,idx[:,:,None].astype(np.int64),1)
-    return px.reshape(H//4,W//4,4,4,3).transpose(0,2,1,3,4).reshape(H,W,3)
+    return px.reshape(BH,BW,4,4,3).transpose(0,2,1,3,4).reshape(BH*4,BW*4,3)[:H,:W]
+
+
+def _tight_rows(payload,row_pitch,tight_pitch,row_count):
+    row_pitch=max(int(row_pitch),int(tight_pitch));row_count=int(row_count)
+    required=row_pitch*max(0,row_count-1)+tight_pitch
+    source=payload+b'\0'*max(0,required-len(payload))
+    return b''.join(
+        source[row*row_pitch:row*row_pitch+tight_pitch]
+        for row in range(row_count)
+    )
 
 def multi_read_png(arc,entry):
     pay=arc[entry['payload_abs']:entry['payload_abs']+entry['payload_size']]
-    if len(pay)<entry['needed']:pay=pay+b'\0'*(entry['needed']-len(pay))
     if entry['fmt']=='DXT5':
+        block_rows=max(1,(entry['h']+3)//4)
+        tight_pitch=max(1,(entry['w']+3)//4)*16
+        pay=_tight_rows(pay,entry.get('row_pitch',tight_pitch),tight_pitch,block_rows)
         if entry.get('dxt5_swapped'):pay=swap_dxt5_halves(pay)
         return Image.fromarray(dxt5_decode(pay,entry['w'],entry['h']),'RGBA')
     if entry['fmt']=='DXT1':
+        block_rows=max(1,(entry['h']+3)//4)
+        tight_pitch=max(1,(entry['w']+3)//4)*8
+        pay=_tight_rows(pay,entry.get('row_pitch',tight_pitch),tight_pitch,block_rows)
         return Image.fromarray(_dxt1_decode(pay,entry['w'],entry['h'])).convert('RGBA')
     if entry['fmt']=='A8R8G8B8':
-        need=entry['w']*entry['h']*4
-        raw=(pay+b'\0'*need)[:need]
+        tight_pitch=entry['w']*4
+        raw=_tight_rows(pay,entry.get('row_pitch',tight_pitch),tight_pitch,entry['h'])
         a=np.frombuffer(raw,np.uint8).reshape(entry['h'],entry['w'],4)
         return Image.fromarray(a[:,:,[2,1,0,3]],'RGBA')
+    if entry['fmt']=='A1R5G5B5':
+        tight_pitch=entry['w']*2
+        raw=_tight_rows(pay,entry.get('row_pitch',tight_pitch),tight_pitch,entry['h'])
+        pixels=np.frombuffer(raw,dtype='<u2').reshape(entry['h'],entry['w'])
+        rgba=np.empty((entry['h'],entry['w'],4),dtype=np.uint8)
+        rgba[:,:,0]=(((pixels>>10)&31)*255//31).astype(np.uint8)
+        rgba[:,:,1]=(((pixels>>5)&31)*255//31).astype(np.uint8)
+        rgba[:,:,2]=((pixels&31)*255//31).astype(np.uint8)
+        rgba[:,:,3]=np.where(pixels&0x8000,255,0).astype(np.uint8)
+        return Image.fromarray(rgba,'RGBA')
     raise ValueError('unsupported texture format '+str(entry['fmt']))
 
 def multi_write_png(arc_bytes,entry,img,encode_fn=None):
@@ -486,6 +545,8 @@ def multi_write_png(arc_bytes,entry,img,encode_fn=None):
     enc=None
     if entry['fmt']=='A8R8G8B8':
         a=np.asarray(img,np.uint8);enc=a[:,:,[2,1,0,3]].tobytes()
+    elif entry['fmt']=='A1R5G5B5':
+        raise ValueError('A1R5G5B5 replacement is not yet proven safe')
     else:
         if encode_fn:
             try:enc=encode_fn(img,entry['fmt'])
@@ -494,16 +555,26 @@ def multi_write_png(arc_bytes,entry,img,encode_fn=None):
         if enc is None:raise ValueError('no encoder supplied for '+str(entry['fmt']))
         if entry['fmt']=='DXT5' and entry.get('dxt5_swapped'):enc=swap_dxt5_halves(enc)
     ps=int(entry['payload_size']);pa=int(entry['payload_abs'])
-    original_slot=bytes(arc_bytes[pa:pa+ps])
-    block=16 if entry['fmt']=='DXT5' else 8 if entry['fmt']=='DXT1' else 4
+    original_slot=bytearray(arc_bytes[pa:pa+ps])
     # Some mapped resources reserve non-image bytes after a shorter encoded
     # surface, so preserve any bytes the encoder does not replace. SPRINTNUMS
     # BIG_* is not one of those cases: callers pass its mapped 128x64 geometry,
     # producing the complete 4096-byte DXT1 surface.
-    replace_len=min(len(enc),ps)
-    replace_len-=replace_len%block
-    if replace_len<=0:raise ValueError('encoder returned no complete texture blocks')
-    final=enc[:replace_len]+original_slot[replace_len:]
+    if entry['fmt'] in ('DXT1','DXT5'):
+        block=16 if entry['fmt']=='DXT5' else 8
+        row_count=max(1,(entry['h']+3)//4)
+        tight_pitch=max(1,(entry['w']+3)//4)*block
+    else:
+        row_count=entry['h'];tight_pitch=entry['w']*4
+    row_pitch=max(tight_pitch,int(entry.get('row_pitch',tight_pitch)))
+    required=tight_pitch*row_count
+    if len(enc)<required:raise ValueError('encoder returned an incomplete texture surface')
+    if row_pitch*max(0,row_count-1)+tight_pitch>ps:
+        raise ValueError('native texture row layout exceeds its payload slot')
+    for row in range(row_count):
+        source_start=row*tight_pitch;destination_start=row*row_pitch
+        original_slot[destination_start:destination_start+tight_pitch]=enc[source_start:source_start+tight_pitch]
+    final=bytes(original_slot)
     if len(final)!=ps:raise ValueError('encoded texture did not preserve the native payload size')
     out=bytearray(arc_bytes);out[pa:pa+ps]=final
     return bytes(out)

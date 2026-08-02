@@ -40,6 +40,8 @@ cdfiles*.dat
 ffmpeg.exe
 
 # --- build output ---
+build/
+dist/
 ../user_package/
 ../junk_backup/
 *.zip

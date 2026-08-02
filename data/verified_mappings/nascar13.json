@@ -1,0 +1,245 @@
+{
+  "format": "nascar-modding-app-live-mapping-audit-v2",
+  "generated_utc": "2026-08-02T07:54:00.835130+00:00",
+  "game_id": "nascar13",
+  "game_name": "NASCAR The Game: 2013",
+  "install_folder": "NASCAR The Game 2013",
+  "profile": {
+    "content_season": 2013,
+    "season_prefix": "13",
+    "required_archives": [
+      "0",
+      "7",
+      "8"
+    ],
+    "paint_primary_archive": "7",
+    "number_container": "CAREERNUMBERS.ARC",
+    "series_uid": 18306,
+    "livery_style": "ntg2013_dlc",
+    "primary_livery_patterns": [
+      "^LIVERY_DLC_LIV_(\\d+)_([A-Z0-9_]+?)_2013(?:_(\\d+))?\\.ARC$"
+    ],
+    "dormant_livery_patterns": [
+      "^LIVERY_12_?(.+?)\\.ARC$",
+      "^(?:HD)?LIVERY_(?!DLC_|CAREER_|LENOVO|TELEMETRY)[A-Z][A-Z0-9_]+\\.ARC$"
+    ],
+    "dormant_number_containers": [
+      "SPRINTNUMS2012.ARC"
+    ]
+  },
+  "indexes": [
+    {
+      "archive": "0",
+      "archive_size": 1292521200,
+      "index_file": "cdfiles.dat",
+      "index_size": 279304,
+      "index_sha256": "5a1940036e8928a8319a997f3de89ffe0436aa6023a81c079ae485bc88b25665",
+      "entries": 2784,
+      "layouts": {
+        "A": 2784
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "1",
+      "archive_size": 955932536,
+      "index_file": "cdfiles1.dat",
+      "index_size": 209397,
+      "index_sha256": "90cb75d2018ce4aecf5295913f21d0a60fa658a288814312ccee604c597619d7",
+      "entries": 2144,
+      "layouts": {
+        "B": 2144
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "4",
+      "archive_size": 928921520,
+      "index_file": "cdfiles4.dat",
+      "index_size": 5103,
+      "index_sha256": "52b26aec5b040bad3a073ffc0a231a650b5ca0f8dfee65d18852d0fddc809fd8",
+      "entries": 50,
+      "layouts": {
+        "B": 50
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "5",
+      "archive_size": 949005144,
+      "index_file": "cdfiles5.dat",
+      "index_size": 4587,
+      "index_sha256": "9bd77d21304777ea80469f8c62ba0e687a869679b9285f57b15dcc086f6e1429",
+      "entries": 45,
+      "layouts": {
+        "B": 45
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "6",
+      "archive_size": 1112225144,
+      "index_file": "cdfiles6.dat",
+      "index_size": 5824,
+      "index_sha256": "e26f4dea99f51c51d15315278a7af11bcdbb48349373068406ddb48e8c420809",
+      "entries": 58,
+      "layouts": {
+        "B": 58
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "7",
+      "archive_size": 2006316600,
+      "index_file": "cdfiles7.dat",
+      "index_size": 116760,
+      "index_sha256": "acd97add9f77135f576ec2ac7be1a834d7ce616d2e0efdd40538d4beb1c4ea88",
+      "entries": 1173,
+      "layouts": {
+        "B": 1173
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "8",
+      "archive_size": 1600296768,
+      "index_file": "cdfiles8.dat",
+      "index_size": 30213,
+      "index_sha256": "4dc5abeda914c155829314f9ad23bc60b3f3beffc0f52bcd36bd29a8cc4d9cb8",
+      "entries": 292,
+      "layouts": {
+        "B": 292
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "9",
+      "archive_size": 588529088,
+      "index_file": "cdfiles9.dat",
+      "index_size": 33614,
+      "index_sha256": "6e1d2ade725df12f5b3008a1bafab6a5d7a7dba5e7de7e4fb6925d653480f1d1",
+      "entries": 246,
+      "layouts": {
+        "B": 246
+      },
+      "out_of_bounds": []
+    },
+    {
+      "archive": "314",
+      "archive_size": 291816,
+      "index_file": "cdfiles314.dat",
+      "index_size": 3299,
+      "index_sha256": "699dc8a84f6d6e15eeb89489da41c7df38e2d0ab230224b5cdadc730ad637b52",
+      "entries": 33,
+      "layouts": {
+        "B": 33
+      },
+      "out_of_bounds": []
+    }
+  ],
+  "facts": {
+    "total_entries": 6825,
+    "expected_livery_entries": 250,
+    "dormant_livery_entries": 177,
+    "number_container_hits": [
+      {
+        "archive": "0",
+        "name": "CAREERNUMBERS.ARC"
+      }
+    ],
+    "database_hits": {
+      "DB_GAME_LOCAL_SCRIPT.PYC": [
+        "0"
+      ],
+      "DB_AICONFIG_SCRIPT.PYC": [
+        "0"
+      ]
+    },
+    "body_models": [
+      {
+        "archive": "0",
+        "name": "NASCAR4_BODY0_0.ARC",
+        "size": 7763920,
+        "magic": "ARCC",
+        "verified": true
+      },
+      {
+        "archive": "0",
+        "name": "NASCAR3_BODY0_0.ARC",
+        "size": 5908179,
+        "magic": "ARCC",
+        "verified": true
+      }
+    ],
+    "career_mode": {
+      "status": "frontend_present_save_validation_required",
+      "safe_to_patch": false,
+      "asset_layer_intact": true,
+      "data_layer_intact": true,
+      "frontend_transition_intact": true,
+      "frontend_evidence": {
+        "menu_label_index": "0x09DF",
+        "menu_label": "Single Season",
+        "normal_menu_gate_initial_value": -1,
+        "normal_menu_gate_condition": "value < 0",
+        "selection_callback": "FUN_00adf690",
+        "single_season_interface_constructor": "FUN_00ba2df0",
+        "selection_message": "SINGLE_SEASON_MODE",
+        "team_shop_handoff": "FUN_00add3f0(1)",
+        "registered_transitions": {
+          "43": "TES_DRIVERSELECTTOSINGLESEASON",
+          "44": "TES_SINGLESEASONTODRIVER"
+        },
+        "frontend_boot_state": 30,
+        "frontend_boot_handler": "0x009C69EC",
+        "frontend_boot_preload": "SPRINTNUMS2012.ARC",
+        "frontend_boot_preload_is_required": true,
+        "binary_probe": {
+          "executable_present": true,
+          "executable": "NTG2013.exe",
+          "sha256": "d442c028c5c14a4a40b3b7fc4039184ad222d420aa30d8eacf46051b77ba3728",
+          "all_strings_present": true,
+          "strings": {
+            "TES_DRIVERSELECTTOSINGLESEASON": true,
+            "TES_SINGLESEASONTODRIVER": true,
+            "GSSingleSeasonModeInterface_c": true,
+            "SINGLE_SEASON_MODE": true,
+            "SprintNums2012.arc": true
+          }
+        }
+      },
+      "active_series": {
+        "uid": 18306,
+        "year": 2013,
+        "locked": false,
+        "verified": true
+      },
+      "dormant_series": {
+        "uid": 9670,
+        "year": 2012,
+        "locked": true,
+        "verified": true
+      },
+      "numbered_calendar_events": 36,
+      "career_resources": {
+        "BUILDSETTINGS.PYC": true,
+        "EVENTINIT.PYC": true,
+        "GSCAREERCALENDARHELPER.PYC": true,
+        "GSCAREERFUNCTIONSHELPER.PYC": true,
+        "GSCAREERRACEINTRO.PYC": true,
+        "GSCAREERRACESPAWN.PYC": true,
+        "2CAREERUPGRADES.ARC": true,
+        "2CALENDARREDONE.ARC": true,
+        "2CHASECONTENDERS.ARC": true,
+        "2DRIVERSELECTMENU.ARC": true,
+        "2DRIVERSELECTTITLE.ARC": true,
+        "2SINGLESEASON.ARC": true,
+        "CAREERNUMBERS.ARC": true,
+        "SPRINTNUMS2012.ARC": true
+      },
+      "remaining_boundary": "The retail frontend transition and its SprintNums2012 preload are present. Replacing or removing that archive is not safe. A disposable retail profile must still prove creation, race completion, save, reload, and restoration before the app modifies an executable or save."
+    }
+  },
+  "ok": true,
+  "errors": []
+}

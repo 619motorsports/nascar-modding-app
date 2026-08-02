@@ -1,0 +1,2 @@
+# Reproducible Windows packaging toolchain. Runtime packages stay in requirements.txt.
+pyinstaller==6.21.0

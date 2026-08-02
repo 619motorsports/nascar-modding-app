@@ -1,10 +1,91 @@
 #!/usr/bin/env python3
 # NASCAR Modding App v1.0.2 - public release
-import csv, io, json, os, re, shutil, struct, subprocess, tempfile, webbrowser, math as _math, importlib.util, collections, time, threading, zipfile, hashlib
+import csv, io, json, os, re, shutil, struct, subprocess, tempfile, webbrowser, math as _math, collections, time, threading, zipfile, hashlib
 import numpy as np
 from PIL import Image, ImageFilter, ImageDraw
 from flask import Flask, jsonify, request, send_file, send_from_directory, after_this_request, Response, g
 import containers as C
+from nascar_modding.core.cdf import (
+    legacy_tuples as _read_cdf_tuples,
+    read_cdf as _read_cdf_entries,
+)
+from nascar_modding.core.files import atomic_write_bytes, atomic_write_json
+from nascar_modding.core.modules import load_module
+from nascar_modding.core.processes import is_process_running
+from nascar_modding.editing.archive import (
+    LEGACY_BACKUP_SUFFIX,
+    MOD_BACKUP_SUFFIX,
+    backup_path,
+)
+from nascar_modding.editing.backups import BackupManager
+from nascar_modding.editing.audio import AudioBankEditor, audio_category as _shared_audio_category
+from nascar_modding.editing.audio_tools import AudioToolsManager
+from nascar_modding.editing.appdata import AppDataManager
+from nascar_modding.editing.ratings import (
+    PYC_CODE_BASE as SHARED_PYC_CODE_BASE,
+    RATING_FIELDS,
+    RATING_LABELS,
+    RatingsEditor,
+)
+from nascar_modding.editing.names import DriverHandleEditor, DriverNameEditor
+from nascar_modding.editing.resources import ResourceEditor
+from nascar_modding.editing.pyc_records import (
+    AI_GLOBAL_FIELDS as SHARED_AI_GLOBAL_FIELDS,
+    AI_TRACK_FIELDS as SHARED_AI_TRACK_FIELDS,
+    WORLD_PACE_FIELDS as SHARED_WORLD_PACE_FIELDS,
+    PycRecordEditor,
+    coerce_scalar_like as _shared_coerce_scalar_like,
+    exact_field_variant as _shared_exact_field_variant,
+    mapped_rows_from_pyc_bytes as _shared_mapped_rows_from_pyc_bytes,
+    patch_load_const_operand as _shared_patch_load_const_operand,
+    scalar_same_type as _shared_scalar_same_type,
+)
+from nascar_modding.editing.scr import (
+    CATEGORY_ORDER as SCR_CATEGORY_ORDER,
+    ScrEditor,
+    parse_numeric_rows as _shared_scr_parse_numeric_rows,
+    scr_category as _shared_scr_category,
+    scr_context as _shared_scr_context,
+    scr_role as _shared_scr_role,
+    scr_track as _shared_scr_track,
+    scr_wheel as _shared_scr_wheel,
+)
+from nascar_modding.editing.schedule import ScheduleEditor
+from nascar_modding.editing.season_packs import SeasonPackEditor
+from nascar_modding.editing.text_tables import (
+    TEXT_CATEGORIES,
+    TextTableEditor,
+)
+from nascar_modding.editing.textures import TextureBankEditor
+from nascar_modding.editing.teams import TeamEditor, TeamPresentationRecovery
+from nascar_modding.editing.team_presentation import TeamPresentationEditor
+from nascar_modding.editing.managed_paints import ManagedPaintEditor
+from nascar_modding.editing.full_repair import FullRepairEditor
+from nascar_modding.editing.livery_wrappers import (
+    HD_DIMS as _NATIVE_HD_DIMS, HD_ENTRY_SIZE as _NATIVE_HD_ENTRY_SIZE,
+    HD_OFFSETS as _NATIVE_HD_MIP_OFFSETS, HD_PITCHES as _NATIVE_HD_MIP_PITCHES,
+    HD_ROLLS as _NATIVE_HD_LARGE_ROLL, SD_DIMS as _NATIVE_SD_DIMS,
+    SD_ENTRY_SIZE as _NATIVE_SD_ENTRY_SIZE, SD_OFFSETS as _NATIVE_SD_MIP_OFFSETS,
+    SD_PITCHES as _NATIVE_SD_MIP_PITCHES, SD_ROLLS as _NATIVE_SD_LARGE_ROLL,
+    NativeLiveryWrapperEditor,
+)
+from nascar_modding.editing.stock_paints import StockPaintEditor
+from nascar_modding.editing.transactions import (
+    AppendRepointTransaction, ManagedPaintCheckpoint, ManagedPaintTransaction, TeamAssetCheckpoint,
+    TeamAssetTransaction,
+)
+from nascar_modding.editing.user_library import UserLibrary
+from nascar_modding.formats import audio as _shared_audio
+from nascar_modding.formats.python2_pyc import (
+    rebuild_with_float_constant as _stat_rebuild_with_const,
+    root_constants as _pyc_consts,
+    root_layout as _stat_root_layout,
+)
+from nascar_modding.games.assets import classify_livery_slot, livery_asset_words
+from nascar_modding.games.installation import GameInstallation
+from nascar_modding.games.profiles import GAME_PROFILES
+from nascar_modding.verification.tracks import TrackInventory
+from nascar_modding.verification.support import SupportReporter
 
 import sys
 import datetime
@@ -33,49 +114,39 @@ def component_path(name):
             return candidate
     return candidates[0]
 
+
+def _load_module_from_path(
+    path, module_name, *, missing_message=None, load_message=None
+):
+    """Load one backend module so import validation is implemented once."""
+    return load_module(
+        path,
+        module_name,
+        add_parent=True,
+        missing_message=missing_message,
+        load_message=load_message,
+    )
+
+
+def _load_internal_module(
+    helper_name, module_name, missing_message=None, load_message=None
+):
+    """Load one bundled backend helper through the canonical component path."""
+    return _load_module_from_path(
+        component_path(helper_name),
+        module_name,
+        missing_message=(
+            missing_message
+            or f'{helper_name} is missing from the internal tools folder'
+        ),
+        load_message=load_message,
+    )
+
+
 SELECTOR_CONFIG = os.path.join(USER_DIR, 'game_selector.json')
 ACTIVE_GAME = 'nascar15'
 GAME_SESSION_SELECTED = False
 _GAME_SWITCH_LOCK = threading.RLock()
-
-GAME_PROFILES = {
-    'nascar15': {
-        'id': 'nascar15',
-        'name': 'NASCAR 15',
-        'short_name': 'NASCAR 15',
-        'season_prefix': '15',
-        'folder_names': ('NASCAR 15',),
-        'required_archives': ('0', '2'),
-        'paint_primary_archive': '2',
-        'tabs': ('Setup','Grid','Names','Text','Stats','Audio','Race','AI','UI','Repoint','Settings','Checkup'),
-        'paint_modes': ('library','create','schedule'),
-        'full_feature_set': True,
-        'season_year': 2015,
-        'series_uid': 25040,
-        'number_container': 'SPRINTNUMS2015.ARC',
-        'data_subdir': '',
-        'team_editor_mode': 'full',
-        'graphics_mode': 'packaged',
-    },
-    'nascar14': {
-        'id': 'nascar14',
-        'name': "NASCAR '14",
-        'short_name': "NASCAR '14",
-        'season_prefix': '14',
-        'folder_names': ("NASCAR '14", 'NASCAR 14'),
-        'required_archives': ('0', '7', '8'),
-        'paint_primary_archive': '7',
-        'tabs': ('Setup','Grid','Names','Text','Stats','Audio','Race','AI','UI','Settings'),
-        'paint_modes': ('library',),
-        'full_feature_set': False,
-        'season_year': 2014,
-        'series_uid': 22538,
-        'number_container': 'SPRINTNUMS2014.ARC',
-        'data_subdir': 'nascar14',
-        'team_editor_mode': 'names_only',
-        'graphics_mode': 'discovered',
-    },
-}
 
 def _profile_dir(game_id=None):
     gid = game_id or ACTIVE_GAME
@@ -115,34 +186,6 @@ APP_NAME = 'NASCAR Modding App'
 APP_VERSION = '1.0.2'
 APP_RELEASE_LABEL = 'Public release'
 
-# New installs use the Modding App backup suffix. Previous-version backups
-# remain valid and are reused automatically so updates never strand a pristine copy.
-MOD_BACKUP_SUFFIX = '.n15mod.bak'
-LEGACY_BACKUP_SUFFIX = '.gridapp.bak'
-
-def backup_path(live_path):
-    """Return the oldest surviving app backup, not merely the newest suffix.
-
-    Some long-running installs contain both a legacy ``.gridapp.bak`` made
-    before the first mod and a newer ``.n15mod.bak`` made after experimental
-    work.  Preferring the newer filename can silently treat already-modified
-    bytes as pristine.  The earliest timestamp is the safest available base.
-    """
-    modern = str(live_path) + MOD_BACKUP_SUFFIX
-    legacy = str(live_path) + LEGACY_BACKUP_SUFFIX
-    existing = [p for p in (modern, legacy) if os.path.exists(p)]
-    if existing:
-        # Hard precedence, not mtime: a legacy .gridapp.bak always predates a
-        # .n15mod.bak by release history, and mtime is not durable across
-        # folder copies, cloud sync, or restores from an external backup.
-        # Trusting mtime can silently promote an already-modified archive to
-        # "pristine", which bakes mods into the baseline permanently.
-        if os.path.exists(legacy):
-            return legacy
-        return modern
-    return modern
-
-
 def _valid_backup(path, kind):
     """Is this file trustworthy enough to copy back over a live game file?
 
@@ -166,32 +209,6 @@ def _valid_backup(path, kind):
     if kind == 'cdf':
         return head == b'filC'
     return os.path.getsize(path) > 1024
-
-
-# ---------------- durable write primitives ----------------
-def atomic_write_bytes(path, data, tmp_suffix='.tmp'):
-    """Durably replace `path` with `data`.
-
-    os.replace() is atomic with respect to the *rename*, not the *contents*.
-    Without an fsync first, a crash or power loss between the write and the
-    rename can leave a valid directory entry pointing at a partial or
-    zero-length file. For a cdfiles index that means a bricked install, so
-    every index rewrite goes through here.
-    """
-    tmp = str(path) + tmp_suffix
-    try:
-        with open(tmp, 'wb') as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except Exception:
-            pass
-        raise
 
 
 class RollbackFailed(RuntimeError):
@@ -237,11 +254,7 @@ def load_cfg():
         return {}
 
 def save_cfg(c):
-    os.makedirs(os.path.dirname(CONFIG) or USER_DIR, exist_ok=True)
-    tmp = CONFIG + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as fh:
-        json.dump(c, fh, indent=1)
-    os.replace(tmp, CONFIG)
+    atomic_write_json(CONFIG, c, indent=1)
 
 def _load_selector_cfg():
     try:
@@ -250,13 +263,20 @@ def _load_selector_cfg():
         return {}
 
 def _save_selector_cfg(data):
-    tmp = SELECTOR_CONFIG + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as fh:
-        json.dump(data, fh, indent=1)
-    os.replace(tmp, SELECTOR_CONFIG)
+    atomic_write_json(SELECTOR_CONFIG, data, indent=1)
 
 def active_game_profile():
     return GAME_PROFILES[ACTIVE_GAME]
+
+def _limited_editor_profile():
+    """Whether the compatibility editor must use conservative write policy."""
+    return not bool(active_game_profile().get('full_feature_set'))
+
+def _profile_scoped_state(default_path, filename):
+    """Keep non-default game state isolated behind one path policy."""
+    if active_game_profile().get('data_subdir'):
+        return os.path.join(_profile_dir(),filename)
+    return default_path
 
 def active_game_name():
     return active_game_profile()['name']
@@ -280,27 +300,26 @@ def _protected_operation_busy():
 
 def _activate_game(game_id):
     global ACTIVE_GAME, CONFIG, SCHEMES
-    global FULL_REPAIR_REPORT, EXTRA_SCHEME_STATE, EXTRA_SCHEME_IMAGES, EXTRA_SCHEME_ROLLBACK_DIR
+    global EXTRA_SCHEME_STATE, EXTRA_SCHEME_IMAGES, EXTRA_SCHEME_ROLLBACK_DIR
     global TEAM_MANAGER_STATE, TEAM_ASSET_ROLLBACK_DIR, _RP_HISTORY
     if game_id not in GAME_PROFILES: raise ValueError('unsupported game profile')
     busy=_protected_operation_busy()
     if busy: raise RuntimeError('cannot change games while a protected operation is running: '+', '.join(busy))
     snapshot=dict(active=ACTIVE_GAME,config=CONFIG,schemes=SCHEMES,
-                  full=globals().get('FULL_REPAIR_REPORT'),extra=globals().get('EXTRA_SCHEME_STATE'),
+                  extra=globals().get('EXTRA_SCHEME_STATE'),
                   extra_images=globals().get('EXTRA_SCHEME_IMAGES'),extra_rollback=globals().get('EXTRA_SCHEME_ROLLBACK_DIR'),
                   team=globals().get('TEAM_MANAGER_STATE'),rollback=globals().get('TEAM_ASSET_ROLLBACK_DIR'),rp=globals().get('_RP_HISTORY'))
     new_config=_profile_config_path(game_id); new_schemes=_profile_schemes_path(game_id)
     os.makedirs(new_schemes, exist_ok=True)
     try:
         ACTIVE_GAME=game_id; CONFIG=new_config; SCHEMES=new_schemes
-        if 'FULL_REPAIR_REPORT' in globals(): FULL_REPAIR_REPORT=os.path.join(_profile_dir(game_id),'last_whole_mod_repair.json')
         if 'EXTRA_SCHEME_STATE' in globals(): EXTRA_SCHEME_STATE=os.path.join(_profile_dir(game_id),'extra_schemes_v1.json')
         if 'EXTRA_SCHEME_IMAGES' in globals(): EXTRA_SCHEME_IMAGES=os.path.join(SCHEMES,'extra')
         if 'EXTRA_SCHEME_ROLLBACK_DIR' in globals(): EXTRA_SCHEME_ROLLBACK_DIR=os.path.join(_profile_dir(game_id),'extra_scheme_rollback_v1')
         if 'TEAM_MANAGER_STATE' in globals(): TEAM_MANAGER_STATE=os.path.join(_profile_dir(game_id),'team_manager_state.json')
         if 'TEAM_ASSET_ROLLBACK_DIR' in globals(): TEAM_ASSET_ROLLBACK_DIR=os.path.join(_profile_dir(game_id),'team_asset_rollback_v1')
         if '_RP_HISTORY' in globals(): _RP_HISTORY=os.path.join(_profile_dir(game_id),'repoint_history.json')
-        for cache_name in ('_UI_TEXT_FILE_CACHE','_BASELINE_VERIFY_CACHE','_UI_THUMB_CACHE','_SCHEDULE_CACHE','_SCHEDULE_SOURCE_CACHE','_TRACK_CACHE','_CDF_ENTRY_CACHE','_PYC_AUDIT_CACHE'):
+        for cache_name in ('_UI_TEXT_FILE_CACHE','_BASELINE_VERIFY_CACHE','_UI_THUMB_CACHE','_TRACK_CACHE','_CDF_ENTRY_CACHE','_PYC_AUDIT_CACHE'):
             cache=globals().get(cache_name)
             if isinstance(cache,dict): cache.clear()
         text_cache=globals().get('_UI_TEXT_CACHE')
@@ -312,7 +331,7 @@ def _activate_game(game_id):
         selector=_load_selector_cfg(); selector['last_game']=game_id; _save_selector_cfg(selector)
     except Exception:
         ACTIVE_GAME=snapshot['active']; CONFIG=snapshot['config']; SCHEMES=snapshot['schemes']
-        for name,key in (('FULL_REPAIR_REPORT','full'),('EXTRA_SCHEME_STATE','extra'),('EXTRA_SCHEME_IMAGES','extra_images'),('EXTRA_SCHEME_ROLLBACK_DIR','extra_rollback'),('TEAM_MANAGER_STATE','team'),('TEAM_ASSET_ROLLBACK_DIR','rollback'),('_RP_HISTORY','rp')):
+        for name,key in (('EXTRA_SCHEME_STATE','extra'),('EXTRA_SCHEME_IMAGES','extra_images'),('EXTRA_SCHEME_ROLLBACK_DIR','extra_rollback'),('TEAM_MANAGER_STATE','team'),('TEAM_ASSET_ROLLBACK_DIR','rollback'),('_RP_HISTORY','rp')):
             if name in globals(): globals()[name]=snapshot[key]
         raise
 
@@ -508,26 +527,7 @@ def need(reg, key):
 
 # ---------------- cdfiles ----------------
 def parse_cdfiles(path):
-    d = open(path,'rb').read()
-    hdr = struct.unpack_from('<12I', d, 0)
-    if hdr[0]!=0x436C6966: raise ValueError('not filC')
-    n, strtab = hdr[8], hdr[10]
-    base = len(d)-strtab
-    def nm(off):
-        p=base+off; e=d.find(b'\0',p)
-        return d[p:e].decode('ascii','replace')
-    for start, lay in ((0x40,'A'),(0x50,'B')):
-        out, ok, pos = [], 0, start
-        for i in range(n):
-            if pos+32>base: break
-            f = struct.unpack_from('<8I', d, pos)
-            if lay=='A': name_off,size,arc_off = f[1],f[2],f[5]
-            else:        name_off,size,arc_off = f[3],f[4],f[7]
-            s = nm(name_off) if name_off<strtab else ''
-            if s and all(32<=ord(c)<127 for c in s): ok+=1
-            out.append((arc_off,size,s)); pos+=32
-        if ok>n*0.8: return [e for e in out if e[2]]
-    raise ValueError('unrecognized cdfiles layout')
+    return _read_cdf_tuples(path)
 
 def find_entry(reg, arcid, name, pristine=False):
     cdf=need(reg,arcid)['cdf']
@@ -538,30 +538,11 @@ def find_entry(reg, arcid, name, pristine=False):
     raise ValueError(f'{name} not found in ARCHIVE{arcid}')
 
 # ---------------- grid slots (multi-archive) ----------------
-BASE_SLOT_RE = re.compile(r'^LIVERY_(14|15)_(\d+[A-Z]?)_(.+?)\.ARC$')
-CAREER_SLOT_RE = re.compile(r'^LIVERY_CAREER_(\w+?)_(\d+)\.ARC$')
-BONUS_SLOT_RE = re.compile(r'^LIVERY_(LENOVO\d*)_?(\w+)\.ARC$')
-DLC_SLOT_RE = re.compile(r'^LIVERY_DLC_(\d+)_([A-Z]+)_(\d+)\.ARC$')
-
-
 def slot_from_name(n, o, s, arcid, hd_map):
-    base = BASE_SLOT_RE.match(n)
-    career = CAREER_SLOT_RE.match(n)
-    bonus = BONUS_SLOT_RE.match(n)
-    dlc = DLC_SLOT_RE.match(n)
-    if base:
-        if base.group(1) != active_game_profile()['season_prefix']:
-            return None
-        num, label, kind = base.group(2), base.group(3).replace('_',' ').title(), 'driver'
-    elif career:
-        label, num, kind = f"Career {career.group(1).title()} {career.group(2)}", '', 'career'
-    elif bonus:
-        label, num, kind = f"{bonus.group(1).title()} {bonus.group(2).title()}", '', 'bonus'
-    elif dlc:
-        label = f"{dlc.group(2).title()} Alt {dlc.group(3)} (DLC)"
-        num, kind = dlc.group(1), 'dlc'
-    else:
+    classified = classify_livery_slot(ACTIVE_GAME, n)
+    if classified is None:
         return None
+    num, label, kind = classified.number, classified.label, classified.kind
     hn = 'HD' + n
     hd = hd_map.get(hn)
     return dict(name=n, hd=hn if hd else None, label=label,
@@ -904,394 +885,32 @@ def build_payload(composite, w, h, mips, stock_payload=None, layer_alpha=None,
 
 
 # === native SD mip L0-L10 writer v0.9.14 ===
-_NATIVE_SD_ENTRY_SIZE = 0x164161
-_NATIVE_SD_MIP_OFFSETS = (
-    0x000000, 0x100000, 0x140000, 0x150000,
-    0x154000, 0x156000, 0x158000, 0x15A000,
-    0x15C000, 0x15E000, 0x160000, 0x162000,
-)
-_NATIVE_SD_MIP_PITCHES = (
-    0x1000, 0x0800, 0x0400, 0x0200,
-    0x0100, 0x0100, 0x0100, 0x0100,
-    0x0100, 0x0100, 0x0100, 0x0100,
-)
-_NATIVE_SD_DIMS = (
-    (2048,1024), (1024,512), (512,256), (256,128),
-    (128,64), (64,32), (32,16), (16,8),
-    (8,4), (4,2), (2,1), (1,1),
-)
-_NATIVE_SD_LARGE_ROLL = (0, -10, -15, -18, -19)
 _NATIVE_SD_WRAP_X_BLOCKS = -5
 _NATIVE_SD_WRAP_Y_BLOCKS = -1
 _NATIVE_SD_PHYS_BLOCKS = 32
-
-def _native_sd_validate_wrapper(wrapper):
-    if len(wrapper) != _NATIVE_SD_ENTRY_SIZE:
-        raise ValueError(
-            f'SD livery entry is {len(wrapper):#x}; expected '
-            f'{_NATIVE_SD_ENTRY_SIZE:#x}'
-        )
-    if wrapper[:4] != b'ARCC':
-        raise ValueError('SD livery entry does not begin with ARCC')
-    if wrapper[0xCC:0xD0] != b'DXT1':
-        raise ValueError('SD livery DXT1 marker missing at 0xCC')
-
-    table_start = len(wrapper) - 0x89
-    actual_offsets = struct.unpack_from('<12I', wrapper, table_start)
-    actual_pitches = struct.unpack_from('<12I', wrapper, table_start + 48)
-
-    if tuple(actual_offsets) != _NATIVE_SD_MIP_OFFSETS:
-        got = ', '.join(f'{v:#x}' for v in actual_offsets)
-        raise ValueError(f'unexpected SD native mip offset table: {got}')
-    if tuple(actual_pitches) != _NATIVE_SD_MIP_PITCHES:
-        got = ', '.join(f'{v:#x}' for v in actual_pitches)
-        raise ValueError(f'unexpected SD native mip pitch table: {got}')
-
-def _native_sd_level_image(base_rgb, level):
-    w,h = _NATIVE_SD_DIMS[level]
-    box = Image.Resampling.BOX if hasattr(Image, 'Resampling') else Image.BOX
-    image = base_rgb if level == 0 else base_rgb.resize((w,h), box)
-    # Stock-proven native compensation. The game interprets these mip pages
-    # with this offset; omitting it shifts the UV atlas in-game.
-    if level <= 4:
-        roll = _NATIVE_SD_LARGE_ROLL[level]
-        if roll:
-            image = Image.fromarray(
-                np.roll(np.asarray(image.convert('RGB')), roll, axis=1)
-            )
-    return image.convert('RGB')
-
-def _native_sd_level_mask(base_alpha, level):
-    if base_alpha is None:
-        return None
-    w,h = _NATIVE_SD_DIMS[level]
-    box = Image.Resampling.BOX if hasattr(Image, 'Resampling') else Image.BOX
-    mask = base_alpha if base_alpha.size == (w,h) else base_alpha.resize((w,h), box)
-    arr = np.asarray(mask).astype(np.float32) / 255.0
-    if level <= 4:
-        roll = _NATIVE_SD_LARGE_ROLL[level]
-        if roll:
-            arr = np.roll(arr, roll, axis=1)
-    return arr
-
-def _native_sd_block_mask(mask, width, height):
-    blocks_w = max(1, (width + 3)//4)
-    blocks_h = max(1, (height + 3)//4)
-    if mask is None:
-        return np.ones((blocks_h, blocks_w), dtype=bool)
-    padded = np.zeros((blocks_h*4, blocks_w*4), dtype=np.float32)
-    padded[:height,:width] = mask[:height,:width]
-    return padded.reshape(blocks_h,4,blocks_w,4).max(axis=(1,3)) > 0.01
-
-def _native_sd_patch_wrapper(pristine_wrapper, composite, layer_alpha=None):
-    _native_sd_validate_wrapper(pristine_wrapper)
-
-    original = bytes(pristine_wrapper)
-    wrapper = bytearray(pristine_wrapper)
-    allowed = np.zeros(len(wrapper), dtype=np.uint8)
-
-    box = Image.Resampling.BOX if hasattr(Image, 'Resampling') else Image.BOX
-    base_rgb = composite.convert('RGB')
-    if base_rgb.size != (2048,1024):
-        base_rgb = base_rgb.resize((2048,1024), box)
-
-    base_alpha = None
-    if layer_alpha is not None:
-        base_alpha = layer_alpha.convert('L')
-        if base_alpha.size != (2048,1024):
-            base_alpha = base_alpha.resize((2048,1024), box)
-
-    levels_written = []
-
-    for level in range(11):
-        width,height = _NATIVE_SD_DIMS[level]
-        image = _native_sd_level_image(base_rgb, level)
-        encoded = encode_image(image)
-        blocks_w = max(1, (width + 3)//4)
-        blocks_h = max(1, (height + 3)//4)
-        needed = blocks_w * blocks_h * 8
-
-        encoded = encoded[:needed]
-        if len(encoded) != needed:
-            encoded = encoded + b'\0' * (needed - len(encoded))
-
-        source_blocks = np.frombuffer(encoded, np.uint8).reshape(
-            blocks_h, blocks_w, 8
-        )
-        touched = _native_sd_block_mask(
-            _native_sd_level_mask(base_alpha, level), width, height
-        )
-        mip_base = RAW_OFFSET + _NATIVE_SD_MIP_OFFSETS[level]
-        pitch = _NATIVE_SD_MIP_PITCHES[level]
-
-        changed_blocks = 0
-        for sy in range(blocks_h):
-            for sx in range(blocks_w):
-                if not touched[sy,sx]:
-                    continue
-
-                if level <= 4:
-                    dest_x = sx
-                    dest_y = sy
-                else:
-                    dest_x = (
-                        sx + _NATIVE_SD_WRAP_X_BLOCKS
-                    ) % _NATIVE_SD_PHYS_BLOCKS
-                    dest_y = (
-                        sy + _NATIVE_SD_WRAP_Y_BLOCKS
-                    ) % _NATIVE_SD_PHYS_BLOCKS
-
-                destination = mip_base + dest_y*pitch + dest_x*8
-                end = destination + 8
-
-                if destination < RAW_OFFSET:
-                    raise ValueError(f'L{level} write before texture payload')
-                if end > RAW_OFFSET + _NATIVE_SD_MIP_OFFSETS[11]:
-                    raise ValueError(
-                        f'L{level} write would reach L11/footer at {destination:#x}'
-                    )
-
-                wrapper[destination:end] = source_blocks[sy,sx].tobytes()
-                allowed[destination:end] = 1
-                changed_blocks += 1
-
-        levels_written.append(
-            f'L{level}:{width}x{height}/{changed_blocks} blocks'
-        )
-
-    before = np.frombuffer(original, np.uint8)
-    after = np.frombuffer(bytes(wrapper), np.uint8)
-    changed = before != after
-    bad = np.flatnonzero(changed & (allowed == 0))
-    if bad.size:
-        raise ValueError(
-            f'native SD safety check failed: changed unapproved byte '
-            f'{int(bad[0]):#x}'
-        )
-
-    l11_start = RAW_OFFSET + _NATIVE_SD_MIP_OFFSETS[11]
-    if wrapper[l11_start:] != pristine_wrapper[l11_start:]:
-        raise ValueError('L11/footer changed; install refused')
-    if len(wrapper) != len(pristine_wrapper):
-        raise ValueError('SD wrapper size changed; install refused')
-
-    return wrapper, levels_written, int(changed.sum())
-
-
-# === native HD mip L0-L11 writer v0.9.29.7 ===
-# The previous extra-slot path wrote a compact linear mip chain. NASCAR 15's HD
-# wrapper is page-mapped: L6-L11 each begin on their own 0x2000 page. Packing
-# those levels linearly put them into L5 padding and left the table-selected
-# native pages on donor data. This writer mirrors the proven SD native layout.
-_NATIVE_HD_ENTRY_SIZE = 0x564161
-_NATIVE_HD_MIP_OFFSETS = (
-    0x000000, 0x400000, 0x500000, 0x540000,
-    0x550000, 0x554000, 0x556000, 0x558000,
-    0x55A000, 0x55C000, 0x55E000, 0x560000,
-    0x562000,
-)
-_NATIVE_HD_MIP_PITCHES = (
-    0x2000, 0x1000, 0x0800, 0x0400,
-    0x0200, 0x0100, 0x0100, 0x0100,
-    0x0100, 0x0100, 0x0100, 0x0100,
-    0x0100,
-)
-_NATIVE_HD_DIMS = (
-    (4096,2048), (2048,1024), (1024,512), (512,256),
-    (256,128), (128,64), (64,32), (32,16),
-    (16,8), (8,4), (4,2), (2,1), (1,1),
-)
-_NATIVE_HD_LARGE_ROLL = (0, -10, -15, -18, -19, -20)
-# Stock SD/HD pairs are not authored from identical logical canvases. At an
-# equivalent 2048x1024 resolution, pristine HD content is 10 pixels to the
-# right of pristine SD content (20 pixels at the native 4096x2048 HD canvas).
-# The HD page-map compensation then brings corresponding *stored* SD/HD mip
-# pages into exact alignment. Omitting this separate HD-atlas offset produced
-# the medium-distance double image seen in RC3-RC7.
-_NATIVE_HD_ATLAS_X_ROLL = 20
 _NATIVE_HD_WRAP_X_BLOCKS = -5
 _NATIVE_HD_WRAP_Y_BLOCKS = -1
 _NATIVE_HD_PHYS_BLOCKS = 32
 
 
-def _native_hd_validate_wrapper(wrapper):
-    if len(wrapper) != _NATIVE_HD_ENTRY_SIZE:
-        raise ValueError(
-            f'HD livery entry is {len(wrapper):#x}; expected '
-            f'{_NATIVE_HD_ENTRY_SIZE:#x}'
-        )
-    if wrapper[:4] != b'ARCC':
-        raise ValueError('HD livery entry does not begin with ARCC')
-    if wrapper[0xCC:0xD0] != b'DXT1':
-        raise ValueError('HD livery DXT1 marker missing at 0xCC')
-    table_start = len(wrapper) - 0x89
-    actual_offsets = struct.unpack_from('<13I', wrapper, table_start)
-    actual_pitches = struct.unpack_from('<13I', wrapper, table_start + 52)
-    if tuple(actual_offsets) != _NATIVE_HD_MIP_OFFSETS:
-        got = ', '.join(f'{v:#x}' for v in actual_offsets)
-        raise ValueError(f'unexpected HD native mip offset table: {got}')
-    if tuple(actual_pitches) != _NATIVE_HD_MIP_PITCHES:
-        got = ', '.join(f'{v:#x}' for v in actual_pitches)
-        raise ValueError(f'unexpected HD native mip pitch table: {got}')
+def _native_sd_patch_wrapper(pristine_wrapper, composite, layer_alpha=None):
+    return _shared_livery_wrapper_editor().patch_sd(pristine_wrapper, composite, layer_alpha)
 
 
-def _native_hd_level_image(base_rgb, level):
-    w,h = _NATIVE_HD_DIMS[level]
-    box = Image.Resampling.BOX if hasattr(Image, 'Resampling') else Image.BOX
-    image = base_rgb if level == 0 else base_rgb.resize((w,h), box)
-    # Stock-proven native compensation for the HD page map.
-    if level <= 5:
-        roll = _NATIVE_HD_LARGE_ROLL[level]
-        if roll:
-            image = Image.fromarray(
-                np.roll(np.asarray(image.convert('RGB')), roll, axis=1)
-            )
-    return image.convert('RGB')
+def _native_hd_patch_wrapper_impl(pristine_wrapper, composite, atlas_x_roll):
+    return _shared_livery_wrapper_editor().patch_hd(
+        pristine_wrapper, composite, stock_atlas_alignment=bool(atlas_x_roll),
+    )
 
 
 def _native_hd_patch_wrapper(pristine_wrapper, composite):
-    _native_hd_validate_wrapper(pristine_wrapper)
-    original = bytes(pristine_wrapper)
-    wrapper = bytearray(pristine_wrapper)
-    allowed = np.zeros(len(wrapper), dtype=np.uint8)
-    box = Image.Resampling.BOX if hasattr(Image, 'Resampling') else Image.BOX
-    base_rgb = composite.convert('RGB')
-    if base_rgb.size != (4096,2048):
-        base_rgb = base_rgb.resize((4096,2048), box)
-    # Match the independently measured relationship in two pristine stock
-    # pairs (Kevin Harvick and Jamie McMurray): HD L0 is +20 px versus SD L0,
-    # and equivalent stored mip pages then align at 0 px after the native
-    # per-mip page compensation. This is distinct from community-template
-    # alignment, which is applied to the shared source before either wrapper.
-    if _NATIVE_HD_ATLAS_X_ROLL:
-        base_rgb = Image.fromarray(
-            np.roll(np.asarray(base_rgb), _NATIVE_HD_ATLAS_X_ROLL, axis=1).astype(np.uint8),
-            'RGB'
-        )
-    levels_written = []
-
-    # L12 is the 1x1 terminal page and is preserved with the footer, matching
-    # the SD writer's L11 preservation rule.
-    for level in range(12):
-        width,height = _NATIVE_HD_DIMS[level]
-        image = _native_hd_level_image(base_rgb, level)
-        encoded = encode_image(image)
-        blocks_w = max(1, (width + 3)//4)
-        blocks_h = max(1, (height + 3)//4)
-        needed = blocks_w * blocks_h * 8
-        encoded = encoded[:needed] + b'\0' * max(0, needed-len(encoded))
-        source_blocks = np.frombuffer(encoded, np.uint8).reshape(
-            blocks_h, blocks_w, 8
-        )
-        mip_base = RAW_OFFSET + _NATIVE_HD_MIP_OFFSETS[level]
-        pitch = _NATIVE_HD_MIP_PITCHES[level]
-        changed_blocks = 0
-        for sy in range(blocks_h):
-            for sx in range(blocks_w):
-                if level <= 5:
-                    dest_x, dest_y = sx, sy
-                else:
-                    dest_x = (sx + _NATIVE_HD_WRAP_X_BLOCKS) % _NATIVE_HD_PHYS_BLOCKS
-                    dest_y = (sy + _NATIVE_HD_WRAP_Y_BLOCKS) % _NATIVE_HD_PHYS_BLOCKS
-                destination = mip_base + dest_y*pitch + dest_x*8
-                end = destination + 8
-                if destination < RAW_OFFSET:
-                    raise ValueError(f'HD L{level} write before texture payload')
-                if end > RAW_OFFSET + _NATIVE_HD_MIP_OFFSETS[12]:
-                    raise ValueError(
-                        f'HD L{level} write would reach L12/footer at {destination:#x}'
-                    )
-                wrapper[destination:end] = source_blocks[sy,sx].tobytes()
-                allowed[destination:end] = 1
-                changed_blocks += 1
-        levels_written.append(
-            f'L{level}:{width}x{height}/{changed_blocks} blocks'
-        )
-
-    before = np.frombuffer(original, np.uint8)
-    after = np.frombuffer(bytes(wrapper), np.uint8)
-    changed = before != after
-    bad = np.flatnonzero(changed & (allowed == 0))
-    if bad.size:
-        raise ValueError(
-            f'native HD safety check failed: changed unapproved byte '
-            f'{int(bad[0]):#x}'
-        )
-    l12_start = RAW_OFFSET + _NATIVE_HD_MIP_OFFSETS[12]
-    if wrapper[l12_start:] != pristine_wrapper[l12_start:]:
-        raise ValueError('HD L12/footer changed; install refused')
-    if len(wrapper) != len(pristine_wrapper):
-        raise ValueError('HD wrapper size changed; install refused')
-    return wrapper, levels_written, int(changed.sum())
+    return _shared_livery_wrapper_editor().patch_hd(
+        pristine_wrapper, composite, stock_atlas_alignment=True,
+    )
 
 
-
-# Exact public-v1 HD writer reserved for added-paint creation/repair.
 def _native_hd_patch_wrapper_public_v1(pristine_wrapper, composite):
-    _native_hd_validate_wrapper(pristine_wrapper)
-    original = bytes(pristine_wrapper)
-    wrapper = bytearray(pristine_wrapper)
-    allowed = np.zeros(len(wrapper), dtype=np.uint8)
-    box = Image.Resampling.BOX if hasattr(Image, 'Resampling') else Image.BOX
-    base_rgb = composite.convert('RGB')
-    if base_rgb.size != (4096,2048):
-        base_rgb = base_rgb.resize((4096,2048), box)
-    levels_written = []
-
-    # L12 is the 1x1 terminal page and is preserved with the footer, matching
-    # the SD writer's L11 preservation rule.
-    for level in range(12):
-        width,height = _NATIVE_HD_DIMS[level]
-        image = _native_hd_level_image(base_rgb, level)
-        encoded = encode_image(image)
-        blocks_w = max(1, (width + 3)//4)
-        blocks_h = max(1, (height + 3)//4)
-        needed = blocks_w * blocks_h * 8
-        encoded = encoded[:needed] + b'\0' * max(0, needed-len(encoded))
-        source_blocks = np.frombuffer(encoded, np.uint8).reshape(
-            blocks_h, blocks_w, 8
-        )
-        mip_base = RAW_OFFSET + _NATIVE_HD_MIP_OFFSETS[level]
-        pitch = _NATIVE_HD_MIP_PITCHES[level]
-        changed_blocks = 0
-        for sy in range(blocks_h):
-            for sx in range(blocks_w):
-                if level <= 5:
-                    dest_x, dest_y = sx, sy
-                else:
-                    dest_x = (sx + _NATIVE_HD_WRAP_X_BLOCKS) % _NATIVE_HD_PHYS_BLOCKS
-                    dest_y = (sy + _NATIVE_HD_WRAP_Y_BLOCKS) % _NATIVE_HD_PHYS_BLOCKS
-                destination = mip_base + dest_y*pitch + dest_x*8
-                end = destination + 8
-                if destination < RAW_OFFSET:
-                    raise ValueError(f'HD L{level} write before texture payload')
-                if end > RAW_OFFSET + _NATIVE_HD_MIP_OFFSETS[12]:
-                    raise ValueError(
-                        f'HD L{level} write would reach L12/footer at {destination:#x}'
-                    )
-                wrapper[destination:end] = source_blocks[sy,sx].tobytes()
-                allowed[destination:end] = 1
-                changed_blocks += 1
-        levels_written.append(
-            f'L{level}:{width}x{height}/{changed_blocks} blocks'
-        )
-
-    before = np.frombuffer(original, np.uint8)
-    after = np.frombuffer(bytes(wrapper), np.uint8)
-    changed = before != after
-    bad = np.flatnonzero(changed & (allowed == 0))
-    if bad.size:
-        raise ValueError(
-            f'native HD safety check failed: changed unapproved byte '
-            f'{int(bad[0]):#x}'
-        )
-    l12_start = RAW_OFFSET + _NATIVE_HD_MIP_OFFSETS[12]
-    if wrapper[l12_start:] != pristine_wrapper[l12_start:]:
-        raise ValueError('HD L12/footer changed; install refused')
-    if len(wrapper) != len(pristine_wrapper):
-        raise ValueError('HD wrapper size changed; install refused')
-    return wrapper, levels_written, int(changed.sum())
-
+    return _shared_livery_wrapper_editor().patch_hd(pristine_wrapper, composite)
 
 def ensure_backup(live,bak):
     # Create a backup only if one doesn't already exist, and only from a
@@ -1339,61 +958,18 @@ def _clear_ui_thumb_cache(*keys):
     if isinstance(grid,dict): grid.update(sig=None,rows=None)
 
 # ---------------- install ----------------
-def write_fei(reg, slot, thumb_img):
-    """Write a DLC FEI preview through the mapped native ARCC entry.
-
-    Public v1 wrote at a hard-coded +0x100 offset and swapped DXT5 block halves.
-    Clean-file mapping proves FEI_LIV uses the normal 16-byte-record / 24-byte
-    texture-header layout, with a full 65536-byte standard-order DXT5 payload.
-    This function remains unused by the guarded DLC install path until the first
-    in-game validation pass, but it is no longer capable of the old blind write.
-    """
-    if not slot.get('fei'):
-        raise ValueError('DLC slot has no FEI preview resource')
-    a=need(reg, slot['arc'])
-    ensure_backup(a['ar'], a['bak'])
-    off=slot['fei']['off']; size=slot['fei']['size']
-    with open(a['ar'],'rb') as fh:
-        fh.seek(off); arc=fh.read(size)
-    entries,_=C.parse_multi_arc(arc)
-    wanted=str(slot['fei'].get('name') or '')
-    entry=next((e for e in entries if e.get('name')==wanted),None)
-    if entry is None and len(entries)==1:
-        entry=entries[0]
-    if entry is None:
-        raise ValueError(f'{wanted or "FEI preview"} not found in mapped FEI container')
-    new=C.multi_write_png_validated(arc,entry,thumb_img.resize((entry['w'],entry['h'])),encode_fn=encode_any)
-    if len(new)!=len(arc):
-        raise ValueError('FEI container size changed; write refused')
-    with open(a['ar'],'r+b') as fh:
-        fh.seek(off); fh.write(new); fh.flush(); os.fsync(fh.fileno())
-        fh.seek(off)
-        if fh.read(size)!=new:
-            raise ValueError('FEI readback mismatch')
-    return f"FEI {entry['name']} (native mapped write)"
-
-def career_container(reg, live=True):
-    a=need(reg,'0')
-    off,size=find_entry(reg,'0','BASESCHEMETHUMBNAILS.ARC')
-    src=a['ar'] if live or not os.path.exists(a['bak']) else a['bak']
-    with open(src,'rb') as fh:
-        fh.seek(off); return off,size,fh.read(size)
-
 def write_career_thumb(reg, slot, thumb_img):
-    a=need(reg,'0')
-    ensure_backup(a['ar'], a['bak'])
-    off,size,arc = career_container(reg, live=True)
-    entries,_=C.parse_multi_arc(arc)
-    m=re.match(r'^LIVERY_CAREER_(\w+?)_(\d+)\.ARC$', slot['name'])
-    if not m: raise ValueError('not a career slot')
-    target=f"CAREER_{m.group(1).upper()}_{m.group(2)}"
-    ent=[e for e in entries if e['name']==target]
-    if not ent: raise ValueError(f'{target} not in thumbnail container')
-    new=C.multi_write_png(arc, ent[0], thumb_img, encode_fn=encode_any)
-    with open(a['ar'],'r+b') as fh:
-        fh.seek(off); fh.write(new)
+    """Compatibility adapter for the shared decoded-texture writer."""
+    match = re.match(r'^LIVERY_CAREER_(\w+?)_(\d+)\.ARC$', slot['name'])
+    if not match:
+        raise ValueError('not a career slot')
+    target = f"CAREER_{match.group(1).upper()}_{match.group(2)}"
+    result = _shared_texture_editor().replace_image(
+        '0', 'BASESCHEMETHUMBNAILS.ARC', target, thumb_img,
+        resize_mode='fit', experimental=True,
+    )
     _clear_ui_thumb_cache()
-    return f"thumb {target}"
+    return f"thumb {target} ({'verified' if result.get('verified') else 'unverified'})"
 
 def slot_thumb_source(slot):
     """User-uploaded thumb if present, else auto-generated from the scheme."""
@@ -1404,149 +980,25 @@ def slot_thumb_source(slot):
     return None
 
 def install_slot(reg, slot, png_path, layer_path=None):
-    """Install one existing paint as an atomic SD/HD transaction.
-
-    Both wrappers are fully prepared and every live target region is snapshotted
-    before the first game byte changes. If any write, readback, or archive-size
-    check fails, every attempted region is restored to its exact pre-install
-    bytes. This prevents a failed HD build/write from leaving only the SD paint
-    changed.
-    """
-    sd_arc = str(slot.get('sd_arc') or slot['arc'])
-    hd_arc = str(slot.get('hd_arc') or sd_arc) if slot.get('hd') else None
-    if slot.get('hd') and int(slot.get('hd_size') or 0) != _NATIVE_HD_ENTRY_SIZE:
-        raise ValueError(
-            f"HD wrapper mismatch for {slot.get('hd')} in ARCHIVE{hd_arc}: "
-            f"actual {int(slot.get('hd_size') or 0):#x}, expected {_NATIVE_HD_ENTRY_SIZE:#x}. Nothing written.")
-    sd_info = need(reg, sd_arc)
-    ensure_backup(sd_info['ar'], sd_info['bak'])
-    if hd_arc:
-        hd_info = need(reg, hd_arc)
-        ensure_backup(hd_info['ar'], hd_info['bak'])
-    else:
-        hd_info = None
-
-    comp = Image.open(png_path).convert('RGB')
-    alpha = None
-    if layer_path and os.path.exists(layer_path):
-        la = Image.open(layer_path)
-        alpha = la.split()[3] if la.mode == 'RGBA' else la.convert('L')
-
-    original_sizes = {sd_arc: os.path.getsize(sd_info['ar'])}
-    if hd_arc:
-        original_sizes[hd_arc] = os.path.getsize(hd_info['ar'])
-
-    # Prepare every intended byte before touching the live archives.
-    sd_off, sd_size = int(slot['sd_off']), int(slot['sd_size'])
-    with open(sd_info['bak'], 'rb') as pristine:
-        pristine.seek(sd_off)
-        sd_pristine = bytearray(pristine.read(sd_size))
-    if len(sd_pristine) != sd_size:
-        raise ValueError('short read from pristine SD livery entry')
-    sd_wrapper, sd_levels, sd_changed = _native_sd_patch_wrapper(sd_pristine, comp, alpha)
-
-    writes = [dict(
-        arcid=sd_arc, info=sd_info, off=sd_off, size=sd_size,
-        intended=bytes(sd_wrapper), label='SD')]
-    hd_result = None
-    if slot.get('hd') and int(slot.get('hd_size') or 0) == _NATIVE_HD_ENTRY_SIZE:
-        hd_off, hd_size = int(slot['hd_off']), int(slot['hd_size'])
-        with open(hd_info['bak'], 'rb') as pristine:
-            pristine.seek(hd_off)
-            hd_pristine = bytearray(pristine.read(hd_size))
-        if len(hd_pristine) != hd_size:
-            raise ValueError('short read from pristine HD livery entry')
-        # RC5: use the mapped native page/pitch writer with the original
-        # stock-proven per-mip compensation. RC3 removed that compensation and
-        # visibly shifted the full atlas. Full-replacement imports still write
-        # every intended block, preventing donor texture bleed/fade.
-        hd_wrapper, hd_levels, hd_changed = _native_hd_patch_wrapper(hd_pristine, comp)
-        hd_result = (
-            f"HD native L0-L11 in ARCHIVE{hd_arc} @0x{hd_off:X} "
-            f"({hd_changed} changed bytes; L12/footer preserved)")
-        writes.append(dict(
-            arcid=hd_arc, info=hd_info, off=hd_off, size=hd_size,
-            intended=bytes(hd_wrapper), label='HD'))
-
-    # Snapshot the current live regions, not the pristine backup. A failed
-    # reinstall must return the user to the paint they had immediately before
-    # pressing Install, even when that was already modified.
-    for item in writes:
-        with open(item['info']['ar'], 'rb') as live:
-            live.seek(item['off'])
-            item['old_live'] = live.read(item['size'])
-        if len(item['old_live']) != item['size']:
-            raise ValueError(
-                f"short live read for {item['label']} livery entry before install")
-
-    attempted = []
-    try:
-        for item in writes:
-            attempted.append(item)
-            with open(item['info']['ar'], 'r+b') as live:
-                live.seek(item['off'])
-                live.write(item['intended'])
-                live.flush()
-                os.fsync(live.fileno())
-                live.seek(item['off'])
-                if live.read(item['size']) != item['intended']:
-                    raise ValueError(
-                        f"{item['label']} native-mip readback mismatch")
-        for arcid, size_before in original_sizes.items():
-            if os.path.getsize(need(reg,arcid)['ar']) != size_before:
-                raise ValueError(
-                    f'ARCHIVE{arcid} size changed during paint install')
-    except Exception as install_ex:
-        rollback_errors = []
-        for item in reversed(attempted):
-            try:
-                with open(item['info']['ar'], 'r+b') as live:
-                    live.seek(item['off'])
-                    live.write(item['old_live'])
-                    live.flush()
-                    os.fsync(live.fileno())
-                    live.seek(item['off'])
-                    if live.read(item['size']) != item['old_live']:
-                        raise ValueError('rollback readback mismatch')
-            except Exception as rb:
-                rollback_errors.append(
-                    f"ARCHIVE{item['arcid']} {item['label']} region: {rb}")
-        for arcid, size_before in original_sizes.items():
-            try:
-                path = need(reg,arcid)['ar']
-                if os.path.getsize(path) != size_before:
-                    with open(path, 'r+b') as live:
-                        live.truncate(size_before)
-                        live.flush()
-                        os.fsync(live.fileno())
-            except Exception as rb:
-                rollback_errors.append(f'ARCHIVE{arcid} size restore: {rb}')
-        _clear_ui_thumb_cache()
-        if rollback_errors:
-            raise RollbackFailed(install_ex, '; '.join(rollback_errors)) from install_ex
-        raise
-
+    """Compatibility adapter for the shared transactional stock-paint writer."""
+    report = _shared_stock_paint_editor().install(
+        slot['name'], png_path,
+        hd_name=(slot.get('hd') if slot.get('hd') else False),
+        layer_path=layer_path,
+    )
     results = [
-        f"SD native L0-L10 in ARCHIVE{sd_arc} @0x{sd_off:X} "
-        f"({sd_changed} changed bytes; L11/footer preserved)"]
-    if hd_result:
-        results.append(hd_result)
-
+        f"SD native paint installed ({report['sd_changed_bytes']} changed bytes)"
+    ]
+    if report.get('hd'):
+        results.append(f"HD native paint installed ({report['hd_changed_bytes']} changed bytes)")
     try:
-        th = slot_thumb_source(slot)
-        if th is not None:
-            if slot['kind'] == 'career':
-                results.append(write_career_thumb(reg,slot,th))
-            elif slot.get('fei'):
-                # v1.0.1 safety hotfix: the old FEI writer treats every DLC
-                # preview as a normal 256x256 DXT5 payload at +0x100. Public
-                # testing showed that selecting a replaced DLC car can fatal
-                # immediately. Preserve the exact native FEI bytes until that
-                # wrapper is mapped and validated in-game; changing the on-track
-                # SD/HD paint does not require changing this menu preview.
-                results.append('DLC FEI preview preserved unchanged (v1.0.1 safety lock)')
+        thumbnail = slot_thumb_source(slot)
+        if thumbnail is not None and slot.get('kind') == 'career':
+            results.append(write_career_thumb(reg, slot, thumbnail))
+        elif thumbnail is not None and slot.get('fei'):
+            results.append('DLC FEI preview preserved unchanged (safety lock)')
     except Exception as ex:
-        results.append(f"thumb skipped: {ex}")
+        results.append(f'thumb skipped: {ex}')
     _clear_ui_thumb_cache()
     return results
 
@@ -1628,9 +1080,7 @@ _DRIVER_DISPLAY_ALIAS_CACHE={}
 
 
 def _driver_asset_words(slot_name):
-    name=re.sub(r'^(?:HD)?LIVERY_(?:14|15)_[^_]+_','',str(slot_name or ''),flags=re.I)
-    name=re.sub(r'\.ARC$','',name,flags=re.I)
-    parts=[p for p in name.split('_') if p]
+    parts=[p for p in livery_asset_words(ACTIVE_GAME,slot_name).split() if p]
     tails={'PRIMARY','SECONDARY','TERTIARY','ALT','ALTERNATE','BEER','THROWBACK','TEST','DEFAULT','SPECIAL','NIGHT','DAY'}
     while parts and parts[-1].upper() in tails:parts.pop()
     return ' '.join(parts)
@@ -1759,7 +1209,7 @@ def roster(reg):
             config_uid=link.get('config_uid'),team_uid=link.get('team_uid'),profile_id=link.get('profile_id'),slot=link.get('slot')))
     drivers.sort(key=lambda x:(int(re.match(r'\d+',str(x.get('number') or '9999')).group(0)) if re.match(r'\d+',str(x.get('number') or '')) else 9999, str(x.get('number') or ''), x['current'].casefold()))
     teams=[]
-    if ACTIVE_GAME=='nascar15':
+    if not _limited_editor_profile():
         try:
             catalog=_team_friendly_catalog()
             for team in catalog.get('teams',[]):
@@ -1769,205 +1219,26 @@ def roster(reg):
             teams.sort(key=lambda x:x['current'].casefold())
         except Exception:teams=[]
     if not teams:
-        team_names=TEAMS_2014 if ACTIVE_GAME=='nascar14' else TEAMS_2015
+        team_names=TEAMS_2014 if _limited_editor_profile() else TEAMS_2015
         for team_name in team_names:
             orig=find_exact_string(blob,team_name)
             if orig:teams.append(dict(original=orig,current=led.get(orig,orig)))
     return drivers,teams
 
-def text_regions(reg):
-    return [(o,s,n) for o,s,n in parse_cdfiles(need(reg,'0')['cdf'])
-            if n.upper().startswith('TEXT') and n.upper().endswith('.LDA')]
-
-def patch_name(reg, old, new):
-    ob,nb = old.encode('latin1'), new.encode('latin1')
-    if len(nb)>len(ob): raise ValueError(f'new name must be {len(ob)} characters or fewer')
-    nb = nb+b' '*(len(ob)-len(nb))
-    a=need(reg,'0'); ensure_backup(a['ar'], a['bak'])
-    patched=0
-    # `with` matters here: an exception mid-loop used to leak the handle, and on
-    # Windows that leaves ARCHIVE0 locked so the user's next Restore fails too.
-    with open(a['ar'],'r+b') as fh:
-        for off,sz,nm2 in text_regions(reg):
-            fh.seek(off); blob=bytearray(fh.read(sz))
-            p=blob.find(ob); ch=False
-            while p>=0:
-                blob[p:p+len(ob)]=nb; patched+=1; ch=True
-                p=blob.find(ob,p+1)
-            if ch: fh.seek(off); fh.write(blob)
-        fh.flush(); os.fsync(fh.fileno())
-    return patched
-
-def _cdfiles_record_pos(cdf_path, target):
-    """Find the 32-byte record for `target` and return (pos, layout)."""
-    d=open(cdf_path,'rb').read()
-    hdr=struct.unpack_from('<12I',d,0)
-    n,strtab=hdr[8],hdr[10]; sbase=len(d)-strtab
-    def nm(off):
-        p=sbase+off; e=d.find(b'\0',p)
-        return d[p:e].decode('ascii','replace')
-    for start,lay in ((0x40,'A'),(0x50,'B')):
-        pos=start; ok=0; hits=[]
-        for i in range(n):
-            if pos+32>sbase: break
-            f=struct.unpack_from('<8I',d,pos)
-            no = f[1] if lay=='A' else f[3]
-            s = nm(no) if no<strtab else ''
-            if s and all(32<=ord(c)<127 for c in s): ok+=1
-            if s==target: hits.append(pos)
-            pos+=32
-        if ok>n*0.8:
-            if not hits: raise ValueError(f'{target} not in cdfiles')
-            return hits[0], lay
-    raise ValueError('unrecognized cdfiles layout')
-
-def patch_name_exp(reg, old, new):
-    """Length-changing LDA rename with archive/CDF transaction rollback."""
-    ob, nb = str(old).encode('latin1'), str(new).encode('latin1')
-    a = need(reg, '0')
-    ensure_backup(a['ar'], a['bak'])
-    cdf = a['cdf']
-    ensure_backup(cdf, backup_path(cdf))
-    original_archive_size = os.path.getsize(a['ar'])
-    original_cdf = open(cdf, 'rb').read()
-    # Snapshot each live text region because in-slot edits are not removed by a
-    # simple archive truncate.
-    regions = text_regions(reg)
-    region_bytes = {}
-    with open(a['ar'], 'rb') as fh:
-        for off, sz, name in regions:
-            fh.seek(off); region_bytes[(off, sz, name)] = fh.read(sz)
-    patched = 0
-    try:
-        for off, sz, nm2 in regions:
-            blob = region_bytes[(off, sz, nm2)]
-            try:
-                rebuilt, n = C.lda_rebuild(blob, {ob: nb})
-            except Exception:
-                continue
-            if not n:
-                continue
-            patched += n
-            if len(rebuilt) <= sz:
-                with open(a['ar'], 'r+b') as fh:
-                    fh.seek(off); fh.write(rebuilt + b'\0' * (sz - len(rebuilt)))
-                    fh.flush(); os.fsync(fh.fileno())
-                if len(rebuilt) != sz:
-                    pos, lay = _cdfiles_record_pos(cdf, nm2)
-                    cdf_live = bytearray(open(cdf, 'rb').read())
-                    struct.pack_into('<I', cdf_live, pos + (8 if lay == 'A' else 16), len(rebuilt))
-                    _extra_atomic_bytes(cdf, bytes(cdf_live))
-            else:
-                with open(a['ar'], 'r+b') as fh:
-                    fh.seek(0, 2); endp = fh.tell(); pad = (-endp) % 16
-                    fh.write(b'\0' * pad); new_off = endp + pad; fh.write(rebuilt)
-                    fh.flush(); os.fsync(fh.fileno())
-                pos, lay = _cdfiles_record_pos(cdf, nm2)
-                cdf_live = bytearray(open(cdf, 'rb').read())
-                if lay == 'A':
-                    struct.pack_into('<I', cdf_live, pos + 8, len(rebuilt))
-                    struct.pack_into('<I', cdf_live, pos + 20, new_off)
-                else:
-                    struct.pack_into('<I', cdf_live, pos + 16, len(rebuilt))
-                    struct.pack_into('<I', cdf_live, pos + 28, new_off)
-                _extra_atomic_bytes(cdf, bytes(cdf_live))
-        if not patched:
-            raise ValueError('name not found as a text-table entry')
-        # Verify that at least one live LDA now contains the exact new value.
-        verified = False
-        for off, sz, _name in text_regions(reg):
-            with open(a['ar'], 'rb') as fh:
-                fh.seek(off); blob = fh.read(sz)
-            hit = find_exact_string(blob, str(new))
-            if hit is not None and str(hit).strip().casefold() == str(new).strip().casefold():
-                verified = True; break
-        if not verified:
-            raise ValueError('rename readback failed: new text was not found')
-        return patched
-    except Exception as original:
-        rollback_errors = []
-        try:
-            with open(a['ar'], 'r+b') as fh:
-                fh.truncate(original_archive_size)
-                for (off, _sz, _name), raw in region_bytes.items():
-                    fh.seek(off); fh.write(raw)
-                fh.flush(); os.fsync(fh.fileno())
-        except Exception as ex:
-            rollback_errors.append('archive restore: ' + str(ex))
-        try:
-            _extra_atomic_bytes(cdf, original_cdf)
-        except Exception as ex:
-            rollback_errors.append('cdf restore: ' + str(ex))
-        if rollback_errors:
-            raise RuntimeError(str(original) + '; rollback also failed: ' + '; '.join(rollback_errors)) from original
-        raise
-
-def _marshal_string_rebuild(pyc, old_bytes, new_bytes):
-    """Replace exact Python-2 marshal string objects, allowing a new length.
-
-    Handles are stored as marshal strings in DB_GAME_LOCAL_SCRIPT.PYC.  Updating
-    the four-byte length and rebuilding the complete PYC keeps interned-string
-    references valid while removing the old fixed-slot character limit.
-    """
-    hits=[]
-    for tag in (ord('s'),ord('t'),ord('u')):
-        for encoded_tag in (tag,tag|0x80):
-            needle=bytes((encoded_tag,))+struct.pack('<i',len(old_bytes))+old_bytes
-            start=0
-            while True:
-                pos=pyc.find(needle,start)
-                if pos<0:break
-                hits.append((pos,len(needle)))
-                start=pos+1
-    if not hits:
-        raise ValueError('current handle was not found as a game-data string')
-    out=bytearray(pyc)
-    for pos,total in sorted(set(hits),reverse=True):
-        out[pos+1:pos+5]=struct.pack('<i',len(new_bytes))
-        out[pos+5:pos+total]=new_bytes
-    rebuilt=bytes(out)
-    # A complete Python-2 marshal reparse is the structural guard.  This catches
-    # an accidental match inside bytecode or another raw payload before install.
-    _mapper_direct_module().parse_pyc(rebuilt)
-    return rebuilt,len(set(hits))
-
-
-def patch_handle(reg, old, new):
-    """Length-changing driver-card handle replacement with exact PYC repoint."""
-    old=str(old);clean_new=str(new).strip().lstrip('@')
-    if not clean_new:raise ValueError('empty handle')
-    if '\x00' in clean_new:raise ValueError('handles cannot contain a null character')
-    try:ob=old.encode('latin1');nb=clean_new.encode('latin1')
-    except UnicodeEncodeError as ex:raise ValueError('handle must use characters supported by the game text encoding') from ex
-    # Not tied to the stock slot width.  The generous sanity ceiling prevents a
-    # pasted paragraph from becoming a multi-kilobyte runtime identifier.
-    if len(nb)>255:raise ValueError('handle is too long for a game menu identifier')
-    v,row,pyc=_pyc_live_blob('DB_GAME_LOCAL_SCRIPT.PYC')
-    rebuilt,patched=_marshal_string_rebuild(pyc,ob,nb)
-    _rp_backup_pair(v)
-    if len(rebuilt)==row['size']:
-        with open(v['ar'],'r+b') as fh:
-            fh.seek(row['offset']);before=fh.read(row['size'])
-            fh.seek(row['offset']);fh.write(rebuilt);fh.flush();os.fsync(fh.fileno())
-            fh.seek(row['offset']);check=fh.read(row['size'])
-        if check!=rebuilt:
-            with open(v['ar'],'r+b') as fh:
-                fh.seek(row['offset']);fh.write(before);fh.flush();os.fsync(fh.fileno())
-            raise ValueError('handle readback failed; previous bytes restored')
-    else:
-        fd,tmp=tempfile.mkstemp(prefix='n15mod_handle_',suffix='.PYC');os.close(fd)
-        try:
-            open(tmp,'wb').write(rebuilt)
-            with _RP_LOCK:_rp_install_one('0',v,row,tmp,source_name='Driver card handle',allow_magic=True)
-        finally:
-            try:os.remove(tmp)
-            except OSError:pass
-    _v,_row,live=_pyc_live_blob('DB_GAME_LOCAL_SCRIPT.PYC')
-    _mapper_direct_module().parse_pyc(live)
-    marker_found=any(live.find(bytes((tag,))+struct.pack('<i',len(nb))+nb)>=0 for tag in (ord('s'),ord('t'),ord('u'),ord('s')|0x80,ord('t')|0x80,ord('u')|0x80))
-    if not marker_found:raise ValueError('handle live readback failed')
-    return patched,clean_new
-
+def _apply_display_name(reg, old, new, experimental=True):
+    """Route verified driver names to the shared editor; retain team-text compatibility."""
+    game = detect_game()
+    if game:
+        editor = DriverNameEditor(_shared_installation(), DATA)
+        wanted = str(old).strip().casefold()
+        matches = [
+            row for row in editor.drivers()
+            if wanted in (row['current'].strip().casefold(), row['original'].strip().casefold())
+        ]
+        if len(matches) == 1 and matches[0]['available']:
+            result = editor.rename(matches[0]['driver_uid'], new)
+            return result['tables']
+    return TextTableEditor(_shared_installation()).replace_exact(old, new)
 
 # ==================== v0.9.25 UI TEXT EDITOR ====================
 # NASCAR 15 stores user-facing interface strings in indexed TEXT*.LDA tables.
@@ -1976,23 +1247,114 @@ def patch_handle(reg, old, new):
 # longer strings use the proven append + cdfiles repoint transaction.
 _UI_TEXT_CACHE={'signature':None,'rows':None,'files':None,'errors':None}
 _UI_TEXT_FILE_CACHE={}
-_UI_TEXT_CATEGORIES=[
-    'Menus & Navigation','Race, HUD & Session Text','Career & Championship',
-    'Paint, Garage & Team Shop','Prompts & Controls','Errors & Warnings',
-    'Loading, Tips & Help','Formatted Templates','Other User Text',
-    'Technical / Internal'
-]
-_UI_TEXT_MAX_BATCH=5000
-_UI_TEXT_TOKEN_RX=re.compile(
-    r'%(?:\([^)]+\))?[#0\- +]?\d*(?:\.\d+)?[diouxXeEfFgGcrsa%]|'
-    r'\{[^{}\r\n]+\}|\$[A-Za-z_][A-Za-z0-9_]*\$|'
-    r'\\[nrt]'
-)
-_UI_TEXT_MAIN_MENU={
-    'race now','career','single season','multiplayer','paint booth','options',
-    'extras','my nascar','team shop','driver select','track select','continue',
-    'quick race','championship','livery studio','quit','exit game'
-}
+_UI_TEXT_CATEGORIES=list(TEXT_CATEGORIES)
+
+
+def _shared_text_editor():
+    return TextTableEditor(_shared_installation())
+
+
+def _shared_installation():
+    """One selected-installation adapter for every legacy Flask workflow."""
+    game=detect_game()
+    if not game:raise RuntimeError('game folder not found')
+    return GameInstallation(ACTIVE_GAME,game)
+
+
+def _shared_resource_editor():
+    return ResourceEditor(_shared_installation())
+
+
+def _shared_append_transaction():
+    return AppendRepointTransaction(_shared_installation())
+
+
+def _shared_backup_manager():
+    return BackupManager(_shared_installation())
+
+
+def _shared_audio_editor():
+    return AudioBankEditor(_shared_installation())
+
+
+def _shared_track_inventory():
+    return TrackInventory(_shared_installation())
+
+
+def _shared_schedule_editor():
+    return ScheduleEditor(_shared_installation(), CONFIG)
+
+
+def _shared_season_pack_editor():
+    return SeasonPackEditor(_shared_installation(), USER_DIR)
+
+
+def _shared_team_editor():
+    return TeamEditor(_shared_installation())
+
+
+def _shared_team_presentation_recovery():
+    return TeamPresentationRecovery(_shared_installation(), USER_DIR)
+
+
+def _shared_team_presentation_editor():
+    return TeamPresentationEditor(_shared_installation(), USER_DIR)
+
+
+def _shared_managed_paint_editor():
+    return ManagedPaintEditor(_shared_installation(), EXTRA_SCHEME_STATE)
+
+
+def _shared_full_repair_editor():
+    return FullRepairEditor(_shared_installation(), USER_DIR, app_version=APP_VERSION)
+
+
+def _shared_paint_transaction():
+    return ManagedPaintTransaction(
+        _shared_installation(), EXTRA_SCHEME_STATE, EXTRA_SCHEME_IMAGES,
+    )
+
+
+def _shared_paint_checkpoint():
+    return ManagedPaintCheckpoint(_shared_paint_transaction(), EXTRA_SCHEME_ROLLBACK_DIR)
+
+
+def _shared_team_asset_transaction():
+    return TeamAssetTransaction(
+        _shared_installation(), TEAM_MANAGER_STATE, EXTRA_SCHEME_STATE,
+    )
+
+
+def _shared_team_asset_checkpoint():
+    return TeamAssetCheckpoint(_shared_team_asset_transaction(), TEAM_ASSET_ROLLBACK_DIR)
+
+
+def _shared_user_library():
+    return UserLibrary(CONFIG)
+
+
+def _shared_scr_editor():
+    return ScrEditor(_shared_installation())
+
+
+def _shared_pyc_editor():
+    return PycRecordEditor(_shared_installation())
+
+
+def _shared_texture_editor():
+    return TextureBankEditor(_shared_installation())
+
+
+def _shared_livery_wrapper_editor():
+    return NativeLiveryWrapperEditor(_shared_installation())
+
+
+def _shared_stock_paint_editor():
+    return StockPaintEditor(_shared_installation())
+
+
+def _shared_driver_handle_editor():
+    return DriverHandleEditor(_shared_installation(), CONFIG, DATA)
 
 
 def _ui_text_signature(reg):
@@ -2006,76 +1368,8 @@ def _ui_text_signature(reg):
     return tuple(out)
 
 
-def _ui_text_sources(reg,pristine=False):
-    v=need(reg,'0')
-    pair=bool(os.path.exists(v['bak']) and os.path.exists(backup_path(v['cdf'])))
-    if pristine and not pair:
-        raise ValueError('no pristine ARCHIVE0 + cdfiles0 backup pair exists yet')
-    use_stock=bool(pristine and pair)
-    return (v['bak'] if use_stock else v['ar'],
-            backup_path(v['cdf']) if use_stock else v['cdf'],use_stock)
-
-
-def _ui_text_file_rows(reg,pristine=False):
-    _ar,cdf,_stock=_ui_text_sources(reg,pristine)
-    return [(o,z,n) for o,z,n in parse_cdfiles(cdf)
-            if re.match(r'^TEXT\d*\.LDA$',n,re.I)]
-
-
-def _ui_text_read_file(reg,name,pristine=False):
-    ar,cdf,use_stock=_ui_text_sources(reg,pristine)
-    hit=None
-    for o,z,n in parse_cdfiles(cdf):
-        if n.casefold()==str(name).casefold():hit=(o,z,n);break
-    if not hit:raise ValueError(f'{name} not found in '+('pristine ' if use_stock else '')+'ARCHIVE0 index')
-    o,z,n=hit
-    with open(ar,'rb') as f:f.seek(o);blob=f.read(z)
-    if len(blob)!=z:raise ValueError(f'short read for {n}')
-    entries=C.lda_entries(blob)
-    return blob,entries,dict(offset=o,size=z,name=n,pristine=use_stock)
-
-
-def _ui_text_decode(raw):
-    return bytes(raw).decode('latin1','replace')
-
-
-def _ui_text_tokens(text):
-    return [t for t in _UI_TEXT_TOKEN_RX.findall(str(text)) if t!='%%']
-
-
 def _ui_text_visible(text):
     return str(text).replace('\r','\\r').replace('\n','\\n').replace('\t','\\t')
-
-
-def _ui_text_classify(text):
-    t=str(text);lo=t.strip().casefold();screen='General UI';category='Other User Text';user=True
-    if not t:
-        return category,screen,False
-    printable=sum(ch.isprintable() or ch in '\r\n\t' for ch in t)/max(1,len(t))
-    technical=(printable<.92 or bool(re.search(r'[/\\]|\.(?:arc|dds|tga|png|pyc|lda|xml|csv)$',lo)) or
-               (re.match(r'^[A-Z0-9_]{4,}$',t) is not None) or
-               (len(t)>2 and ' ' not in t and t.count('_')>=2))
-    if technical:
-        return 'Technical / Internal','Internal identifier',False
-    if lo in _UI_TEXT_MAIN_MENU:
-        return 'Menus & Navigation','Main Menu',True
-    if any(k in lo for k in ('race','lap','qualif','practice','pit','caution','restart','green flag','checkered','draft','damage','fuel','tyre','tire')):
-        category='Race, HUD & Session Text';screen='Race / Garage / HUD'
-    elif any(k in lo for k in ('career','season','championship','standings','points','sponsor','contract','calendar','playoff','chase')):
-        category='Career & Championship';screen='Career / Single Season'
-    elif any(k in lo for k in ('paint','scheme','livery','colour','color','decal','vinyl','team shop')):
-        category='Paint, Garage & Team Shop';screen='Paint Booth / Team Shop'
-    elif any(k in lo for k in ('controller','keyboard','button','press ','select ','confirm','cancel','back','continue','yes','no')):
-        category='Prompts & Controls';screen='Prompts / Controls'
-    elif any(k in lo for k in ('error','failed','unable','warning','invalid','not available','connection','disconnected')):
-        category='Errors & Warnings';screen='Dialog / Error'
-    elif any(k in lo for k in ('loading','tip:','did you know','trivia','fact:')) or len(t)>180:
-        category='Loading, Tips & Help';screen='Loading / Help'
-    elif _ui_text_tokens(t):
-        category='Formatted Templates';screen='Dynamic UI text'
-    elif len(t)<=42 and (t.istitle() or t.isupper()):
-        category='Menus & Navigation';screen='Menu / Heading'
-    return category,screen,user
 
 
 def _ui_text_quick_status():
@@ -2085,18 +1379,9 @@ def _ui_text_quick_status():
     copy before the tab could render. On a full install that could take minutes.
     This quick path only parses cdfiles0; individual tables are decoded lazily.
     """
-    g,reg=registry()
-    if not g or '0' not in reg:
-        raise ValueError('ARCHIVE0 is not available; configure the NASCAR 15 folder first')
-    v=need(reg,'0')
-    has_stock=os.path.exists(v['bak']) and os.path.exists(backup_path(v['cdf']))
-    stock_names=set()
-    if has_stock:
-        try: stock_names={n.casefold() for _o,_z,n in _ui_text_file_rows(reg,True)}
-        except Exception: stock_names=set()
-    files=[dict(name=n,size=z,offset=o,has_stock=n.casefold() in stock_names,
+    files=[dict(name=row['name'],size=row['size'],offset=row['offset'],has_stock=row['has_stock'],
                 count=None,user_facing=None,modified=None)
-           for o,z,n in _ui_text_file_rows(reg,False)]
+           for row in _shared_text_editor().files()]
     return sorted(files,key=lambda x:x['name'].casefold())
 
 
@@ -2107,33 +1392,12 @@ def _ui_text_scan_file(file_name,force=False,include_stock=True):
     key=(sig,str(file_name).casefold(),bool(include_stock))
     if not force and key in _UI_TEXT_FILE_CACHE:
         return _UI_TEXT_FILE_CACHE[key]
-    blob,entries,meta=_ui_text_read_file(reg,file_name,False)
-    stock_entries=[];errors=[]
-    if include_stock:
-        try:
-            _sblob,stock_entries,_smeta=_ui_text_read_file(reg,file_name,True)
-        except Exception as ex:
-            # No paired pristine copy is normal on a first run. Keep the table
-            # usable and simply omit stock comparisons.
-            if 'no pristine' not in str(ex).lower(): errors.append(f'{file_name} stock: {ex}')
-    counts=collections.Counter(_ui_text_decode(e['raw']) for e in entries)
-    rows=[]
-    for e in entries:
-        current=_ui_text_decode(e['raw'])
-        stock=(_ui_text_decode(stock_entries[e['index']]['raw'])
-               if e['index']<len(stock_entries) else None)
-        cat,screen,user=_ui_text_classify(current)
-        rows.append(dict(file=meta['name'],index=e['index'],current=current,stock=stock,
-                         current_length=len(e['raw']),
-                         stock_length=(len(stock_entries[e['index']]['raw']) if e['index']<len(stock_entries) else None),
-                         category=cat,screen=screen,user_facing=user,
-                         modified=(stock is not None and current!=stock),tokens=_ui_text_tokens(current),
-                         byte_offset=e['start'],file_size=len(blob),
-                         reference_count=counts[current],shared=counts[current]>1))
-    result=(rows,dict(name=meta['name'],count=len(rows),
+    rows=_shared_text_editor().entries(file_name);errors=[]
+    result=(rows,dict(name=(rows[0]['file'] if rows else file_name),count=len(rows),
                       user_facing=sum(1 for x in rows if x['user_facing']),
                       modified=sum(1 for x in rows if x['modified']),
-                      size=meta['size'],has_stock=bool(stock_entries)),errors)
+                      size=(rows[0]['file_size'] if rows else 0),
+                      has_stock=any(x['stock'] is not None for x in rows)),errors)
     _UI_TEXT_FILE_CACHE[key]=result
     return result
 
@@ -2144,39 +1408,19 @@ def _ui_text_scan(force=False):
     sig=_ui_text_signature(reg)
     if not force and _UI_TEXT_CACHE.get('rows') is not None and _UI_TEXT_CACHE.get('signature')==sig:
         return _UI_TEXT_CACHE['rows'],_UI_TEXT_CACHE['files'],_UI_TEXT_CACHE['errors']
-    live_files=_ui_text_file_rows(reg,False)
-    v=need(reg,'0');has_pristine=os.path.exists(v['bak']) and os.path.exists(backup_path(v['cdf']))
-    stock_names=({n.casefold() for _o,_z,n in _ui_text_file_rows(reg,True)} if has_pristine else set())
-    rows=[];files=[];errors=[];raw_counts=collections.Counter()
-    per_file=[]
-    for _off,_size,name in live_files:
+    editor=_shared_text_editor();rows=[];files=[];errors=[];raw_counts=collections.Counter()
+    for file_meta in editor.files():
+        name=file_meta['name']
         try:
-            blob,entries,meta=_ui_text_read_file(reg,name,False)
-            stock_entries=[]
-            if name.casefold() in stock_names:
-                try:_sblob,stock_entries,_smeta=_ui_text_read_file(reg,name,True)
-                except Exception as ex:errors.append(f'{name} stock: {ex}')
-            values=[]
-            for e in entries:
-                current=_ui_text_decode(e['raw']);stock=(
-                    _ui_text_decode(stock_entries[e['index']]['raw'])
-                    if e['index']<len(stock_entries) else None)
-                cat,screen,user=_ui_text_classify(current)
-                item=dict(file=name,index=e['index'],current=current,stock=stock,
-                          current_length=len(e['raw']),stock_length=(len(stock_entries[e['index']]['raw']) if e['index']<len(stock_entries) else None),
-                          category=cat,screen=screen,user_facing=user,
-                          modified=(stock is not None and current!=stock),tokens=_ui_text_tokens(current),
-                          byte_offset=e['start'],file_size=len(blob))
-                values.append(item);raw_counts[current]+=1
-            per_file.append((name,values,meta,bool(stock_entries)))
+            values=editor.entries(name)
+            rows.extend(values);raw_counts.update(item['current'] for item in values)
+            files.append(dict(name=name,count=len(values),user_facing=sum(1 for x in values if x['user_facing']),
+                              modified=sum(1 for x in values if x['modified']),size=file_meta['size'],
+                              has_stock=bool(file_meta['has_stock'])))
         except Exception as ex:errors.append(f'{name}: {ex}')
-    for name,values,meta,has_stock in per_file:
-        for item in values:
-            item['reference_count']=raw_counts[item['current']]
-            item['shared']=item['reference_count']>1
-            rows.append(item)
-        files.append(dict(name=name,count=len(values),user_facing=sum(1 for x in values if x['user_facing']),
-                          modified=sum(1 for x in values if x['modified']),size=meta['size'],has_stock=has_stock))
+    for item in rows:
+        item['reference_count']=raw_counts[item['current']]
+        item['shared']=item['reference_count']>1
     _UI_TEXT_CACHE.update(signature=sig,rows=rows,files=files,errors=errors)
     return rows,files,errors
 
@@ -2186,85 +1430,16 @@ def _ui_text_invalidate():
     _UI_TEXT_FILE_CACHE.clear()
 
 
-def _ui_text_exact(reg,file_name,index,pristine=False):
-    blob,entries,meta=_ui_text_read_file(reg,file_name,pristine)
-    i=int(index)
-    if i<0 or i>=len(entries):raise ValueError(f'string index {i} is outside {file_name}')
-    return blob,entries[i],meta
-
-
-def _ui_text_encode(text):
-    text=str(text)
-    if '\x00' in text:raise ValueError('text cannot contain a NUL character')
-    try:return text.encode('latin1')
-    except UnicodeEncodeError as ex:
-        bad=text[ex.start:ex.end]
-        raise ValueError(f'{bad!r} is outside the game\'s Latin-1 text encoding')
-
-
-def _ui_text_missing_tokens(old,new):
-    oldc=collections.Counter(_ui_text_tokens(old));newc=collections.Counter(_ui_text_tokens(new))
-    missing=[]
-    for token,count in oldc.items():
-        if newc[token]<count:missing.extend([token]*(count-newc[token]))
-    return missing
-
-
 def _ui_text_plan(file_name,index,new_text,mode='auto',force_tokens=False):
-    g,reg=registry();blob,e,meta=_ui_text_exact(reg,file_name,index,False)
-    old=_ui_text_decode(e['raw']);newb=_ui_text_encode(new_text);oldb=e['raw']
-    missing=_ui_text_missing_tokens(old,new_text)
-    if missing and not force_tokens:
-        raise ValueError('replacement removes required format token(s): '+', '.join(missing))
-    mode=str(mode or 'auto').lower()
-    if mode not in ('auto','fixed','rebuild'):raise ValueError('mode must be auto, fixed, or rebuild')
-    chosen=('fixed' if len(newb)<=len(oldb) else 'rebuild') if mode=='auto' else mode
-    if chosen=='fixed' and len(newb)>len(oldb):
-        raise ValueError(f'fixed-slot mode allows at most {len(oldb)} Latin-1 bytes; replacement is {len(newb)}')
-    rebuilt_size=len(blob)
-    if chosen=='rebuild':
-        rebuilt,_=C.lda_rebuild_indices(blob,{int(index):newb});rebuilt_size=len(rebuilt)
-    rows,_fm,_fe=_ui_text_scan_file(file_name,include_stock=False);matches=[r for r in rows if r['index']==int(index)]
-    refs=matches[0]['reference_count'] if matches else 1
-    return dict(file=meta['name'],index=int(index),old=old,new=str(new_text),old_bytes=len(oldb),new_bytes=len(newb),
-                mode=chosen,file_size=len(blob),rebuilt_size=rebuilt_size,size_delta=rebuilt_size-len(blob),
-                repoint=(chosen=='rebuild'),missing_tokens=missing,format_tokens=_ui_text_tokens(old),
-                reference_count=refs,shared=refs>1,has_backup=os.path.exists(need(reg,'0')['bak']) and os.path.exists(backup_path(need(reg,'0')['cdf'])))
+    plan=_shared_text_editor().plan(file_name,index,new_text,force_tokens)
+    plan['mode']='rebuild';plan['has_backup']=_shared_text_editor().store.has_pristine
+    return plan
 
 
 def _ui_text_apply_one(file_name,index,new_text,mode='auto',force_tokens=False):
-    plan=_ui_text_plan(file_name,index,new_text,mode,force_tokens)
-    g,reg=registry();v=need(reg,'0')
-    if _rp_game_running():raise ValueError('NASCAR15.exe is running; close the game first')
-    blob,e,meta=_ui_text_exact(reg,file_name,index,False);newb=_ui_text_encode(new_text)
-    _rp_backup_pair(v)
-    if plan['mode']=='fixed':
-        replacement=newb+b'\0'*(len(e['raw'])-len(newb))
-        before_size=os.path.getsize(v['ar'])
-        with open(v['ar'],'r+b') as f:
-            f.seek(meta['offset']+e['start']);f.write(replacement);f.flush();os.fsync(f.fileno())
-            f.seek(meta['offset']+e['start']);readback=f.read(len(replacement))
-        if readback!=replacement:raise ValueError('text readback mismatch')
-        if os.path.getsize(v['ar'])!=before_size:raise ValueError('archive size changed during fixed-slot edit')
-        history=dict(timestamp=datetime.datetime.now().isoformat(timespec='seconds'),archive='0',entry=meta['name'],
-                     category='UI Text',source_name=f'{meta["name"]} string {index}',old_offset=meta['offset'],old_size=meta['size'],
-                     new_offset=meta['offset'],new_size=meta['size'],growth=0,verified=True,text_index=int(index),text_mode='fixed')
-        try:_rp_add_history(history)
-        except Exception:pass
-        result=dict(ok=True,verified=True,mode='fixed',history=history)
-    else:
-        rebuilt,changed=C.lda_rebuild_indices(blob,{int(index):newb})
-        if changed!=1:raise ValueError('the requested text already matches the replacement')
-        fd,tmp=tempfile.mkstemp(prefix='n15mod_ui_text_',suffix='.LDA');os.close(fd)
-        try:
-            with open(tmp,'wb') as f:f.write(rebuilt)
-            _raw,idxrows,_lay=_rp_index_rows(v['cdf']);row=_rp_find_row(idxrows,meta['name'])
-            with _RP_LOCK:
-                result=_rp_install_one('0',v,row,tmp,source_name=f'UI Text {meta["name"]} #{index}',allow_magic=True)
-        finally:
-            try:os.remove(tmp)
-            except OSError:pass
-        result['mode']='rebuild'
+    applied=_shared_text_editor().apply(file_name,index,new_text,force_tokens)
+    plan=applied['plan'];plan['mode']='rebuild'
+    result=dict(ok=True,verified=applied['verified'],mode='rebuild',write=applied['write'])
     _ui_text_invalidate()
     return result,plan
 
@@ -2340,27 +1515,19 @@ def ui_text_change():
 def ui_text_restore():
     q=request.get_json(silent=True) or {}
     try:
-        _blob,e,_meta=_ui_text_exact(registry()[1],q['file'],q['index'],True)
-        stock=_ui_text_decode(e['raw'])
-        result,plan=_ui_text_apply_one(q['file'],q['index'],stock,'rebuild',True)
-        return jsonify(dict(ok=True,stock=stock,plan=plan,result=result))
+        result=_shared_text_editor().restore(q['file'],q['index'])
+        _ui_text_invalidate()
+        return jsonify(dict(ok=True,stock=result['stock'],plan=result['plan'],result=result))
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
 
 
 @app.route('/api/ui_text/restore_file',methods=['POST'])
 def ui_text_restore_file():
-    q=request.get_json(silent=True) or {};tmp=None
+    q=request.get_json(silent=True) or {}
     try:
-        g,reg=registry();v=need(reg,'0');stock,_entries,meta=_ui_text_read_file(reg,q['file'],True)
-        fd,tmp=tempfile.mkstemp(prefix='n15mod_ui_text_stock_',suffix='.LDA');os.close(fd);open(tmp,'wb').write(stock)
-        _raw,rows,_layout=_rp_index_rows(v['cdf']);row=_rp_find_row(rows,meta['name'])
-        with _RP_LOCK:result=_rp_install_one('0',v,row,tmp,source_name=f'UI Text restore {meta["name"]}',allow_magic=True)
-        _ui_text_invalidate();return jsonify(dict(ok=True,result=result,restored=meta['name']))
+        result=_shared_text_editor().restore_file(q['file'])
+        _ui_text_invalidate();return jsonify(dict(ok=True,result=result,restored=result['file']))
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
-    finally:
-        if tmp:
-            try:os.remove(tmp)
-            except OSError:pass
 
 
 @app.route('/api/ui_text/export')
@@ -2383,61 +1550,15 @@ def ui_text_import_preview():
         if not up:raise ValueError('choose a CSV exported by the UI Text Editor')
         raw=up.read()
         if len(raw)>8*1024*1024:raise ValueError('CSV exceeds the 8 MB safety limit')
-        text=raw.decode('utf-8-sig');reader=csv.DictReader(io.StringIO(text));changes=[];seen=set()
-        for line,row in enumerate(reader,2):
-            fn=(row.get('file') or '').strip();idxs=(row.get('index') or '').strip();new=row.get('new_text')
-            if new is None:new=row.get('current_text')
-            if not fn or not idxs:continue
-            key=(fn,int(idxs))
-            if key in seen:raise ValueError(f'duplicate file/index at CSV line {line}: {fn} #{idxs}')
-            seen.add(key)
-            try:
-                plan=_ui_text_plan(fn,int(idxs),new or '','auto',False)
-                if plan['old']==(new or ''):continue
-                changes.append(dict(file=fn,index=int(idxs),new=new or '',valid=True,plan=plan,line=line))
-            except Exception as ex:
-                changes.append(dict(file=fn,index=int(idxs),new=new or '',valid=False,error=str(ex),line=line))
-            if len(changes)>_UI_TEXT_MAX_BATCH:raise ValueError(f'CSV has more than {_UI_TEXT_MAX_BATCH} changes')
+        changes=_shared_text_editor().preview_csv(raw)
         return jsonify(dict(ok=True,count=len(changes),valid_count=sum(1 for x in changes if x['valid']),invalid_count=sum(1 for x in changes if not x['valid']),changes=changes))
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
 
 
 def _ui_text_batch_apply_internal(changes,force_tokens=False,source_prefix='UI Text batch'):
-    td=None
-    if not changes:raise ValueError('no text changes were supplied')
-    if len(changes)>_UI_TEXT_MAX_BATCH:raise ValueError(f'batch exceeds {_UI_TEXT_MAX_BATCH} changes')
-    g,reg=registry();v=need(reg,'0')
-    if _rp_game_running():raise ValueError('NASCAR15.exe is running; close the game first')
-    grouped=collections.defaultdict(dict)
-    for item in changes:
-        fn=str(item['file']);idx=int(item['index']);new=str(item.get('new',''))
-        _blob,e,meta=_ui_text_exact(reg,fn,idx,False);old=_ui_text_decode(e['raw'])
-        missing=_ui_text_missing_tokens(old,new)
-        if missing and not force_tokens:raise ValueError(f'{fn} #{idx} removes token(s): '+', '.join(missing))
-        grouped[meta['name']][idx]=_ui_text_encode(new)
-    try:
-        td=tempfile.mkdtemp(prefix='n15mod_ui_text_batch_');prepared=[]
-        for n,(fn,repls) in enumerate(grouped.items()):
-            blob,_entries,meta=_ui_text_read_file(reg,fn,False);rebuilt,changed=C.lda_rebuild_indices(blob,repls)
-            if not changed:continue
-            fp=os.path.join(td,f'{n:03d}_{os.path.basename(fn)}');open(fp,'wb').write(rebuilt)
-            _raw,idxrows,_layout=_rp_index_rows(v['cdf']);row=_rp_find_row(idxrows,fn)
-            prepared.append((fn,row,fp,changed))
-        if not prepared:raise ValueError('all imported values already match the live text')
-        _rp_backup_pair(v);state=dict(archive_size=os.path.getsize(v['ar']),cdf=open(v['cdf'],'rb').read());results=[]
-        try:
-            with _RP_LOCK:
-                for fn,row,fp,changed in prepared:
-                    r=_rp_install_one('0',v,row,fp,source_name=f'{source_prefix} {fn}',allow_magic=True,history=False)
-                    r['history']['text_changes']=changed;results.append(r)
-                hist=_rp_load_history();hist.extend(r['history'] for r in results);_rp_save_history(hist)
-        except Exception as install_ex:
-            rollback_archive_cdf(v,state['archive_size'],state['cdf'],'.ui_text_rollback.tmp',install_ex)
-            raise
-        _ui_text_invalidate()
-        return dict(ok=True,atomic=True,files=len(results),changes=sum(x[3] for x in prepared),verified=True,results=[r['history'] for r in results])
-    finally:
-        if td:shutil.rmtree(td,ignore_errors=True)
+    result=_shared_text_editor().apply_batch(changes,force_tokens)
+    _ui_text_invalidate()
+    return dict(ok=True,atomic=True,**result)
 
 
 @app.route('/api/ui_text/batch_apply',methods=['POST'])
@@ -2449,221 +1570,32 @@ def ui_text_batch_apply():
 # ==================== end v0.9.25 UI TEXT EDITOR ====================
 
 # ---------------- stats (base 0-100 + supported custom range) ----------------
-STATS=['skill','aggression','skill_intermediate','skill_plate',
-       'skill_road_course','skill_short','skill_superspeedway']
-STAT_LABELS=['Overall Skill','Aggression','Intermediate','Plate','Road Course','Short Track','Superspeedway']
-PYC_CODE_BASE = 30
+STATS=list(RATING_FIELDS)
+STAT_LABELS=list(RATING_LABELS)
+PYC_CODE_BASE = SHARED_PYC_CODE_BASE
 STAT_EXPERIMENTAL_ABS_MAX=1_000_000_000.0
 
 
 def load_profiles():
-    name='ai_profiles_nascar14.csv' if ACTIVE_GAME=='nascar14' else 'ai_profiles.csv'
+    name=active_game_profile().get('ai_profiles_file','ai_profiles.csv')
     return list(csv.DictReader(open(_game_data_path(name),encoding='utf-8-sig')))
 
 
-def _pyc_consts(pyc):
-    class P:
-        def __init__(s,d,o): s.d=d; s.o=o
-        def b(s): v=s.d[s.o]; s.o+=1; return v
-        def i32(s):
-            v=struct.unpack_from('<i',s.d,s.o)[0]; s.o+=4; return v
-        def rd(s,n): v=s.d[s.o:s.o+n]; s.o+=n; return v
-        def obj(s):
-            t=chr(s.b() & 0x7f)
-            if t=='N': return None
-            if t in 'FT': return t=='T'
-            if t=='i': return s.i32()
-            if t=='I': return struct.unpack('<q',s.rd(8))[0]
-            if t=='g': return struct.unpack('<d',s.rd(8))[0]
-            if t=='f': return float(s.rd(s.b()).decode('ascii'))
-            if t in 'st': return s.rd(s.i32())
-            if t=='u': return s.rd(s.i32()).decode('utf8','replace')
-            if t=='R': s.i32(); return None
-            if t in '([': return tuple(s.obj() for _ in range(s.i32()))
-            if t=='l': s.rd(abs(s.i32())*2); return None
-            if t=='c':
-                for _ in range(4): s.i32()
-                s.obj(); consts=s.obj()
-                for _ in range(6): s.obj()
-                s.i32(); s.obj()
-                return consts
-            raise ValueError('marshal '+t)
-    return P(pyc,8).obj()
+def _shared_ratings_editor():
+    return RatingsEditor(_shared_installation(), DATA)
 
 
-class _StatMarshalSkip:
-    """Small Python-2 marshal walker used only to locate root co_consts."""
-    def __init__(self,data):self.d=data;self.i=0
-    def take(self,n):
-        if self.i+n>len(self.d):raise ValueError('truncated Python-2 marshal object')
-        o=self.i;self.i+=n;return o
-    def i32(self):o=self.take(4);return struct.unpack_from('<i',self.d,o)[0]
-    def obj(self,depth=0):
-        if depth>300:raise ValueError('marshal nesting is too deep')
-        c=chr(self.d[self.take(1)] & 0x7f)
-        if c in ('N','T','F','S','.','0'):return
-        if c=='i':self.take(4);return
-        if c=='I':self.take(8);return
-        if c=='g':self.take(8);return
-        if c=='y':self.take(16);return
-        if c=='f':self.take(self.d[self.take(1)]);return
-        if c=='x':
-            self.take(self.d[self.take(1)]);self.take(self.d[self.take(1)]);return
-        if c=='l':self.take(abs(self.i32())*2);return
-        if c in ('s','t','u'):
-            n=self.i32();
-            if n<0:raise ValueError('negative marshal string length')
-            self.take(n);return
-        if c=='R':self.take(4);return
-        if c in ('(','['):
-            n=self.i32()
-            if n<0 or n>10_000_000:raise ValueError('invalid marshal sequence length')
-            for _ in range(n):self.obj(depth+1)
-            return
-        if c=='{':
-            while True:
-                if self.i>=len(self.d):raise ValueError('unterminated marshal dict')
-                if chr(self.d[self.i]&0x7f)=='0':self.i+=1;break
-                self.obj(depth+1);self.obj(depth+1)
-            return
-        if c=='c':
-            self.take(16)
-            for _ in range(8):self.obj(depth+1) # code,consts,names,varnames,freevars,cellvars,filename,name
-            self.take(4);self.obj(depth+1)
-            return
-        raise ValueError('unsupported Python-2 marshal type '+repr(c))
+def read_stats(_reg):
+    return _shared_ratings_editor().ratings()
 
 
-def _stat_root_layout(pyc):
-    if len(pyc)<31 or pyc[8]&0x7f!=ord('c'):
-        raise ValueError('unexpected PYC root layout')
-    r=_StatMarshalSkip(pyc);r.i=9;r.take(16)
-    typ=chr(pyc[r.take(1)]&0x7f)
-    if typ not in ('s','t'):raise ValueError('PYC root bytecode is not a string object')
-    code_len=r.i32();code_off=r.take(code_len)
-    const_type_off=r.i
-    if chr(pyc[r.take(1)]&0x7f)!='(':
-        raise ValueError('PYC root constants are not a tuple')
-    count_pos=r.i;count=r.i32();items_start=r.i
-    for _ in range(count):r.obj(1)
-    return dict(code_off=code_off,code_len=code_len,const_type_off=const_type_off,
-                count_pos=count_pos,count=count,items_start=items_start,const_end=r.i)
+def write_stat(_reg, profile_id, stat, value100, experimental=False):
+    return _shared_ratings_editor().set_rating(profile_id, stat, value100, experimental)
 
 
-def _stat_live_entry(reg):
-    v=need(reg,'0');raw,rows,layout=_rp_index_rows(v['cdf']);row=_rp_find_row(rows,'DB_AICONFIG_SCRIPT.PYC')
-    with open(v['ar'],'rb') as fh:fh.seek(row['offset']);pyc=fh.read(row['size'])
-    if len(pyc)!=row['size']:raise ValueError('short DB_AICONFIG_SCRIPT.PYC read')
-    return v,row,pyc
-
-
-def stat_machine(reg):
-    v,row,pyc=_stat_live_entry(reg)
-    layout=_stat_root_layout(pyc)
-    consts=_pyc_consts(pyc)
-    iov={i:const_value for i,const_value in enumerate(consts) if isinstance(const_value,float)}
-    voi={}
-    for const_index,const_value in iov.items():voi.setdefault(const_value,const_index)
-    return row['offset'],row['size'],voi,iov,pyc,layout,row,v
-
-
-def stat_offset(row, st):
-    return PYC_CODE_BASE + int(row[st+'_load_offset_hex'],16)
-
-
-def _stat_display_from_const(value):
-    x=float(value)*100.0
-    return int(round(x)) if abs(x-round(x))<1e-9 else round(x,6)
-
-
-def read_stats(reg):
-    off,sz,voi,iov,pyc,layout,idxrow,v = stat_machine(reg)
-    profs={int(r['profile_id']):r for r in load_profiles()}
-    out=[]
-    for link in load_driver_links():
-        profile_id=int(link.get('profile_id',-1))
-        if profile_id not in profs:continue
-        row=profs[profile_id];vals={}
-        for st in STATS:
-            lo=stat_offset(row,st)
-            if lo+3>len(pyc) or pyc[lo]!=0x64:raise ValueError('unexpected rating bytecode - scan offsets no longer match')
-            ci=struct.unpack_from('<H',pyc,lo+1)[0]
-            vals[st]=_stat_display_from_const(iov.get(ci,float(row[st])))
-        out.append(dict(slot=link.get('slot'),label=_driver_display_from_link(link),profile_id=profile_id,stats=vals))
-    return sorted(out,key=lambda d:d['label'])
-
-
-def _stat_rebuild_with_const(pyc,load_off,target):
-    layout=_stat_root_layout(pyc);consts=_pyc_consts(pyc)
-    if layout['count']!=len(consts):raise ValueError('PYC constant-count validation failed')
-    if layout['count']>=65535:raise ValueError('PYC constant table has reached the 16-bit LOAD_CONST limit')
-    if load_off<layout['code_off'] or load_off+3>layout['code_off']+layout['code_len'] or pyc[load_off]!=0x64:
-        raise ValueError('rating LOAD_CONST offset is invalid')
-    new_index=layout['count'];out=bytearray(pyc)
-    struct.pack_into('<H',out,load_off+1,new_index)
-    struct.pack_into('<i',out,layout['count_pos'],new_index+1)
-    out[layout['const_end']:layout['const_end']]=b'g'+struct.pack('<d',float(target))
-    check=_pyc_consts(bytes(out))
-    if len(check)!=new_index+1 or not isinstance(check[new_index],float) or abs(check[new_index]-target)>1e-12:
-        raise ValueError('rebuilt rating PYC failed constant readback')
-    # The bytecode lies before co_consts, so inserting at const_end must not move
-    # or alter the targeted instruction.
-    if out[load_off]!=0x64 or struct.unpack_from('<H',out,load_off+1)[0]!=new_index:
-        raise ValueError('rebuilt rating PYC failed LOAD_CONST readback')
-    return bytes(out),new_index
-
-
-def write_stat(reg,profile_id,stat,value100,experimental=False):
-    if stat not in STATS:raise ValueError('bad stat')
-    try:value100=float(value100)
-    except Exception:raise ValueError('rating must be a finite number')
-    if not _math.isfinite(value100):raise ValueError('NaN and infinity are blocked')
-    if not experimental and not (0.0<=value100<=100.0):
-        raise ValueError('the original rating scale is 0-100; enable Allow ratings outside 0-100 to use a custom value')
-    if abs(value100)>STAT_EXPERIMENTAL_ABS_MAX:
-        raise ValueError(f'absolute ratings above {STAT_EXPERIMENTAL_ABS_MAX:g} are blocked')
-    target=value100/100.0
-    off,sz,voi,iov,pyc,layout,idxrow,v=stat_machine(reg)
-    row=next((r for r in load_profiles() if int(r['profile_id'])==int(profile_id)),None)
-    if not row:raise ValueError('driver AI profile not found')
-    lo=stat_offset(row,stat)
-    if lo+3>len(pyc) or pyc[lo]!=0x64:raise ValueError('unexpected rating bytecode - aborted for safety')
-    existing=next((idx for val,idx in voi.items() if abs(float(val)-target)<1e-12),None)
-    _rp_backup_pair(v)
-    if existing is not None:
-        with open(v['ar'],'r+b') as fh:
-            fh.seek(idxrow['offset']+lo);before=fh.read(3)
-            if len(before)!=3 or before[0]!=0x64:raise ValueError('live rating bytecode changed; reload ratings')
-            fh.seek(idxrow['offset']+lo+1);fh.write(struct.pack('<H',existing));fh.flush();os.fsync(fh.fileno())
-        with open(v['ar'],'rb') as fh:fh.seek(idxrow['offset']+lo+1);rb=struct.unpack('<H',fh.read(2))[0]
-        if rb!=existing:
-            with open(v['ar'],'r+b') as fh:fh.seek(idxrow['offset']+lo);fh.write(before);fh.flush();os.fsync(fh.fileno())
-            raise ValueError('rating operand readback failed; original bytes restored')
-        return dict(applied=_stat_display_from_const(target),method='existing_constant',repoint=False,const_index=existing)
-    rebuilt,new_index=_stat_rebuild_with_const(pyc,lo,target)
-    fd,tmp=tempfile.mkstemp(prefix='n15mod_rating_',suffix='.PYC');os.close(fd)
-    try:
-        open(tmp,'wb').write(rebuilt)
-        with _RP_LOCK:
-            result=_rp_install_one('0',v,idxrow,tmp,source_name=f'Uncapped rating {profile_id}/{stat}',allow_magic=True)
-    finally:
-        try:os.remove(tmp)
-        except OSError:pass
-    # Parse the live repointed file and verify just this instruction resolves to target.
-    _off,_sz,_voi,iov2,live,_layout,_row,_v=stat_machine(reg)
-    ci=struct.unpack_from('<H',live,lo+1)[0]
-    if ci not in iov2 or abs(iov2[ci]-target)>1e-12:raise ValueError('uncapped rating live readback failed')
-    return dict(applied=_stat_display_from_const(target),method='append_constant_repoint',
-                repoint=True,const_index=new_index,file=result)
-
-
-def reset_stats(reg,profile_id):
-    row=next((r for r in load_profiles() if int(r['profile_id'])==int(profile_id)),None)
-    if not row:return 0
-    n=0
-    for st in STATS:
-        write_stat(reg,profile_id,st,float(row[st])*100.0,experimental=True);n+=1
-    return n
+def reset_stats(_reg, profile_id):
+    result = _shared_ratings_editor().restore(profile_id)
+    return len(result['applied'])
 
 # ---------------- menus: numbers / custom thumbs ----------------
 MENU_CONTAINERS = {
@@ -2682,14 +1614,14 @@ MENU_CONTAINERS = {
 def _numcard_unroll(img):
     return img.copy()
 
-def _numcard_reroll(img):
-    return img.copy()
+# Both directions are the same identity transform for the corrected parser.
+_numcard_reroll = _numcard_unroll
 
 def _menu_containers():
     out=dict(MENU_CONTAINERS)
     out['numbers']=('0',active_game_profile().get('number_container','SPRINTNUMS2015.ARC'))
-    # NASCAR '14 does not expose TEAMSHOPLOGO2 in the mapped base archive.
-    if ACTIVE_GAME=='nascar14': out.pop('shoplogo2',None)
+    for key in active_game_profile().get('unavailable_menu_keys',()):
+        out.pop(str(key),None)
     return out
 
 
@@ -2744,185 +1676,93 @@ def td_read(reg, container):
 
 @app.route('/api/tdlist')
 def api_tdlist():
-    g,reg=registry()
-    result=[]
-    for arcid, name, off, size in td_containers(reg):
-        team=name.replace('2DRIVERSELECTTD_','').replace('.ARC','')
-        try:
-            _,_,_,arc=td_read(reg,name)
-            ent,_=C.parse_multi_arc(arc)
-            entries=[dict(name=e['name'],w=e['w'],h=e['h'],fmt=e['fmt']) for e in ent]
-        except Exception as ex:
-            entries=[]; 
-        result.append(dict(container=name, team=team, entries=entries))
-    return jsonify(dict(ok=True, containers=result))
+    editor=_shared_texture_editor();result=[]
+    for arcid in editor.installation.archive_pairs:
+        for indexed in editor.installation.entries(arcid):
+            name=indexed.name
+            if not name.startswith('2DRIVERSELECTTD_'):continue
+            team=name.replace('2DRIVERSELECTTD_','').replace('.ARC','')
+            try:
+                entries=[dict(name=e['name'],w=e['width'],h=e['height'],fmt=e['format']) for e in editor.entries(arcid,name)]
+            except Exception:
+                entries=[]
+            result.append(dict(container=name,team=team,entries=entries))
+    return jsonify(dict(ok=True,containers=sorted(result,key=lambda row:row['container'])))
+
 
 @app.route('/api/td/<container>/<entry>', methods=['GET','POST'])
 def api_td_entry(container, entry):
-    g,reg=registry()
-    arcid,off,size,arc=td_read(reg,container)
-    ent,_=C.parse_multi_arc(arc)
-    match=[e for e in ent if e['name']==entry]
-    if not match: return ('not found',404)
-    e=match[0]
-    if request.method=='GET':
-        if request.args.get('pristine'):
-            a=need(reg,arcid)
-            if os.path.exists(a['bak']):
-                with open(a['bak'],'rb') as fh:
-                    fh.seek(off); arc=fh.read(size)
-                ent2,_=C.parse_multi_arc(arc)
-                match=[x for x in ent2 if x['name']==entry]; e=match[0] if match else e
-        img=C.multi_read_png(arc,e)
-        buf=io.BytesIO(); img.save(buf,'PNG'); buf.seek(0)
-        return send_file(buf,mimetype='image/png')
-    # Replace (PNG re-encode) is proven safe in-game ONLY for DRIVERPAINT car
-    # renders. PAINTSCHEME and 3DNUM crash Paint Select when re-encoded (still
-    # under investigation). Those stay Copy From / Export only.
-    if not entry.startswith('DRIVERPAINT') and not request.args.get('experimental'):
-        return jsonify(dict(ok=False,
-            error='Replace only works for DRIVERPAINT car renders right now. '
-                  'Use Copy From… or Export for '+entry.split('_')[0]+' entries.')),400
-    f=request.files.get('file')
-    if not f: return jsonify(dict(ok=False,error='no file')),400
-    img=Image.open(f.stream)
-    img,prep=prepare_import_image(img,(e['w'],e['h']),request_resize_mode('fit'),preserve_alpha=True)
     try:
-        new=C.multi_write_png_validated(arc,e,img,encode_fn=encode_any)
-        _ui_install(arcid,off,size,new)
-    except RollbackFailed as ex:
-        return jsonify(dict(ok=False,error='Image install failed and rollback also failed. Stop editing and restore the affected archive from backup. '+str(ex))),500
-    except Exception as ex:
-        return jsonify(dict(ok=False,error='write refused (safe): '+str(ex))),400
-    _clear_ui_thumb_cache()
-    return jsonify(dict(ok=True,verified=True,decode_verified=True,image_prep=prep))
+        editor=_shared_texture_editor();arcid,_indexed=editor.installation.find_entry(container)
+        if request.method=='GET':
+            return Response(editor.image_png(arcid,container,entry,pristine=bool(request.args.get('pristine'))),mimetype='image/png')
+        f=request.files.get('file')
+        if not f:return jsonify(dict(ok=False,error='no file')),400
+        result=editor.replace_image(arcid,container,entry,Image.open(f.stream),
+            resize_mode=request_resize_mode('fit'),experimental=bool(request.args.get('experimental')))
+        _clear_ui_thumb_cache();return jsonify(dict(ok=True,**result))
+    except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
+
 
 @app.route('/api/td_copy', methods=['POST'])
 def api_td_copy():
-    """Copy the RAW stored bytes of one TD entry over another same-size entry.
-    This is the proven-safe operation (no PNG/DXT re-encode). Both entries must
-    be the same fmt and payload_size."""
     d=request.get_json(force=True)
-    src_c, src_e = d['src_container'], d['src_entry']
-    dst_c, dst_e = d['dst_container'], d['dst_entry']
-    g,reg=registry()
-    s_arcid,s_off,s_size,s_arc=td_read(reg,src_c)
-    d_arcid,d_off,d_size,d_arc=td_read(reg,dst_c)
-    s_ent,_=C.parse_multi_arc(s_arc); d_ent,_=C.parse_multi_arc(d_arc)
-    se=next((e for e in s_ent if e['name']==src_e),None)
-    de=next((e for e in d_ent if e['name']==dst_e),None)
-    if not se or not de:
-        return jsonify(dict(ok=False,error='entry not found')),404
-    if se['payload_size']!=de['payload_size'] or se['fmt']!=de['fmt']:
-        return jsonify(dict(ok=False,
-            error=f'size/format mismatch: {se["fmt"]}/{se["payload_size"]} vs {de["fmt"]}/{de["payload_size"]}')),400
-    raw=bytes(s_arc[se['payload_abs']:se['payload_abs']+se['payload_size']])
-    new=bytearray(d_arc)
-    new[de['payload_abs']:de['payload_abs']+de['payload_size']]=raw
-    if len(new)!=len(d_arc):
-        return jsonify(dict(ok=False,error='size guard failed')),500
-    _ui_install(d_arcid,d_off,d_size,bytes(new))
-    _clear_ui_thumb_cache()
-    return jsonify(dict(ok=True,verified=True))
+    try:
+        editor=_shared_texture_editor();src=d['src_container'];dst=d['dst_container']
+        s_arcid,_=editor.installation.find_entry(src);d_arcid,_=editor.installation.find_entry(dst)
+        result=editor.copy_entry(s_arcid,src,d['src_entry'],d_arcid,dst,d['dst_entry'])
+        _clear_ui_thumb_cache();return jsonify(dict(ok=True,**result))
+    except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
+
 
 @app.route('/api/td/<container>/<entry>/reset', methods=['POST'])
 def api_td_reset(container, entry):
-    g,reg=registry()
-    arcid,off,size,_=td_read(reg,container)
-    a=need(reg,arcid)
-    if not os.path.exists(a['bak']): return jsonify(dict(ok=False,error='no backup'))
-    with open(a['bak'],'rb') as fh:
-        fh.seek(off); barc=fh.read(size)
-    ent,_=C.parse_multi_arc(barc)
-    match=[e for e in ent if e['name']==entry]
-    if not match: return ('not found',404)
-    e=match[0]
-    _arcid,_off,_size,live_arc=td_read(reg,container)
-    restored=bytearray(live_arc)
-    restored[e['payload_abs']:e['payload_abs']+e['payload_size']]=barc[e['payload_abs']:e['payload_abs']+e['payload_size']]
-    _ui_install(arcid,off,size,bytes(restored))
-    _clear_ui_thumb_cache()
-    return jsonify(dict(ok=True,verified=True))
+    try:
+        editor=_shared_texture_editor();arcid,_=editor.installation.find_entry(container)
+        result=editor.restore_entry(arcid,container,entry)
+        _clear_ui_thumb_cache();return jsonify(dict(ok=True,**result))
+    except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
+
 
 @app.route('/api/menu/<key>')
 def api_menu_list(key):
-    g,reg=registry()
-    if key not in _menu_containers(): return jsonify(dict(ok=False,error='bad key')),404
     try:
-        _,_,_,arc=menu_container(reg,key)
-        ent,_=_menu_parse_entries(arc,key)
-        return jsonify(dict(ok=True,
-            entries=[dict(name=e['name'],w=e['w'],h=e['h']) for e in ent
-                     if e['w']>0 and e['h']>0]))
-    except Exception as e:
-        return jsonify(dict(ok=False, error=str(e), entries=[]))
+        if key not in _menu_containers():return jsonify(dict(ok=False,error='bad key')),404
+        arcid,name=_menu_containers()[key];entries=_shared_texture_editor().entries(arcid,name)
+        return jsonify(dict(ok=True,entries=[dict(name=e['name'],w=e['width'],h=e['height']) for e in entries]))
+    except Exception as ex:return jsonify(dict(ok=False,error=str(ex),entries=[])),400
+
 
 @app.route('/api/menu/<key>/<name>', methods=['GET','POST'])
 def api_menu_entry(key,name):
     try:
-        g,reg=registry()
-        arcid,off,size,arc=menu_container(reg,key)
-        ent,_=_menu_parse_entries(arc,key)
-        match=[e for e in ent if e['name']==name]
-        if not match: return ('not found',404)
-        e=match[0]
+        if key not in _menu_containers():return jsonify(dict(ok=False,error='bad key')),404
+        arcid,container=_menu_containers()[key];editor=_shared_texture_editor()
         if request.method=='GET':
-            if request.args.get('pristine'):
-                _,_,_,arc=menu_container(reg,key,live=False)
-            img=C.multi_read_png(arc,e)
-            if key=='numbers': img=_numcard_unroll(img.convert('RGBA'))
-            buf=io.BytesIO(); img.save(buf,'PNG'); buf.seek(0)
-            return send_file(buf,mimetype='image/png')
+            return Response(editor.image_png(arcid,container,name,pristine=bool(request.args.get('pristine'))),mimetype='image/png')
         if key in ('shoplogo','shoplogo2'):
-            return jsonify(dict(ok=False,error='Team Shop logo replacement is locked: this special short-payload texture caused an in-game fatal error. Use Stock to restore it.')),400
+            return jsonify(dict(ok=False,error='Team Shop logo replacement remains locked because its special short payload caused an in-game fatal error.')),400
         f=request.files.get('file')
-        if not f: return jsonify(dict(ok=False,error='no file')),400
-        img=Image.open(f.stream)
-        requested=request_resize_mode('auto')
-        mode=('stretch' if key=='numbers' else ('fit' if requested=='auto' else requested))
-        img,prep=prepare_import_image(img,(e['w'],e['h']),mode,preserve_alpha=True)
-        prep['requested_mode']=requested; prep['effective_mode']=mode
-        if key=='numbers':
-            img=_numcard_reroll(img.convert('RGBA'))
-            prep['target_aware']=True
-            prep['resize_reason']='mapped SPRINTNUMS atlas; stretched to the exact native canvas so no black side bars are added'
-        # This validates the rewritten ARC, every neighboring payload, and the
-        # target's decode before the shared archive is touched.
-        new=C.multi_write_png_validated(arc,e,img,encode_fn=encode_any,
-                                             known_dims=((128,64) if key=='numbers' else None))
-        # This performs a same-size transaction, fsync, exact full-container
-        # readback, and verified rollback if the live write fails.
-        _ui_install(arcid,off,size,new)
-        _clear_ui_thumb_cache()
-        return jsonify(dict(ok=True,verified=True,decode_verified=True,image_prep=prep,
-                            target=dict(width=e['w'],height=e['h'],format=e['fmt'],
-                                        payload_size=e['payload_size'])))
-    except RollbackFailed as ex:
-        return jsonify(dict(ok=False,error='Image install failed and the automatic rollback also failed. Stop editing and restore the affected archive from backup. '+str(ex))),500
-    except Exception as ex:
-        return jsonify(dict(ok=False,error='Image import was not installed: '+str(ex))),400
+        if not f:return jsonify(dict(ok=False,error='no file')),400
+        requested=request_resize_mode('auto');mode='stretch' if key=='numbers' else ('fit' if requested=='auto' else requested)
+        result=editor.replace_image(arcid,container,name,Image.open(f.stream),resize_mode=mode,experimental=(key!='numbers'))
+        _clear_ui_thumb_cache();return jsonify(dict(ok=True,**result))
+    except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
+
 
 @app.route('/api/menu/<key>/<name>/reset', methods=['POST'])
 def api_menu_reset(key,name):
-    g,reg=registry()
-    arcid,off,size,_=menu_container(reg,key)
-    a=need(reg,arcid)
-    if not os.path.exists(a['bak']): return jsonify(dict(ok=False,error='no backup'))
-    _,_,_,arc_b=menu_container(reg,key,live=False)
-    ent,_=_menu_parse_entries(arc_b,key)
-    match=[e for e in ent if e['name']==name]
-    if not match: return ('not found',404)
-    e=match[0]
-    _,_,_,live_arc=menu_container(reg,key,live=True)
-    restored=bytearray(live_arc)
-    restored[e['payload_abs']:e['payload_abs']+e['payload_size']]=arc_b[e['payload_abs']:e['payload_abs']+e['payload_size']]
-    _ui_install(arcid,off,size,bytes(restored))
-    _clear_ui_thumb_cache()
-    return jsonify(dict(ok=True,verified=True))
+    try:
+        if key not in _menu_containers():return jsonify(dict(ok=False,error='bad key')),404
+        arcid,container=_menu_containers()[key];result=_shared_texture_editor().restore_entry(arcid,container,name)
+        _clear_ui_thumb_cache();return jsonify(dict(ok=True,**result))
+    except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
 
-# NASCAR '14 starts fail-closed. Flask route rules are listed exactly so a
-# future endpoint is blocked until it is deliberately reviewed and added here.
-_N14_ALLOWED_RULES={
+
+
+# Limited profiles start fail-closed. Route rules are listed exactly so future
+# full-profile endpoints remain blocked until deliberately reviewed.
+_LIMITED_PROFILE_ALLOWED_RULES={
  '/api/status','/api/app_settings','/api/diagnostics/export','/api/backup_now','/api/setpath','/api/restore',
  '/api/grid','/api/template/<name>','/api/thumb/<name>','/api/scheme_smart/<name>','/api/scheme/<name>',
  '/api/layer/<name>','/api/slotthumb/<name>','/api/build','/api/restore_slot','/api/import_scheme/<name>',
@@ -2946,25 +1786,25 @@ _N14_ALLOWED_RULES={
  '/api/pyc/audit','/api/pyc/audit/export','/api/support/check','/api/support/report','/api/help/request'
 }
 
-def _n14_route_allowed(path):
+def _limited_profile_route_allowed(path):
     rule=getattr(getattr(request,'url_rule',None),'rule',None)
-    return (rule or path) in _N14_ALLOWED_RULES
+    return (rule or path) in _LIMITED_PROFILE_ALLOWED_RULES
 
-_N14_PYC_WRITE_POLICY={
+_LIMITED_PROFILE_PYC_WRITE_POLICY={
  'AIRACINGTRACKCONFIG_C': ('DB_AICONFIG_SCRIPT.PYC', None),
  'AIRACINGGLOBALCONFIG_C': ('DB_AICONFIG_SCRIPT.PYC', None),
  'WORLDSCRIPT_C': ('DB_GAME_LOCAL_SCRIPT.PYC', None),
  'RACEDATA_C': ('DB_GAME_LOCAL_SCRIPT.PYC', {'RaceLaps'}),
 }
 
-def _n14_pyc_write_allowed(rule,payload):
+def _limited_profile_pyc_write_allowed(rule,payload):
     if rule not in ('/api/pyc/set','/api/pyc/set_batch'): return True,None
-    payload=payload if isinstance(payload,dict) else {}
-    cls=str(payload.get('class') or '').upper(); policy=_N14_PYC_WRITE_POLICY.get(cls)
-    if not policy: return False,f"PYC class {cls or '(missing)'} is read-only in NASCAR '14."
+    payload=payload if isinstance(payload,dict) else {}; game=active_game_name()
+    cls=str(payload.get('class') or '').upper(); policy=_LIMITED_PROFILE_PYC_WRITE_POLICY.get(cls)
+    if not policy: return False,f"PYC class {cls or '(missing)'} is read-only in {game}."
     expected_file,fields=policy
     if str(payload.get('file') or '').upper()!=expected_file:
-        return False,f"{cls} writes are limited to {expected_file} in NASCAR '14."
+        return False,f"{cls} writes are limited to {expected_file} in {game}."
     requested=[]
     if rule=='/api/pyc/set': requested=[str(payload.get('field') or '')]
     else: requested=[str(x.get('field') or '') for x in (payload.get('changes') or []) if isinstance(x,dict)]
@@ -2973,7 +1813,7 @@ def _n14_pyc_write_allowed(rule,payload):
         return False,f'{cls} writes are limited to: '+', '.join(sorted(fields))+'.'
     return True,None
 
-def _n14_ui_write_allowed(rule):
+def _limited_profile_ui_write_allowed(rule):
     if rule not in ('/api/ui/replace_raw','/api/ui/copy','/api/ui/restore','/api/ui/bulk_restore'): return True,None
     allowed_archives={'0','1'}
     archives=[]
@@ -2984,7 +1824,7 @@ def _n14_ui_write_allowed(rule):
         elif rule=='/api/ui/restore': archives=[str(q.get('archive') or '')]
         else: archives=[str(x.get('archive') or '') for x in (q.get('targets') or []) if isinstance(x,dict)]
     if not archives or any(a not in allowed_archives for a in archives):
-        return False,"NASCAR '14 Graphics writes are currently limited to mapped ARCHIVE0/1 front-end assets. Track packages and paint archives remain read-only here."
+        return False,f"{active_game_name()} Graphics writes are currently limited to mapped ARCHIVE0/1 front-end assets. Track packages and paint archives remain read-only here."
     return True,None
 
 @app.before_request
@@ -2999,15 +1839,15 @@ def _game_request_guard():
         _GAME_SWITCH_LOCK.acquire(); g._game_switch_lock_owned=True
     public=(path=='/' or path=='/favicon.ico' or path.startswith('/static/') or path in ('/api/games/session','/api/games/select','/api/status','/api/appdata/export','/api/appdata/import'))
     if not GAME_SESSION_SELECTED and not public:
-        return jsonify(dict(ok=False,error="Choose NASCAR 15 or NASCAR '14 before using the app.",code='game_not_selected')),409
-    if GAME_SESSION_SELECTED and ACTIVE_GAME=='nascar14' and path.startswith('/api/') and not public:
+        return jsonify(dict(ok=False,error="Choose a supported NASCAR game before using the app.",code='game_not_selected')),409
+    if GAME_SESSION_SELECTED and _limited_editor_profile() and path.startswith('/api/') and not public:
         rule=getattr(getattr(request,'url_rule',None),'rule',None) or path
-        if not _n14_route_allowed(path):
-            return jsonify(dict(ok=False,error=f"{path} is not available for NASCAR '14 yet.",code='feature_not_available',game=active_game_name())),403
-        allowed,reason=_n14_pyc_write_allowed(rule,request.get_json(silent=True) if request.method in ('POST','PUT','PATCH') else None)
+        if not _limited_profile_route_allowed(path):
+            return jsonify(dict(ok=False,error=f"{path} is not available for {active_game_name()} yet.",code='feature_not_available',game=active_game_name())),403
+        allowed,reason=_limited_profile_pyc_write_allowed(rule,request.get_json(silent=True) if request.method in ('POST','PUT','PATCH') else None)
         if not allowed:
             return jsonify(dict(ok=False,error=reason,code='pyc_write_not_allowed',game=active_game_name())),403
-        allowed,reason=_n14_ui_write_allowed(rule)
+        allowed,reason=_limited_profile_ui_write_allowed(rule)
         if not allowed:
             return jsonify(dict(ok=False,error=reason,code='graphics_write_not_allowed',game=active_game_name())),403
 
@@ -3060,11 +1900,11 @@ def _game_session_payload():
         path=detect_game(gid)
         profiles.append(dict(id=gid,name=profile['name'],path=path,found=bool(path),
                              full_feature_set=bool(profile['full_feature_set']),
-                             tabs=list(profile['tabs']),paint_modes=list(profile['paint_modes']),team_editor_mode=profile.get('team_editor_mode'),graphics_mode=profile.get('graphics_mode'),season_year=profile.get('season_year')))
+                             tabs=list(profile['tabs']),paint_modes=list(profile['paint_modes']),team_editor_mode=profile.get('team_editor_mode'),graphics_mode=profile.get('graphics_mode'),season_year=profile.get('season_year'),number_container=profile.get('number_container')))
     current=active_game_profile()
     return dict(ok=True,selected=bool(GAME_SESSION_SELECTED),active_game=ACTIVE_GAME,
                 game_name=current['name'],profiles=profiles,tabs=list(current['tabs']),
-                paint_modes=list(current['paint_modes']),full_feature_set=bool(current['full_feature_set']),team_editor_mode=current.get('team_editor_mode'),graphics_mode=current.get('graphics_mode'),season_year=current.get('season_year'))
+                paint_modes=list(current['paint_modes']),full_feature_set=bool(current['full_feature_set']),team_editor_mode=current.get('team_editor_mode'),graphics_mode=current.get('graphics_mode'),season_year=current.get('season_year'),number_container=current.get('number_container'))
 
 @app.route('/api/games/session')
 def game_session():
@@ -3090,9 +1930,9 @@ def status():
     profile=active_game_profile()
     ok=bool(g and all(k in reg for k in profile['required_archives']))
     added_scheme_scan = None
-    if ok and ACTIVE_GAME == 'nascar15':
+    if ok and not _limited_editor_profile():
         try:
-            added_scheme_scan = _extra_reconcile_state_with_live_database(extra_scheme_mod(), g)
+            added_scheme_scan = _shared_managed_paint_editor().reconcile_live_state()
         except Exception as ex:
             added_scheme_scan = {'changed': False, 'error': str(ex)}
     core=set(('0','1','2','3','4','5','6','7','8','314'))
@@ -3228,44 +2068,7 @@ def app_settings():
 @app.route('/api/diagnostics/export')
 def diagnostics_export():
     """Small support bundle: no game archives or copyrighted payloads."""
-    import zipfile,hashlib,platform,datetime
-    g,reg=registry(); cfg=load_cfg()
-    def file_info(path):
-        if not path or not os.path.exists(path): return dict(path=path,exists=False)
-        st=os.stat(path); h=hashlib.sha256()
-        # Hash first and last MiB plus size for fast diagnostics on huge archives.
-        with open(path,'rb') as f:
-            first=f.read(1<<20)
-            if st.st_size>(1<<20):
-                f.seek(max(0,st.st_size-(1<<20))); last=f.read(1<<20)
-            else: last=b''
-        h.update(struct.pack('<Q',st.st_size));h.update(first);h.update(last)
-        return dict(path=path,exists=True,size=st.st_size,mtime=st.st_mtime,
-                    quick_sha256=h.hexdigest())
-    archives={}
-    for k,v in sorted(reg.items()):
-        archives[k]=dict(archive=file_info(v['ar']),cdfiles=file_info(v['cdf']),
-                         archive_backup=file_info(v['bak']),
-                         cdfiles_backup=file_info(backup_path(v['cdf'])))
-    schemes=[]
-    if os.path.isdir(SCHEMES):
-        for fn in sorted(os.listdir(SCHEMES)):
-            fp=os.path.join(SCHEMES,fn)
-            if os.path.isfile(fp): schemes.append(dict(name=fn,size=os.path.getsize(fp)))
-    helpers={n:os.path.exists(component_path(n)) for n in (
-        'texconv.exe','ffmpeg.exe','nascar15_pyc_record_mapper_v5_teams.py',
-        'nascar15_v11_probe_patcher.py','nascar15_const_repoint_v0_2.py','nascar15_schedule_editor_v0_1.py','ui_assets.csv')}
-    safe_cfg={k:v for k,v in cfg.items() if k not in ('token','password','secret')}
-    report=dict(created=datetime.datetime.now().isoformat(),app_name=APP_NAME,app_version=APP_VERSION,release_label=APP_RELEASE_LABEL,
-                python=sys.version,platform=platform.platform(),game=g,config=safe_cfg,
-                helpers=helpers,archives=archives,scheme_files=schemes,
-                stock_baselines=cfg.get('stock_baselines',{}),
-                repoint_history=(globals().get('_rp_load_history',lambda:[])()))
-    buf=io.BytesIO()
-    with zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED) as z:
-        z.writestr('diagnostics.json',json.dumps(report,indent=2))
-        z.writestr('README.txt','NASCAR 15 Modding App diagnostics. No game archive bytes are included.\n')
-    buf.seek(0)
+    buf=io.BytesIO(_shared_support_reporter().diagnostics_bytes(load_cfg()))
     return send_file(buf,mimetype='application/zip',as_attachment=True,
                      download_name=f'nascar15_modding_app_v{APP_VERSION}_diagnostics.zip')
 
@@ -3273,23 +2076,12 @@ def diagnostics_export():
 def backup_now():
     """Force pristine backups of every archive + cdfiles pair that doesn't
     already have one. Never overwrites an existing backup."""
-    g,reg=registry()
-    if not g: return jsonify(dict(ok=False, error='game not found')),400
-    created=[]; existing=[]; failed=[]
-    for k,v in sorted(reg.items()):
-        for live,bak in ((v['ar'],v['bak']),(v['cdf'],backup_path(v['cdf']))):
-            base=os.path.basename(live)
-            if os.path.exists(bak): existing.append(base); continue
-            try:
-                ensure_backup(live,bak); created.append(base)
-            except PermissionError:
-                failed.append(base+' (file locked - close the game and retry)')
-            except Exception as e:
-                failed.append(f'{base} ({e})')
-    if created:
-        _clear_ui_thumb_cache()
-    return jsonify(dict(ok=not failed, created=created,
-                        existing=len(existing), failed=failed))
+    try:
+        result=_shared_backup_manager().create_missing()
+        if result['created']:_clear_ui_thumb_cache()
+        return jsonify(result),(200 if result['ok'] else 400)
+    except Exception as ex:
+        return jsonify(dict(ok=False,error=str(ex))),400
 
 @app.route('/api/setpath', methods=['POST'])
 def setpath():
@@ -4697,8 +3489,7 @@ def api_name():
     if not new: return jsonify(dict(ok=False,error='empty name')),400
     exp=bool(j.get('experimental'))
     try:
-        if exp: n=patch_name_exp(reg, old, new)
-        else: n=patch_name(reg, old, new)
+        n=_apply_display_name(reg, old, new, exp)
     except Exception as e: return jsonify(dict(ok=False,error=str(e))),400
     cfg=load_cfg(); led=cfg.setdefault('renames',{})
     orig=old
@@ -4712,14 +3503,10 @@ def api_handle():
     g,reg=registry(); j=request.json
     old,new=j['old'],j['new'].strip()
     if not new: return jsonify(dict(ok=False,error='empty handle')),400
-    try: n,applied=patch_handle(reg,old,new)
+    try: result=_shared_driver_handle_editor().rename_current(old,new)
     except Exception as e: return jsonify(dict(ok=False,error=str(e))),400
-    cfg=load_cfg(); led=cfg.setdefault('handles',{})
-    orig=old
-    for o,c2 in list(led.items()):
-        if c2==old: orig=o; break
-    led[orig]=applied; save_cfg(cfg)
-    return jsonify(dict(ok=True,patched=n,applied=applied.rstrip('_ '),storage_length=len(applied)))
+    return jsonify(dict(ok=True,patched=result['patched'],applied=result['current'],
+                        storage_length=len(result['current'])))
 
 @app.route('/api/names/export')
 def names_export():
@@ -4741,11 +3528,15 @@ def names_restore_all():
         # Reverse the newest display strings back to their original text-table strings.
         for original,current in list(renames.items()):
             if str(original)==str(current):continue
-            try:patch_name_exp(reg,str(current),str(original));done.append(f'name {current} -> {original}')
+            try:_apply_display_name(reg,str(current),str(original),True);done.append(f'name {current} -> {original}')
             except Exception as ex:errors.append(f'{current}: {ex}')
+        handle_editor=_shared_driver_handle_editor()
+        mapped={row['original']:row for row in handle_editor.handles()}
         for original,current in list(handles.items()):
             if str(original)==str(current):continue
-            try:patch_handle(reg,str(current),str(original));done.append(f'handle {current} -> {original}')
+            try:
+                if str(original) not in mapped:raise ValueError('mapped handle was not found')
+                handle_editor.restore(mapped[str(original)]['driver_uid']);done.append(f'handle {current} -> {original}')
             except Exception as ex:errors.append(f'@{current}: {ex}')
         if errors:return jsonify(dict(ok=False,error='; '.join(errors),restored=done)),400
         cfg.pop('renames',None);cfg.pop('handles',None);save_cfg(cfg)
@@ -4776,151 +3567,14 @@ def api_stats_reset():
 
 @app.route('/api/pack/export')
 def pack_export():
-    import zipfile
-    g,reg=registry()
-    buf=io.BytesIO()
-    z=zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED)
-    z.writestr('manifest.json', json.dumps(dict(format='gridpack', version=1)))
-    for f in os.listdir(SCHEMES):
-        z.write(os.path.join(SCHEMES,f), 'schemes/'+f)
-    cfg=load_cfg()
-    z.writestr('names.json',json.dumps(dict(renames=cfg.get('renames',{}),
-        handles={k:str(v).rstrip('_ ') for k,v in (cfg.get('handles',{}) or {}).items()}),indent=1))
-    try:
-        z.writestr('stats.json', json.dumps(
-            [dict(profile_id=d['profile_id'], stats=d['stats']) for d in read_stats(reg)],
-            indent=1))
-    except Exception: pass
-    # menu images that differ from backup
-    for key in _menu_containers():
-        try:
-            arcid,off,size,live=menu_container(reg,key,live=True)
-            a=need(reg,arcid)
-            if not os.path.exists(a['bak']): continue
-            _,_,_,bak=menu_container(reg,key,live=False)
-            ent,_=C.parse_multi_arc(live, known_dims=(128,64) if key=='numbers' else None)
-            for e in ent:
-                if e['w']<=0: continue
-                pa,ps=e['payload_abs'],e['payload_size']
-                if live[pa:pa+ps]!=bak[pa:pa+ps]:
-                    img=C.multi_read_png(live,e)
-                    b=io.BytesIO(); img.save(b,'PNG')
-                    z.writestr(f'menus/{key}/{e["name"]}.png', b.getvalue())
-        except Exception: continue
-    z.close(); buf.seek(0)
-    return send_file(buf, mimetype='application/zip', as_attachment=True,
-                     download_name='nascar15_legacy_mod_pack.gridpack')
+    return pack_v2_export()
 
-LEGACY_PACK_MEMBER_RENAMES = {
-    'LIVERY_14_55_VICKERS_PRIMARY.ARC': 'LIVERY_15_55_BRIAN_VICKERS_PRIMARY.ARC',
-    'HDLIVERY_14_55_VICKERS_PRIMARY.ARC': 'HDLIVERY_15_55_BRIAN_VICKERS_PRIMARY.ARC',
-}
-
-
-def _legacy_pack_member_basename(name):
-    """Translate filenames emitted by older public builds to current IDs."""
-    base=os.path.basename(str(name or ''))
-    for old,new in LEGACY_PACK_MEMBER_RENAMES.items():
-        if base.startswith(old):
-            return new+base[len(old):]
-    return base
-
-
-def _legacy_driver_name_target(reg, old):
-    """Resolve old public roster aliases to an exact current stock text key."""
-    text=str(old or '').strip()
-    # The broken public roster exposed Mike Wallace in Darrell Wallace Jr.'s
-    # selectable slot.  A legacy driver rename under that key therefore belongs
-    # to Darrell, not the unrelated historic trivia/name string.
-    candidates=(['Darrell Wallace Jr.','Bubba Wallace Jr.','Darrell Wallace Jr','Darrell Wallace']
-                if text.casefold()=='mike wallace' else [text])
-    return _find_exact_stock_text(reg,candidates)
-
-
-def _pack_apply_legacy_v1(z, selected=None):
-    """Convert and import a gridpack v1 through current safe write paths."""
-    selected=set(selected or ('schemes','names','ratings','menus'))
-    _g,reg=registry();applied={k:0 for k in PACK_CATEGORIES};errors=[];migrations=[]
-    if 'schemes' in selected:
-        os.makedirs(SCHEMES,exist_ok=True)
-        for member in z.namelist():
-            safe=_pack_safe_member(member)
-            if not safe.startswith('schemes/') or safe.endswith('/'):continue
-            base=_legacy_pack_member_basename(safe)
-            if not base:continue
-            raw=z.read(member)
-            if len(raw)>100*1024*1024:
-                errors.append(base+': file is larger than the 100 MB safety limit');continue
-            target=os.path.join(SCHEMES,base)
-            if os.path.exists(target) and open(target,'rb').read()==raw:continue
-            with open(target,'wb') as fh:fh.write(raw)
-            if base!=os.path.basename(safe):migrations.append(f'{os.path.basename(safe)} → {base}')
-            if base.lower().endswith('.png') and '.layer.' not in base.lower() and '.thumb.' not in base.lower():
-                applied['schemes']+=1
-    if 'names' in selected:
-        data=_pack_read_json(z,'names.json',{}) or {};cfg=load_cfg()
-        for old,new in (data.get('renames') or {}).items():
-            target=_legacy_driver_name_target(reg,old)
-            if not target:
-                errors.append(f'Rename {old}: exact current stock text was not found');continue
-            try:
-                if str(cfg.get('renames',{}).get(target,target))!=str(new):
-                    patch_name_exp(reg,target,str(new));cfg.setdefault('renames',{})[target]=str(new);applied['names']+=1
-                if str(old)!=str(target):migrations.append(f'name key {old} → {target}')
-            except Exception as ex:errors.append(f'Rename {old}: {ex}')
-        for old,new in (data.get('handles') or {}).items():
-            try:
-                if str(cfg.get('handles',{}).get(old,old))!=str(new):
-                    _n,actual=patch_handle(reg,str(old),str(new));cfg.setdefault('handles',{})[str(old)]=actual;applied['names']+=1
-            except Exception as ex:errors.append(f'Handle {old}: {ex}')
-        save_cfg(cfg)
-    if 'ratings' in selected:
-        ratings=_pack_read_json(z,'stats.json',[]) or []
-        try:current={str(x['profile_id']):x['stats'] for x in read_stats(reg)}
-        except Exception:current={}
-        for row in ratings:
-            for st,v in (row.get('stats') or {}).items():
-                if str(current.get(str(row.get('profile_id')),{}).get(st))==str(v):continue
-                try:write_stat(reg,row['profile_id'],st,float(v),experimental=True);applied['ratings']+=1
-                except Exception as ex:errors.append(f"Rating {row.get('profile_id')}/{st}: {ex}")
-    if 'menus' in selected:
-        for member in z.namelist():
-            m=re.match(r'^menus/([^/]+)/(.+)\.png$',member,re.I)
-            if not m:continue
-            key,name=m.group(1),m.group(2)
-            try:
-                arcid,off,size,arc=menu_container(reg,key)
-                entries,_=_menu_parse_entries(arc,key)
-                e=next((x for x in entries if x['name']==name),None)
-                if not e:raise ValueError('current game image entry is missing')
-                img=Image.open(io.BytesIO(z.read(member)))
-                img,_=prepare_import_image(img,(e['w'],e['h']),'fit',preserve_alpha=True)
-                a=need(reg,arcid);ensure_backup(a['ar'],a['bak'])
-                new=C.multi_write_png_validated(arc,e,img,encode_fn=encode_any,
-                    known_dims=(128,64) if key=='numbers' else None)
-                with open(a['ar'],'r+b') as fh:fh.seek(off);fh.write(new);fh.flush();os.fsync(fh.fileno())
-                applied['menus']+=1
-            except Exception as ex:errors.append(f'Menu {key}/{name}: {ex}')
-        if applied['menus']:_clear_ui_thumb_cache()
-    return applied,errors,migrations
 
 
 @app.route('/api/pack/import', methods=['POST'])
 def pack_import():
-    """Compatibility endpoint retained for older app frontends."""
-    import zipfile
-    f=request.files.get('file')
-    if not f:return jsonify(dict(ok=False,error='no file')),400
-    try:
-        with zipfile.ZipFile(f.stream) as z:
-            info=_pack_inspect_zip(z)
-            if not info.get('legacy'):
-                return jsonify(dict(ok=False,error='This is a current Mod Pack. Use Import Mod Pack so it can be previewed first.')),400
-            applied,errors,migrations=_pack_apply_legacy_v1(z)
-        return jsonify(dict(ok=True,schemes=applied['schemes'],renames=applied['names'],handles=0,
-            stats=applied['ratings'],menus=applied['menus'],errors=errors,migrations=migrations,
-            note='Older pack converted to the current data model. Saved paints can be installed from Paint Schemes.'))
-    except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
+    return pack_v2_import()
+
 
 @app.route('/api/verify_game_files')
 def verify_game_files_api():
@@ -4950,131 +3604,27 @@ def restore():
     swaps originals aside, verifies the complete set, and rolls the set back if
     any commit step fails.
     """
-    staged = []
-    committed = []
     try:
         if _extra_game_running():
-            raise RuntimeError('NASCAR15.exe is running. Close the game before restoring original files')
-        _g, reg = registry()
-        targets = []
-        skipped = []
-        for key, value in sorted(reg.items(), key=lambda x: str(x[0])):
-            for kind, live, backup in (
-                ('ar', value['ar'], backup_path(value['ar'])),
-                ('cdf', value['cdf'], backup_path(value['cdf'])),
-            ):
-                if not os.path.exists(backup):
-                    skipped.append(os.path.basename(live) + ' (no pristine backup)')
-                    continue
-                if not _valid_backup(backup, kind):
-                    raise ValueError(os.path.basename(backup) + ' looks invalid; nothing was restored')
-                if not os.path.exists(live):
-                    raise ValueError(os.path.basename(live) + ' is missing; nothing was restored')
-                targets.append((kind, live, backup))
-        if not targets:
-            raise ValueError('no valid pristine backups are available')
-
-        token = f"{os.getpid()}_{int(time.time())}"
-        # Stage first. No live file changes until every backup has copied and
-        # passed size/magic validation.
-        for kind, live, backup in targets:
-            temp = live + '.restore_new_' + token
-            old = live + '.restore_old_' + token
-            shutil.copyfile(backup, temp)
-            with open(temp, 'rb+') as fh:
-                os.fsync(fh.fileno())
-            if os.path.getsize(temp) != os.path.getsize(backup) or not _valid_backup(temp, kind):
-                raise ValueError('staged restore validation failed for ' + os.path.basename(live))
-            staged.append((kind, live, backup, temp, old))
-
-        # Atomic file swaps. Keep every original beside the live file until the
-        # full set has passed readback.
-        for kind, live, backup, temp, old in staged:
-            if os.path.exists(old):
-                os.remove(old)
-            os.replace(live, old)
-            try:
-                os.replace(temp, live)
-            except Exception:
-                os.replace(old, live)
-                raise
-            committed.append((kind, live, backup, temp, old))
-
-        for kind, live, backup, _temp, _old in committed:
-            if os.path.getsize(live) != os.path.getsize(backup) or not _valid_backup(live, kind):
-                raise ValueError('restored file readback failed for ' + os.path.basename(live))
-
-        # Game bytes are now stock. Archive app ownership/history state instead
-        # of leaving it capable of reapplying or misreporting removed edits.
-        stamp = time.strftime('%Y%m%d_%H%M%S')
-        state_archive = os.path.join(USER_DIR, 'restored_app_state', stamp)
-        archived_state = []
-        state_paths = [
-            EXTRA_SCHEME_STATE,
-            TEAM_MANAGER_STATE,
-            globals().get('_RP_HISTORY'),
-            globals().get('FULL_REPAIR_REPORT'),
-        ]
+            raise RuntimeError('The selected NASCAR game is running. Close it before restoring original files')
+        result=_shared_backup_manager().restore_all()
+        stamp=time.strftime('%Y%m%d_%H%M%S');state_archive=os.path.join(USER_DIR,'restored_app_state',stamp);archived_state=[]
+        state_paths=[EXTRA_SCHEME_STATE,TEAM_MANAGER_STATE,globals().get('_RP_HISTORY')]
         for state_path in state_paths:
             if state_path and os.path.isfile(state_path):
-                os.makedirs(state_archive, exist_ok=True)
-                dest = os.path.join(state_archive, os.path.basename(state_path))
-                os.replace(state_path, dest)
-                archived_state.append(os.path.basename(state_path))
+                os.makedirs(state_archive,exist_ok=True);dest=os.path.join(state_archive,os.path.basename(state_path));os.replace(state_path,dest);archived_state.append(os.path.basename(state_path))
         if os.path.isdir(TEAM_ASSET_ROLLBACK_DIR):
-            os.makedirs(state_archive, exist_ok=True)
-            dest = os.path.join(state_archive, os.path.basename(TEAM_ASSET_ROLLBACK_DIR))
-            if os.path.exists(dest):
-                shutil.rmtree(dest)
-            os.replace(TEAM_ASSET_ROLLBACK_DIR, dest)
-            archived_state.append(os.path.basename(TEAM_ASSET_ROLLBACK_DIR) + '/')
-
-        cfg = load_cfg(); cfg.pop('renames', None); cfg.pop('handles', None); save_cfg(cfg)
-        for _kind, _live, _backup, _temp, old in committed:
-            try:
-                os.remove(old)
-            except FileNotFoundError:
-                pass
+            os.makedirs(state_archive,exist_ok=True);dest=os.path.join(state_archive,os.path.basename(TEAM_ASSET_ROLLBACK_DIR))
+            if os.path.exists(dest):shutil.rmtree(dest)
+            os.replace(TEAM_ASSET_ROLLBACK_DIR,dest);archived_state.append(os.path.basename(TEAM_ASSET_ROLLBACK_DIR)+'/')
+        cfg=load_cfg();cfg.pop('renames',None);cfg.pop('handles',None);save_cfg(cfg)
         _clear_ui_thumb_cache()
-        try:
-            _SCHEDULE_SOURCE_CACHE.clear(); _SCHEDULE_CACHE.clear()
-        except Exception:
-            pass
-        return jsonify(dict(
-            ok=True,
-            restored=[os.path.basename(x[1]) for x in committed],
-            skipped=skipped,
-            archived_state=archived_state,
-            state_archive=(state_archive if archived_state else None),
-            note='All staged files passed readback. Previous app ownership/history state was archived so the restored game is rediscovered from live files.'
-        ))
-    except Exception as original:
-        rollback_errors = []
-        # Reverse all committed swaps. The original file is still in `old`.
-        for _kind, live, _backup, _temp, old in reversed(committed):
-            try:
-                if os.path.exists(old):
-                    failed_live = live + '.restore_failed_new'
-                    if os.path.exists(failed_live):
-                        os.remove(failed_live)
-                    if os.path.exists(live):
-                        os.replace(live, failed_live)
-                    os.replace(old, live)
-                    if os.path.exists(failed_live):
-                        os.remove(failed_live)
-            except Exception as ex:
-                rollback_errors.append(os.path.basename(live) + ': ' + str(ex))
-        for _kind, _live, _backup, temp, _old in staged:
-            try:
-                if os.path.exists(temp):
-                    os.remove(temp)
-            except Exception:
-                pass
-        detail = str(original)
-        if rollback_errors:
-            detail += ' | Restore rollback failed: ' + '; '.join(rollback_errors)
-        return jsonify(dict(ok=False, error=detail,
-                            rolled_back=bool(committed and not rollback_errors))), 400
+        result.update(archived_state=archived_state,state_archive=(state_archive if archived_state else None),
+                      note='All staged files passed readback. Previous app ownership/history state was archived so the restored game is rediscovered from live files.')
+        return jsonify(result)
+    except Exception as ex:
+        return jsonify(dict(ok=False,error=str(ex))),400
+
 
 
 # ==================== v0.6 additions ====================
@@ -5109,25 +3659,18 @@ def api_import_scheme(name):
 @app.route('/api/previewedit/<name>', methods=['GET','POST'])
 def api_previewedit(name):
     """Load a career/AI 256x256 preview card into the canvas and save it back."""
-    g,reg=registry()
-    key='careerthumbs'
-    arcid,off,size,arc=menu_container(reg,key)
-    ent,_=C.parse_multi_arc(arc)
-    match=[e for e in ent if e['name']==name]
-    if not match: return ('not found',404)
-    e=match[0]
+    editor=_shared_texture_editor();container='BASESCHEMETHUMBNAILS.ARC';arcid='0'
     if request.method=='GET':
-        img=C.multi_read_png(arc,e)
+        try:img=editor.read_image(arcid,container,name)
+        except Exception:return ('not found',404)
         buf=io.BytesIO(); img.save(buf,'PNG'); buf.seek(0)
         return send_file(buf,mimetype='image/png')
     f=request.files.get('file')
     if not f: return jsonify(dict(ok=False,error='no file')),400
     img=Image.open(f.stream)
-    img,prep=prepare_import_image(img,(e['w'],e['h']),request_resize_mode('fit'),preserve_alpha=True)
-    a=need(reg,arcid); ensure_backup(a['ar'],a['bak'])
-    new=C.multi_write_png(arc,e,img,encode_fn=encode_any)
-    with open(a['ar'],'r+b') as fh:
-        fh.seek(off); fh.write(new)
+    current=editor.read_image(arcid,container,name)
+    img,prep=prepare_import_image(img,current.size,request_resize_mode('fit'),preserve_alpha=True)
+    editor.replace_image(arcid,container,name,img,resize_mode='stretch',experimental=True)
     _clear_ui_thumb_cache()
     return jsonify(dict(ok=True, image_prep=prep))
 
@@ -5151,1577 +3694,188 @@ def import_liv_tmp(path, out_png, raw_offset=0x5, w=2048, h=1024):
 # ==================== v0.8 AUDIO LAB ====================
 import base64 as _b64
 
-AUDIO_TOOLS_DIR = os.path.join(USER_DIR, 'audio_tools')
-AUDIO_TOOLS_BIN = os.path.join(AUDIO_TOOLS_DIR, 'bin')
-AUDIO_TOOLS_RELEASE_TAG = 'latest'
-AUDIO_TOOLS_ARCHIVE = 'ffmpeg-master-latest-win64-lgpl-shared.zip'
-AUDIO_TOOLS_RELEASE_BASE = (
-    'https://github.com/BtbN/FFmpeg-Builds/releases/download/'
-    + AUDIO_TOOLS_RELEASE_TAG
-)
+def _shared_audio_tools():
+    return AudioToolsManager(USER_DIR)
 
 
-def ffmpeg_path():
-    # Prefer the app-managed LGPL audio-tools component. It lives in USER_DIR so
-    # frozen builds can install/update it next to the executable without touching
-    # the bundled application resources.
-    candidates = [
-        os.path.join(AUDIO_TOOLS_BIN, 'ffmpeg.exe'),
-        os.path.join(AUDIO_TOOLS_DIR, 'ffmpeg.exe'),
-        os.path.join(USER_DIR, 'ffmpeg.exe'),
-        os.path.join(APP_DIR, 'ffmpeg.exe'),
-    ]
-    for p in candidates:
-        if p and os.path.exists(p):
-            return p
-    return shutil.which('ffmpeg')
+ffmpeg_path = _shared_audio.ffmpeg_path
 
 
-def _ffmpeg_details():
-    ff = ffmpeg_path()
-    if not ff:
-        return dict(ready=False, path=None, source=None, version=None)
-    source = ('managed_audio_tools' if os.path.abspath(ff).startswith(os.path.abspath(AUDIO_TOOLS_DIR))
-              else ('app_folder' if os.path.dirname(os.path.abspath(ff)) in
-                    (os.path.abspath(USER_DIR), os.path.abspath(APP_DIR)) else 'path'))
-    version = None
-    try:
-        r = subprocess.run([ff, '-hide_banner', '-version'], capture_output=True,
-                           text=True, timeout=15)
-        first = (r.stdout or r.stderr or '').splitlines()
-        version = first[0].strip() if first else None
-    except Exception:
-        pass
-    return dict(ready=True, path=ff, source=source, version=version)
 
 
-def _download_url(url, destination, timeout=180):
-    import urllib.request
-    req = urllib.request.Request(url, headers={
-        'User-Agent': 'NASCAR-Modding-App-Audio-Tools/1.0.1'
-    })
-    with urllib.request.urlopen(req, timeout=timeout) as response, open(destination, 'wb') as out:
-        shutil.copyfileobj(response, out, length=1024*1024)
 
 
-def _find_file(root, wanted):
-    wanted = wanted.lower()
-    for base, dirs, files in os.walk(root):
-        for name in files:
-            if name.lower() == wanted:
-                return os.path.join(base, name)
-    return None
 
 
-def _validate_managed_ffmpeg(ff):
-    r = subprocess.run([ff, '-hide_banner', '-version'], capture_output=True,
-                       text=True, timeout=30)
-    text = (r.stdout or '') + '\n' + (r.stderr or '')
-    if r.returncode != 0 or 'ffmpeg version' not in text.lower():
-        raise ValueError('downloaded ffmpeg.exe did not start correctly')
-    lower = text.lower()
-    if '--enable-gpl' in lower or '--enable-nonfree' in lower:
-        raise ValueError('downloaded build is not the required LGPL-only configuration')
-    enc = subprocess.run([ff, '-hide_banner', '-encoders'], capture_output=True,
-                         text=True, timeout=30)
-    enc_text = (enc.stdout or '') + '\n' + (enc.stderr or '')
-    if enc.returncode != 0 or 'libmp3lame' not in enc_text:
-        raise ValueError('downloaded LGPL build does not provide the libmp3lame encoder')
-    return text.splitlines()[0].strip()
 
 
 @app.route('/api/audio/tools/status')
 def audio_tools_status():
-    d = _ffmpeg_details()
-    d.update(dict(ok=True, managed_dir=AUDIO_TOOLS_DIR,
-                  release_tag=AUDIO_TOOLS_RELEASE_TAG,
-                  archive=AUDIO_TOOLS_ARCHIVE))
-    return jsonify(d)
+    return jsonify(dict(ok=True, **_shared_audio_tools().status()))
 
 
 @app.route('/api/audio/tools/install', methods=['POST'])
 def audio_tools_install():
-    if os.name != 'nt':
-        return jsonify(dict(ok=False, error='The one-click audio tools installer is for 64-bit Windows.')),400
-    archive_url = AUDIO_TOOLS_RELEASE_BASE + '/' + AUDIO_TOOLS_ARCHIVE
-    checksums_url = AUDIO_TOOLS_RELEASE_BASE + '/checksums.sha256'
-    parent = os.path.dirname(AUDIO_TOOLS_DIR) or USER_DIR
-    os.makedirs(parent, exist_ok=True)
-    staging = AUDIO_TOOLS_DIR + '.installing'
-    old = AUDIO_TOOLS_DIR + '.previous'
     try:
-        with tempfile.TemporaryDirectory(prefix='n15_audio_tools_') as td:
-            archive_path = os.path.join(td, AUDIO_TOOLS_ARCHIVE)
-            checksums_path = os.path.join(td, 'checksums.sha256')
-            _download_url(checksums_url, checksums_path)
-            _download_url(archive_url, archive_path)
-
-            checksum_lines = open(checksums_path, 'r', encoding='utf-8', errors='replace').read().splitlines()
-            expected = None
-            for line in checksum_lines:
-                parts = line.strip().split()
-                if len(parts) >= 2 and parts[-1].lstrip('*') == AUDIO_TOOLS_ARCHIVE:
-                    expected = parts[0].lower()
-                    break
-            if not expected or not re.fullmatch(r'[0-9a-f]{64}', expected):
-                raise ValueError('the release checksum file did not contain the expected LGPL archive')
-            actual = hashlib.sha256(open(archive_path, 'rb').read()).hexdigest()
-            if actual != expected:
-                raise ValueError('download checksum mismatch; nothing was installed')
-
-            extract_dir = os.path.join(td, 'extract')
-            os.makedirs(extract_dir, exist_ok=True)
-            import zipfile
-            with zipfile.ZipFile(archive_path) as z:
-                z.extractall(extract_dir)
-            src_ff = _find_file(extract_dir, 'ffmpeg.exe')
-            if not src_ff:
-                raise ValueError('downloaded archive did not contain ffmpeg.exe')
-            src_bin = os.path.dirname(src_ff)
-
-            if os.path.exists(staging): shutil.rmtree(staging)
-            os.makedirs(os.path.join(staging, 'bin'), exist_ok=True)
-            copied = []
-            for name in os.listdir(src_bin):
-                src = os.path.join(src_bin, name)
-                if os.path.isfile(src) and name.lower().endswith(('.exe', '.dll')):
-                    shutil.copy2(src, os.path.join(staging, 'bin', name))
-                    copied.append(name)
-            if 'ffmpeg.exe' not in [x.lower() for x in copied]:
-                raise ValueError('ffmpeg.exe was not copied into the managed tool directory')
-
-            for wanted in ('LICENSE.txt', 'COPYING.LGPLv2.1', 'COPYING.LGPLv3'):
-                src = _find_file(extract_dir, wanted)
-                if src:
-                    shutil.copy2(src, os.path.join(staging, os.path.basename(src)))
-
-            source_info = (
-                'NASCAR Modding App managed audio tools\n'
-                'Component: BtbN FFmpeg Windows LGPL shared build\n'
-                f'Release tag: {AUDIO_TOOLS_RELEASE_TAG}\n'
-                f'Archive: {AUDIO_TOOLS_ARCHIVE}\n'
-                f'Archive SHA-256: {actual}\n'
-                f'Download: {archive_url}\n'
-                'Build scripts/source: https://github.com/BtbN/FFmpeg-Builds\n'
-                'FFmpeg source and license information: https://ffmpeg.org/\n'
-                'The NASCAR Modding App launches ffmpeg.exe as a separate tool.\n'
-            )
-            open(os.path.join(staging, 'SOURCE_INFORMATION.txt'), 'w', encoding='utf-8').write(source_info)
-            managed_ff = os.path.join(staging, 'bin', 'ffmpeg.exe')
-            version = _validate_managed_ffmpeg(managed_ff)
-
-            if os.path.exists(old): shutil.rmtree(old)
-            if os.path.exists(AUDIO_TOOLS_DIR): os.replace(AUDIO_TOOLS_DIR, old)
-            try:
-                os.replace(staging, AUDIO_TOOLS_DIR)
-            except Exception:
-                if os.path.exists(old) and not os.path.exists(AUDIO_TOOLS_DIR):
-                    os.replace(old, AUDIO_TOOLS_DIR)
-                raise
-            if os.path.exists(old): shutil.rmtree(old)
-
-        return jsonify(dict(ok=True, ready=True, version=version,
-                            path=os.path.join(AUDIO_TOOLS_BIN, 'ffmpeg.exe'),
-                            release_tag=AUDIO_TOOLS_RELEASE_TAG,
-                            checksum=actual,
-                            files=len(copied)))
+        return jsonify(dict(ok=True, **_shared_audio_tools().install()))
     except Exception as e:
-        try:
-            if os.path.exists(staging): shutil.rmtree(staging)
-        except Exception:
-            pass
         return jsonify(dict(ok=False, error=str(e))),400
-
-_SIL={ (True): _b64.b64decode("//2UxIZnZ3ZmbbbRkAAAqqqqqqvvvvvvvvvvvvvvvvvvvn+/3+/fv379++++973333333ve973ve973ve973ve973vetjba/3+/379+/fv3333ve++++++973ve973ve973ve973ve971sbbX+/3+/fv379++++973333333ve973ve973ve973ve973vetjba/3+/379+/fv3333ve++++++973ve973ve973ve973ve971sbbX+/3+/fv379++++973333333ve973ve973ve973ve973vetjba/3+/379+/fv3333ve++++++973ve973ve973ve973ve971sbbX+/3+/fv379++++973333333ve973ve973ve973ve973vetjba/3+/379+/fv3333ve++++++973ve973ve973ve973ve971sbbX+/3+/fv379++++973333333ve973ve973ve973ve973vetjba/3+/379+/fv3333ve++++++973ve973ve973ve973ve971sbbX+/3+/fv379++++973333333ve973ve973ve973ve973vetjba/3+/379+/fv3333ve++++++973ve973ve973ve973ve971sbbQ"), (False): _b64.b64decode("//2UBFUzM0MiRDMRIiIiSSSbSAAAAAAAAACqqqqqqqqqqvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvn333333d3d3d3d1sbb58ti2Nttta+fPnz58+fPnz58222+fPvvvvvu7u7u7u7rY23z5bFsbbba18+fPnz58+fPnz5ttt8+ffffffd3d3d3d3Wxtvny2LY2221r58+fPnz58+fPnzbbb58++++++7u7u7u7utjbfPlsWxtttrXz58+fPnz58+fPm223z59999993d3d3d3dbG2+fLYtjbbbWvnz58+fPnz58+fNttvnz777777u7u7u7u62Nt8+WxbG222tfPnz58+fPnz58+bbbfPn333333d3d3d3d1sbb58ti2Nttta+fPnz58+fPnz58222+fPvvvvvu7u7u7u7rY23z5bFsbbba18+fPnz58+fPnz5ttt8+ffffffd3d3d3d3Wxtvny2LY2221r58+fPnz58+fPnzbbb58++++++7u7u7u7utjbfPlsWxtttrXz58+fPnz58+fPm223z59999993d3d3d3dbG2+fLYtjbbbWvnz58+fPnz58+fNttvnz777777u7u7u7u62Nt8+WxbG222tfPnz58+fPnz58+bbbfPg") }
-
-_BR={(1,1):{1:32,2:64,3:96,4:128,5:160,6:192,7:224,8:256,9:288,10:320,11:352,12:384,13:416,14:448},
-     (1,2):{1:32,2:48,3:56,4:64,5:80,6:96,7:112,8:128,9:160,10:192,11:224,12:256,13:320,14:384},
-     (1,3):{1:32,2:40,3:48,4:56,5:64,6:80,7:96,8:112,9:128,10:160,11:192,12:224,13:256,14:320},
-     (2,1):{1:32,2:48,3:56,4:64,5:80,6:96,7:112,8:128,9:144,10:160,11:176,12:192,13:224,14:256},
-     (2,2):{1:8,2:16,3:24,4:32,5:40,6:48,7:56,8:64,9:80,10:96,11:112,12:128,13:144,14:160}}
-_BR[(2,3)]=_BR[(2,2)]
-_SRT={3:{0:44100,1:48000,2:32000},2:{0:22050,1:24000,2:16000},0:{0:11025,1:12000,2:8000}}
-
-def frame_info(d,i=0):
-    if i+4>len(d) or d[i]!=0xFF or (d[i+1]&0xE0)!=0xE0: return None
-    vf=(d[i+1]>>3)&3
-    if vf==1: return None
-    lf=(d[i+1]>>1)&3
-    if lf==0: return None
-    layer=4-lf; ver=1 if vf==3 else 2
-    br=(d[i+2]>>4)&0xF; sr=(d[i+2]>>2)&3; pad=(d[i+2]>>1)&1
-    if br in (0,15) or sr==3: return None
-    kbps=_BR[(ver,layer)][br]; hz=_SRT[vf][sr]
-    if layer==1: flen=(12*kbps*1000//hz+pad)*4
-    elif layer==3 and ver==2: flen=72*kbps*1000//hz+pad
-    else: flen=144*kbps*1000//hz+pad
-    return (layer,kbps,hz,((d[i+3]>>6)&3)==3,flen)
-
-def walk_frames(d,limit=100000):
-    out=[];i=0
-    while i<len(d)-4 and len(out)<limit:
-        fi=frame_info(d,i)
-        if not fi: break
-        out.append((i,fi)); i+=fi[4]
-    return out
-
-def _mpeg_frame_topology(d, limit=200000, max_gap=96):
-    """Map the exact MPEG frame starts used by an FSB5 sample.
-
-    NASCAR 15 music banks are not safe to rebuild as a generic contiguous or
-    16-byte-padded stream.  FMOD banks may align each frame differently (32-byte
-    alignment is common), and the sample header/loop chunks continue to describe
-    the original decoded sample window.  This mapper preserves the stock frame
-    start offsets instead of guessing a padding rule.
-    """
-    frames=[]
-    if not d: return dict(frames=[], starts=[], cells=[], padded=False, spec=None)
-    i=0
-    # A valid FSB sample should start on a frame. Tolerate a tiny leading pad for
-    # raw user streams, but never silently skip a large unknown prefix.
-    if not frame_info(d,0):
-        first=next((j for j in range(1,min(max_gap+1,max(1,len(d)-3))) if frame_info(d,j)),None)
-        if first is None: return dict(frames=[], starts=[], cells=[], padded=False, spec=None)
-        i=first
-    spec=None
-    while i<len(d)-4 and len(frames)<limit:
-        fi=frame_info(d,i)
-        if not fi: break
-        if spec is None: spec=fi
-        # A slot is one codec configuration. A different layer/rate/channel mode
-        # is treated as the end rather than accepted as a false sync in padding.
-        if (fi[0],fi[1],fi[2],fi[3]) != (spec[0],spec[1],spec[2],spec[3]): break
-        end=i+fi[4]
-        if end>len(d): break
-        frames.append(dict(start=i, length=fi[4], data=d[i:end], info=fi))
-        nxt=None
-        for j in range(end,min(len(d)-3,end+max_gap+1)):
-            nfi=frame_info(d,j)
-            if nfi and (nfi[0],nfi[1],nfi[2],nfi[3]) == (spec[0],spec[1],spec[2],spec[3]):
-                nxt=j; break
-        if nxt is None: break
-        i=nxt
-    starts=[x['start'] for x in frames]
-    cells=[]
-    for n,x in enumerate(frames):
-        # Every non-final cell ends at the next stock frame start.  The final
-        # cell is limited to the original frame itself; bytes after it are kept
-        # byte-identical, which avoids turning unknown tail data into audio.
-        end=starts[n+1] if n+1<len(starts) else x['start']+x['length']
-        cells.append(dict(start=x['start'], end=end, capacity=end-x['start'],
-                          frame_length=x['length']))
-    padded=any(c['capacity']!=frames[i]['length'] for i,c in enumerate(cells))
-    return dict(frames=frames, starts=starts, cells=cells, padded=padded, spec=spec)
-
-def fmod_walk(d,limit=200000):
-    """Return de-padded frames using the measured FSB frame topology."""
-    t=_mpeg_frame_topology(d,limit=limit)
-    return [x['data'] for x in t['frames']],t['padded'],t['spec']
-
-def _mpeg_silent_frame_that_fits(spec, capacity):
-    sil=_sil_for(spec)
-    if sil:
-        t=_mpeg_frame_topology(sil,limit=4)
-        for x in t['frames']:
-            if len(x['data'])<=capacity:
-                return x['data']
-        fi=frame_info(sil,0)
-        if fi and fi[4]<=capacity:
-            return sil[:fi[4]]
-    return None
-
-def _fit_mpeg_to_stock_topology(stream, original, meta):
-    """Fit replacement audio into the stock sample's exact MPEG frame cells.
-
-    The old writer filled the byte slot using a guessed 16-byte padding rule and
-    as many silent frames as would fit.  Music then retained stock sample-count
-    and loop metadata but no longer retained stock frame boundaries.  This writer
-    keeps the original number of frames, every original frame start offset, all
-    bytes outside those cells, and therefore all header/loop metadata.
-    """
-    stock=_mpeg_frame_topology(original)
-    source=_mpeg_frame_topology(stream)
-    if not stock['frames'] or not stock['spec']:
-        raise ValueError('stock MPEG frame topology could not be mapped')
-    if not source['frames'] or not source['spec']:
-        raise ValueError('replacement contains no valid MPEG frames')
-    ss=stock['spec']; rs=source['spec']
-    if (ss[0],ss[1],ss[2],ss[3]) != (rs[0],rs[1],rs[2],rs[3]):
-        raise ValueError('replacement MPEG format does not exactly match the stock song')
-    out=bytearray(original)
-    src=[x['data'] for x in source['frames']]
-    used=0; silence=0; preserved_tail=len(original)-(stock['cells'][-1]['end'] if stock['cells'] else 0)
-    for i,cell in enumerate(stock['cells']):
-        cap=cell['capacity']
-        frame=src[i] if i<len(src) else None
-        if frame is not None and len(frame)>cap:
-            # A different encoder padding phase can make an occasional CBR frame
-            # one byte larger.  Do not split it; use a valid matching silent frame
-            # for that final fraction of a second instead.
-            frame=None
-        if frame is None:
-            frame=_mpeg_silent_frame_that_fits(ss,cap)
-            if frame is None:
-                raise ValueError(f'no valid matching MPEG frame fits stock cell {i} ({cap} bytes)')
-            silence+=1
-        else:
-            used+=1
-        out[cell['start']:cell['end']]=frame+b'\0'*(cap-len(frame))
-    # Re-scan the result and demand the exact original start map.  This is the
-    # important game-safety check; ordinary FSB parsing does not verify it.
-    check=_mpeg_frame_topology(bytes(out))
-    if check['starts']!=stock['starts'] or len(check['frames'])!=len(stock['frames']):
-        raise ValueError('rebuilt MPEG frame topology differs from stock; write refused')
-    if check['spec'] and (check['spec'][0],check['spec'][1],check['spec'][2],check['spec'][3]) != (ss[0],ss[1],ss[2],ss[3]):
-        raise ValueError('rebuilt MPEG codec specification changed')
-    samples=int((meta or {}).get('samples') or 0)
-    hz=int((meta or {}).get('hz') or ss[2] or 0)
-    return bytes(out),dict(stock_frames=len(stock['frames']),source_frames=len(src),
-        audio_frames=used,silent_frames=silence,padded=stock['padded'],
-        preserved_tail=preserved_tail,samples=samples,hz=hz,starts=stock['starts'])
-
-def _verify_mpeg_decode(payload):
-    """Ask FFmpeg to decode the rebuilt elementary stream before game write."""
-    ff=ffmpeg_path()
-    if not ff: return True,None
-    frames,_,fi=fmod_walk(payload)
-    if not frames or not fi: return False,'no frames after rebuild'
-    ext='.mp2' if fi[0]==2 else '.mp3'
-    with tempfile.TemporaryDirectory() as td:
-        src=os.path.join(td,'verify'+ext)
-        open(src,'wb').write(b''.join(frames))
-        r=subprocess.run([ff,'-v','error','-i',src,'-f','null','-'],capture_output=True,text=True)
-        if r.returncode!=0:
-            return False,(r.stderr or 'FFmpeg decode failed')[-240:]
-    return True,None
-
-
-_AUDIO_VOLUME_MODES={'match_stock','custom','source'}
-_AUDIO_CUSTOM_GAIN_MIN_DB=-24.0
-_AUDIO_CUSTOM_GAIN_MAX_DB=24.0
-
-def _audio_volume_mode(value):
-    mode=str(value or 'match_stock').strip().lower()
-    return mode if mode in _AUDIO_VOLUME_MODES else 'match_stock'
-
-def _audio_custom_gain_db(value, mode='custom'):
-    if _audio_volume_mode(mode)!='custom':
-        return 0.0
-    try:
-        gain=float(value)
-    except (TypeError,ValueError):
-        raise ValueError('Custom volume must be a number between -24 and +24 dB')
-    if not _math.isfinite(gain):
-        raise ValueError('Custom volume must be a finite number')
-    if gain<_AUDIO_CUSTOM_GAIN_MIN_DB or gain>_AUDIO_CUSTOM_GAIN_MAX_DB:
-        raise ValueError('Custom volume must be between -24 and +24 dB')
-    return gain
-
-def _audio_volume_label(mode,gain_db):
-    mode=_audio_volume_mode(mode)
-    if mode=='match_stock': return f'matched to stock ({float(gain_db):+.1f} dB applied)'
-    if mode=='source': return 'kept at source level (0.0 dB applied)'
-    return f'custom gain {float(gain_db):+.1f} dB'
-
-def _audio_is_loop_sample(name):
-    n=str(name or '').lower()
-    return any(token in n for token in ('eng_l','eng_r','exh_l','exh_r','engine','exhaust'))
-
-def _active_pcm_stats(values):
-    arr=np.asarray(values,dtype=np.float64).reshape(-1)
-    if not arr.size: return dict(rms=0.0,peak=0.0,rms_db=-120.0,peak_db=-120.0)
-    peak=float(np.max(np.abs(arr)))
-    if peak<=1e-9: return dict(rms=0.0,peak=0.0,rms_db=-120.0,peak_db=-120.0)
-    floor=max(1e-5,peak*0.001)
-    active=arr[np.abs(arr)>=floor]
-    if active.size<32: active=arr
-    rms=float(np.sqrt(np.mean(active*active))) if active.size else 0.0
-    def db(v): return 20.0*np.log10(max(v,1e-9))
-    return dict(rms=rms,peak=peak,rms_db=float(db(rms)),peak_db=float(db(peak)))
-
-def _safe_gain_db(mode, source_stats=None, stock_stats=None, custom_gain_db=0.0):
-    mode=_audio_volume_mode(mode)
-    if mode=='source': return 0.0
-    if mode=='custom': return _audio_custom_gain_db(custom_gain_db,mode)
-    if not source_stats or not stock_stats or source_stats.get('rms',0)<=0 or stock_stats.get('rms',0)<=0:
-        return 0.0
-    wanted=float(stock_stats['rms_db'])-float(source_stats['rms_db'])
-    # Leave headroom before the limiter. Match-stock is intentionally bounded so
-    # a nearly silent upload cannot turn into a destructive +40 dB surprise.
-    peak_room=-0.5-float(source_stats.get('peak_db',-120.0))
-    return max(-12.0,min(18.0,wanted,peak_room+3.0))
-
-def _apply_pcm_gain_i16(stream,gain_db):
-    if not stream: return stream
-    usable=len(stream)-(len(stream)%2)
-    src=np.frombuffer(stream[:usable],dtype='<i2').astype(np.float64)/32768.0
-    scaled=src*(10.0**(float(gain_db)/20.0))
-    # Leave already-safe audio untouched. Engage the smooth limiter only when
-    # the selected gain would exceed the headroom.
-    limited=(scaled if (not scaled.size or float(np.max(np.abs(scaled)))<=0.97)
-             else np.tanh(scaled/0.97)*0.97)
-    out=np.clip(np.rint(limited*32767.0),-32768,32767).astype('<i2').tobytes()
-    return out+stream[usable:]
-
-def _loop_fill_pcm16(stream,target_bytes,channels,hz,crossfade_ms=12):
-    frame_bytes=max(1,int(channels)*2)
-    target_bytes=int(target_bytes)-(int(target_bytes)%frame_bytes)
-    usable=len(stream)-(len(stream)%frame_bytes)
-    if usable<=0 or target_bytes<=0: return b''
-    if usable>=target_bytes: return stream[:target_bytes]
-    src=np.frombuffer(stream[:usable],dtype='<i2').reshape(-1,int(channels)).astype(np.float64)
-    target_frames=target_bytes//frame_bytes
-    repeats=(target_frames+len(src)-1)//len(src)
-    out=np.tile(src,(repeats,1))[:target_frames].copy()
-    fade=max(1,min(len(src)//4,int(int(hz)*crossfade_ms/1000)))
-    # Blend the first samples of each repeat with the previous repeat's tail.
-    # The blend is in-place, so the output remains exactly the stock duration.
-    if fade>0:
-        alpha=np.linspace(0.0,1.0,fade,endpoint=False)[:,None]
-        for boundary in range(len(src),target_frames,len(src)):
-            n=min(fade,target_frames-boundary)
-            if n<=0: break
-            prev=src[-n:]
-            nxt=src[:n]
-            out[boundary:boundary+n]=prev*(1.0-alpha[:n])+nxt*alpha[:n]
-    return np.clip(np.rint(out),-32768,32767).astype('<i2').tobytes()
-
-def _ffmpeg_pcm_stats(raw,filename,hz,channels):
-    ff=ffmpeg_path()
-    if not ff: return None
-    ext=os.path.splitext(filename or '')[1] or '.bin'
-    with tempfile.TemporaryDirectory() as td:
-        src=os.path.join(td,'measure'+ext); out=os.path.join(td,'measure.f32')
-        open(src,'wb').write(raw)
-        r=subprocess.run([ff,'-v','error','-i',src,'-vn','-map_metadata','-1',
-                          '-ar',str(int(hz)),'-ac',str(int(channels)),
-                          '-c:a','pcm_f32le','-f','f32le',out,'-y'],
-                         capture_output=True,text=True)
-        if r.returncode!=0 or not os.path.exists(out): return None
-        data=np.frombuffer(open(out,'rb').read(),dtype='<f4')
-    return _active_pcm_stats(data)
-
-def _mpeg_gain_db(mode,upload_raw,upload_name,stock_payload,spec,custom_gain_db=0.0):
-    mode=_audio_volume_mode(mode)
-    if mode!='match_stock': return _safe_gain_db(mode,custom_gain_db=custom_gain_db)
-    frames,_,_fi=fmod_walk(stock_payload)
-    if not frames: return 0.0
-    channels=1 if spec[3] else 2
-    stock_ext='.mp2' if spec[0]==2 else '.mp3'
-    source_stats=_ffmpeg_pcm_stats(upload_raw,upload_name,spec[2],channels)
-    stock_stats=_ffmpeg_pcm_stats(b''.join(frames),'stock'+stock_ext,spec[2],channels)
-    return _safe_gain_db(mode,source_stats,stock_stats)
-
-FSB_MODES={0:'NONE',1:'PCM8',2:'PCM16',3:'PCM24',4:'PCM32',5:'PCMFLOAT',6:'GCADPCM',
- 7:'IMAADPCM',8:'VAG',9:'HEVAG',10:'XMA',11:'MPEG',12:'CELT',13:'AT9',14:'XWMA',15:'VORBIS'}
-FSB_FREQ={1:8000,2:11000,3:11025,4:16000,5:22050,6:24000,7:32000,8:44100,9:48000,10:96000}
-
-def parse_fsb5(bank):
-    if bank[:4]!=b'FSB5': raise ValueError('not FSB5')
-    ver,num,shdr,ntab,dsz,mode=struct.unpack_from('<6I',bank,4)
-    codec=FSB_MODES.get(mode,f'mode{mode}')
-    data_start=len(bank)-dsz; names_start=data_start-ntab; hdrs_start=names_start-shdr
-    raws=[]; chunks=[]; raw_positions=[]; chunk_records=[]; pos=hdrs_start
-    for _ in range(num):
-        raw_pos=pos
-        raw,=struct.unpack_from('<Q',bank,pos); pos+=8
-        raws.append(raw); raw_positions.append(raw_pos); cl=[]; cr=[]; nxt=raw&1
-        while nxt:
-            chunk_header_pos=pos
-            ch,=struct.unpack_from('<I',bank,pos); pos+=4
-            nxt=ch&1; size=(ch>>1)&0xFFFFFF; ctype=ch>>25
-            payload_pos=pos; payload=bank[pos:pos+size]
-            cl.append((ctype,payload))
-            cr.append(dict(type=ctype,header_pos=chunk_header_pos,payload_pos=payload_pos,size=size,data=payload))
-            pos+=size
-        chunks.append(cl); chunk_records.append(cr)
-    walk_delta=pos-names_start
-    names=['']*num
-    if ntab>=4*num:
-        noffs=[struct.unpack_from('<I',bank,names_start+4*i)[0] for i in range(num)]
-        for i,o in enumerate(noffs):
-            p=names_start+o
-            if 0<=p<data_start:
-                e=bank.find(b'\0',p,data_start)
-                names[i]=bank[p:e].decode('ascii','replace') if e!=-1 else ''
-    # per-sample meta: frequency index bits 1-4, channel bit 5 (standard v1 layout);
-    # chunk type 1 = channel count, type 2 = explicit frequency (override)
-    metas=[]
-    for i,r in enumerate(raws):
-        hz=FSB_FREQ.get((r>>1)&0xF); chn=((r>>5)&1)+1; scount=(r>>34)&0x3FFFFFFF
-        for ct,pay in chunks[i]:
-            if ct==1 and len(pay)>=1: chn=pay[0]
-            elif ct==2 and len(pay)>=4: hz=struct.unpack_from('<I',pay)[0]
-        metas.append(dict(hz=hz, ch=chn, samples=scount))
-    # candidate offset layouts, scored by a codec-appropriate validator
-    def score(offs):
-        s=0
-        for i,o in enumerate(offs):
-            end=offs[i+1] if i+1<len(offs) else dsz
-            if mode==11:
-                s+=1 if (o+1<dsz and bank[data_start+o]==0xFF and (bank[data_start+o+1]&0xE0)==0xE0) else 0
-            elif mode==2:
-                exp=metas[i]['samples']*2*metas[i]['ch']
-                s+=1 if 0<=(end-o)-exp<128 else 0
-            else:
-                s+=1 if end>o else 0
-        return s
-    cands=[]
-    for bits,mult,sh in ((28,16,6),(27,32,7),(28,16,7)):
-        offs=[((r>>sh)&((1<<bits)-1))*mult for r in raws]
-        if not offs or offs!=sorted(offs) or offs[-1]>=dsz or offs[0]>=64: continue
-        cands.append((score(offs),offs,f'sh{sh}x{mult}'))
-    pick=max(cands,key=lambda c:c[0]) if cands else None
-    if not pick or walk_delta!=0:
-        r0=f'{raws[0]:016x}' if raws else '-'
-        d0=bank[data_start:data_start+16].hex() if dsz>=16 else '-'
-        raise ValueError(f'sample offset decode failed [codec={codec} n={num} shdr={shdr} '
-            f'ntab={ntab} dsz={dsz} walk_delta={walk_delta} raw0={r0} data0={d0} '
-            f'cands={[(c[0],c[2]) for c in cands]}] - paste this to the dev')
-    sync,offs,layout=pick
-    validated = sync==num                      # every sample passed its validator
-    slices=[]
-    for i,o in enumerate(offs):
-        end=offs[i+1] if i+1<len(offs) else dsz
-        slices.append((names[i] or f'sample_{i:03d}', data_start+o, end-o, metas[i]))
-    return dict(num=num, mode=mode, codec=codec, slices=slices, layout=layout,
-                validated=validated,
-                editable=(mode==11 and validated) or (mode==2 and validated),
-                version=ver, sample_headers_size=shdr, name_table_size=ntab,
-                data_size=dsz, data_start=data_start, names_start=names_start,
-                headers_start=hdrs_start, raws=raws, raw_positions=raw_positions,
-                chunks=chunks, chunk_records=chunk_records, offsets=offs,
-                metas=metas, names=names, header_walk_end=pos)
-
-
-def _align_up(value, alignment):
-    alignment=max(1,int(alignment))
-    return (int(value)+(alignment-1)) & ~(alignment-1)
-
-
-def _infer_stock_mpeg_frame_alignment(sample_bytes):
-    """Infer the actual FMOD MPEG frame alignment used by one stock sample.
-
-    Full-length replacement cannot preserve the old finite frame-start map, so it
-    must reproduce the rule that generated that map. We only accept a power-of-two
-    alignment when it predicts every measured stock frame start exactly.
-    """
-    topo=_mpeg_frame_topology(sample_bytes)
-    frames=topo.get('frames') or []
-    if len(frames)<3:
-        raise ValueError('stock song has too few MPEG frames to infer its alignment')
-    for alignment in (16,32,64,8,4,128,256):
-        ok=True
-        for i in range(len(frames)-1):
-            expected=_align_up(frames[i]['start']+frames[i]['length'],alignment)
-            if expected!=frames[i+1]['start']:
-                ok=False;break
-        if ok:
-            return alignment,topo
-    gaps=sorted({frames[i+1]['start']-(frames[i]['start']+frames[i]['length'])
-                 for i in range(min(len(frames)-1,64))})
-    raise ValueError('stock MPEG frame alignment is not a consistent supported power-of-two rule; '
-                     'measured gaps '+str(gaps[:12]))
-
-
-def _pack_mpeg_frames_with_alignment(stream, alignment):
-    source=_mpeg_frame_topology(stream)
-    frames=source.get('frames') or []
-    if not frames or not source.get('spec'):
-        raise ValueError('encoded replacement contains no valid MPEG frames')
-    out=bytearray(); starts=[]
-    for frame in frames:
-        if out:
-            target=_align_up(len(out),alignment)
-            if target>len(out): out.extend(b'\0'*(target-len(out)))
-        starts.append(len(out)); out.extend(frame['data'])
-    check=_mpeg_frame_topology(bytes(out))
-    if check.get('starts')!=starts or len(check.get('frames') or [])!=len(frames):
-        raise ValueError('aligned MPEG rebuild did not retain every encoded frame')
-    return bytes(out),dict(frames=len(frames),starts=starts,spec=source['spec'],alignment=alignment)
-
-
-def _encode_full_length_mpeg(raw, filename, spec, gain_db=0.0):
-    """Encode the complete upload and measure its intended decoded sample count."""
-    ff=ffmpeg_path()
-    if not ff:
-        raise ValueError('full-length music replacement needs the installed LGPL audio tools')
-    fmt='mp2' if spec[0]==2 else 'mp3'
-    channels=1 if spec[3] else 2
-    ext=os.path.splitext(filename or '')[1] or '.bin'
-    with tempfile.TemporaryDirectory() as td:
-        src=os.path.join(td,'input'+ext); enc_path=os.path.join(td,'encoded.'+fmt); pcm_path=os.path.join(td,'measure.pcm')
-        open(src,'wb').write(raw)
-        cmd=[ff,'-v','error','-i',src,'-vn','-map_metadata','-1',
-             '-ar',str(spec[2]),'-ac',str(channels)]
-        if abs(float(gain_db))>0.01:
-            cmd += ['-af',f'volume={float(gain_db):.3f}dB,alimiter=limit=0.97']
-        cmd += ['-c:a','mp2' if spec[0]==2 else 'libmp3lame','-b:a',f'{spec[1]}k']
-        if spec[0]!=2:
-            cmd += ['-write_xing','0','-id3v2_version','0']
-        cmd += ['-f',fmt,enc_path,'-y']
-        r=subprocess.run(cmd,capture_output=True,text=True)
-        if r.returncode!=0 or not os.path.exists(enc_path):
-            raise ValueError('FFmpeg could not encode the full song: '+(r.stderr or '')[-240:])
-        m=subprocess.run([ff,'-v','error','-i',src,'-vn','-map_metadata','-1',
-                          '-ar',str(spec[2]),'-ac',str(channels),'-c:a','pcm_s16le',
-                          '-f','s16le',pcm_path,'-y'],capture_output=True,text=True)
-        if m.returncode!=0 or not os.path.exists(pcm_path):
-            raise ValueError('FFmpeg could not measure the full song duration: '+(m.stderr or '')[-240:])
-        encoded=open(enc_path,'rb').read(); pcm_size=os.path.getsize(pcm_path)
-    first=next((i for i in range(len(encoded)) if frame_info(encoded,i)),None)
-    if first is None: raise ValueError('full-song encode produced no MPEG frames')
-    stream=encoded[first:]
-    got=frame_info(stream,0)
-    if not got or got[:4]!=spec[:4]:
-        raise ValueError('full-song encode did not match the stock MPEG format')
-    sample_count=pcm_size//(channels*2)
-    if sample_count<=0 or sample_count>=2**30:
-        raise ValueError('full song decoded sample count is outside the FSB5 header range')
-    return stream,int(sample_count),channels
-
-
-def _scaled_loop_points(old_start, old_end, old_samples, new_samples):
-    if new_samples<=0: return 0,0
-    if old_samples<=1:
-        return 0,max(0,new_samples-1)
-    # Map the inclusive [0, old_samples-1] timeline onto the new inclusive
-    # timeline so a stock loop ending on the final sample still ends on the
-    # final sample after a duration change.
-    scale=float(max(0,new_samples-1))/float(old_samples-1)
-    ns=max(0,min(new_samples-1,int(round(old_start*scale))))
-    ne=max(ns,min(new_samples-1,int(round(old_end*scale))))
-    return ns,ne
-
-
-def _rebuild_fsb5_full_mpeg_sample(bank, sample_index, stream, sample_count):
-    """Rebuild one MPEG sample at arbitrary duration while preserving the bank.
-
-    The FSB5 header, names, unknown chunks, GUID and every untouched sample are
-    retained. Only the target sample count/loop points, all sample data offsets,
-    the bank data-size field, and the target MPEG bytes change.
-    """
-    fsb=parse_fsb5(bank)
-    if fsb['mode']!=11 or not fsb['validated']:
-        raise ValueError('full-length rebuild is limited to validated MPEG FSB5 banks')
-    if fsb['layout']!='sh6x16':
-        raise ValueError('full-length rebuild requires the standard FSB5 16-byte data-offset layout; found '+fsb['layout'])
-    if not (0<=int(sample_index)<fsb['num']):
-        raise ValueError('sample index is outside the FSB5 bank')
-    idx=int(sample_index); target=fsb['slices'][idx]
-    original_target=bank[target[1]:target[1]+target[2]]
-    alignment,stock_topology=_infer_stock_mpeg_frame_alignment(original_target)
-    packed,pack_info=_pack_mpeg_frames_with_alignment(stream,alignment)
-    if pack_info['spec'][:4] != stock_topology['spec'][:4]:
-        raise ValueError('replacement MPEG format does not exactly match the stock song')
-
-    data=bytearray(); new_offsets=[]; original_blobs=[]
-    for i,(_name,rel,length,_meta) in enumerate(fsb['slices']):
-        aligned=_align_up(len(data),16)
-        if aligned>len(data): data.extend(b'\0'*(aligned-len(data)))
-        new_offsets.append(len(data))
-        original_blob=bytes(bank[rel:rel+length]); original_blobs.append(original_blob)
-        data.extend(packed if i==idx else original_blob)
-    final=_align_up(len(data),16)
-    if final>len(data): data.extend(b'\0'*(final-len(data)))
-    if len(data)>=2**32:
-        raise ValueError('rebuilt FSB5 data chunk exceeds the 32-bit size field')
-
-    prefix=bytearray(bank[:fsb['data_start']])
-    struct.pack_into('<I',prefix,20,len(data))
-    for i,raw_pos in enumerate(fsb['raw_positions']):
-        off=new_offsets[i]
-        if off%16 or off//16 >= 2**28:
-            raise ValueError('rebuilt sample offset is outside the FSB5 28-bit offset field')
-        count=int(sample_count if i==idx else fsb['metas'][i]['samples'])
-        if count<0 or count>=2**30:
-            raise ValueError('rebuilt sample count is outside the FSB5 30-bit field')
-        old=fsb['raws'][i]
-        rebuilt=(old & 0x3F) | ((off//16)<<6) | (count<<34)
-        struct.pack_into('<Q',prefix,raw_pos,rebuilt)
-
-    loop_update=None
-    for rec in fsb['chunk_records'][idx]:
-        if rec['type']==3 and rec['size']>=8:
-            old_start,old_end=struct.unpack_from('<II',rec['data'],0)
-            new_start,new_end=_scaled_loop_points(old_start,old_end,fsb['metas'][idx]['samples'],sample_count)
-            struct.pack_into('<II',prefix,rec['payload_pos'],new_start,new_end)
-            loop_update=dict(old=[old_start,old_end],new=[new_start,new_end])
-
-    rebuilt=bytes(prefix)+bytes(data)
-    check=parse_fsb5(rebuilt)
-    if check['num']!=fsb['num'] or check['mode']!=fsb['mode'] or check['layout']!='sh6x16':
-        raise ValueError('rebuilt FSB5 bank structure did not validate')
-    if check['metas'][idx]['samples']!=int(sample_count):
-        raise ValueError('rebuilt FSB5 sample count readback mismatch')
-    for i,(_name,rel,length,_meta) in enumerate(check['slices']):
-        if i==idx: continue
-        if rebuilt[rel:rel+len(original_blobs[i])] != original_blobs[i]:
-            raise ValueError('untouched FSB5 sample '+str(i)+' changed during rebuild')
-    new_name,new_rel,new_len,new_meta=check['slices'][idx]
-    new_target=rebuilt[new_rel:new_rel+new_len]
-    topo=_mpeg_frame_topology(new_target)
-    if len(topo.get('frames') or [])!=pack_info['frames'] or topo.get('starts')!=pack_info['starts']:
-        raise ValueError('rebuilt target MPEG topology readback mismatch')
-    ok,err=_verify_mpeg_decode(new_target)
-    if not ok: raise ValueError('rebuilt full song did not decode cleanly: '+str(err))
-    return rebuilt,dict(old_bank_size=len(bank),new_bank_size=len(rebuilt),growth=len(rebuilt)-len(bank),
-                        old_slot_size=target[2],new_slot_size=new_len,alignment=alignment,
-                        frames=pack_info['frames'],samples=int(sample_count),hz=int(new_meta['hz'] or 0),
-                        channels=int(new_meta['ch'] or 0),loop=loop_update)
-
-def fit_payload(stream, slice_len, sil, fmod_pad=False):
-    def cell(b): return b+b'\0'*((16-len(b)%16)%16) if fmod_pad else b
-    out=b''; used=0
-    for i,f in walk_frames(stream):
-        fb=cell(stream[i:i+f[4]])
-        if len(out)+len(fb)>slice_len: break
-        out+=fb; used+=1
-    if used==0: raise ValueError('no valid MPEG frames in replacement')
-    sc=cell(sil) if sil else b''
-    while sc and len(out)+len(sc)<=slice_len: out+=sc
-    return out+b'\0'*(slice_len-len(out)), used
-
-def _pcm16_from_wav(data, channels, hz):
-    """Convert an uncompressed WAV to raw little-endian PCM16 without ffmpeg.
-
-    Covers the ordinary case of dropping a .wav onto a PCM16 game slot: reads
-    8/16/24/32-bit integer PCM via the stdlib, then matches the slot's channel
-    count and sample rate with numpy. Raises ValueError for anything it cannot
-    handle (float WAV, ADPCM, other compressed forms) so the caller can fall back
-    to ffmpeg or report a clear message.
-
-    Resampling is linear interpolation, which is coarser than ffmpeg's
-    swresample. ffmpeg is preferred whenever it is available; this is the
-    no-ffmpeg path.
-    """
-    import wave as _wave
-    try:
-        with _wave.open(io.BytesIO(data), 'rb') as w:
-            ch, sw, fr, n = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
-            raw = w.readframes(n)
-    except Exception as ex:
-        raise ValueError('not an uncompressed PCM WAV (' + str(ex) + ')') from ex
-    if ch < 1 or fr < 1:
-        raise ValueError('WAV header reports no channels or no sample rate')
-    if not raw:
-        raise ValueError('WAV contains no audio frames')
-
-    if sw == 1:            # unsigned 8-bit
-        a = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
-        a = (a - 128.0) * 256.0
-    elif sw == 2:
-        a = np.frombuffer(raw, dtype='<i2').astype(np.float32)
-    elif sw == 3:          # 24-bit packed, sign-extend via the high byte
-        b = np.frombuffer(raw[:len(raw) - (len(raw) % 3)], dtype=np.uint8).reshape(-1, 3)
-        v = (b[:, 0].astype(np.int32) | (b[:, 1].astype(np.int32) << 8)
-             | (b[:, 2].astype(np.int8).astype(np.int32) << 16))
-        a = (v / 256.0).astype(np.float32)
-    elif sw == 4:
-        a = np.frombuffer(raw, dtype='<i4').astype(np.float32) / 65536.0
-    else:
-        raise ValueError('unsupported WAV sample width: ' + str(sw * 8) + '-bit')
-
-    usable = (a.size // ch) * ch
-    a = a[:usable].reshape(-1, ch)
-    if a.shape[0] == 0:
-        raise ValueError('WAV contains no complete audio frames')
-
-    want = 1 if channels <= 1 else 2
-    if a.shape[1] == want:
-        pass
-    elif want == 1:
-        a = a.mean(axis=1, keepdims=True)
-    elif a.shape[1] == 1:
-        a = np.repeat(a, 2, axis=1)
-    else:
-        a = a[:, :2]
-
-    if fr != hz:
-        m = int(round(a.shape[0] * float(hz) / float(fr)))
-        if m < 1:
-            raise ValueError('resampling to ' + str(hz) + ' Hz leaves no audio')
-        src_x = np.arange(a.shape[0], dtype=np.float64)
-        dst_x = np.linspace(0.0, a.shape[0] - 1, m)
-        a = np.stack([np.interp(dst_x, src_x, a[:, c]) for c in range(a.shape[1])], axis=1)
-
-    return np.clip(np.rint(a), -32768, 32767).astype('<i2').ravel().tobytes()
-
-
-# --- verified silent MPEG frames, so tail padding needs no ffmpeg -------------
-# One frame per (layer, kbps, Hz, mono) for layers 2 and 3 at 128/160/192 kbps and
-# 32000/44100/48000 Hz, mono and stereo. Each was generated with ffmpeg anullsrc and
-# then decoded back and checked byte-by-byte: all 36 decode to pure silence.
-# zlib+base64 keeps 36 frames (21 KB raw) in about 3 KB of source.
-_SIL_TABLE_B64 = (
-    'eNrtWm9sG0kVt0p6OrXqtZZKJaiO5nIVfElPsTdxgxC5SrXQRfABQV2J+I5A0/pOZ+9FQiRGtdP4w4FaldBQVVClSKmgh6KrrJyP'
-    '8xpq2bGgaRAoCgjOtrKynQ+QfKjOK2GBa1nO8t7M7NrebJyaPxe73TdtEo9n3rx57/fevjezTqe122Lt7+asPT093T3dfSdtr3XX'
-    '9Vnq+np7LWRcr+Wkps9S39dP+XH9vZo+S7XP1qOue9Lao+mz1PUp6/ZZrZo+S30fWxd+a/os1b7PW9V1+229mj5LXZ+yrs1q0/RZ'
-    '6vv6NfpT+xT9cTp65nT0zOnomdPRM6ejZ05Hz5yOnjkdPXM6euZ09Mzp6JnT0TOno2dOR8+cjp45HT1zOnrmtuj5NZNcudzhsnPQ'
-    '7F0cx/HC3zzTJkLvMpqPlyX9f5cq5aKULcYkr9frPPJA5D3OI4uhwrrIC9V/5IugMfQJHQr4uf/T770x7p2IJDtNpj1bEVOSJ3NF'
-    'SlIuJgFvKV6MFXMT+C8m+bLFBRkbrDYWKmzKCxKl3IIvC3LkJiQfY+VDkSZlbL5s/uHIRgVYU1q4VIyBzPFyljHOEtbyJrZiLJNc'
-    'WikDa0qXKpIPZMHVKWMiRUyuYJN80eC12SKwJgTiZmEsrk4Z54gUPrmMLVv0Oo+9LJU3KYG4MZAbV2ebpxuUSYvl88IA6KJCCcT1'
-    'gdy4OmU8QTcok+bLZDx+0EWZEpoD5MbVmWKJFDkZW7YYvZduRzUHTBB/Ah12jrOaT3eZzeYX7DeGjpvq48920Qd5ZQgJpaDz6Ohs'
-    'X9A9VJqfScbdfGEI5YoSgg+CLTfgHkqGC8N9QX9SXA+jIF6kcfjg4eP+ZDjoXo/D/GBk2Z1FUyF9FFl+My36S8A4tQxjCs7RmVQM'
-    'bYMkjs58GBJKBWA8PwNj1oVc3zwwpsvCh7sjfGEdGA/3FWA+H3d/k7oUEHw4+0DcWAap4u51mC/6k6geui58CE5FVmZAKn9qGebD'
-    'Dndpu38CA90fO3v2goMfD5mYg9f7N2CZQiEaVVgRcch+AD6ASOo3eUnRDhlHBoGvAa4o+qOKBui4LPOYyUmKYTYDiIwjgwD3T/Xy'
-    'j9CD3u6wW7u6zNwL4EHm49e/1pQHYSgHHPICmh1xAYhkWPwI4jwAWBD9tB+hPEBBPA7TAPki4JhNCs/PMvQDQ8AQDw6gcEytMLcB'
-    'hsBcAM9ROW4wAAJDQK2TjyyrHAsMucAQ4S6I68qkoRKDPDBEPwE5lUlBP/OVj2lj4CBvg4N86YzD+dJ7Aar0+gegasKHI/i8eJ44'
-    'cXLJS/AxrNj/YprET+KmY6EMsW5KBY/wRQzb1P89Xi9Co09FXvCaj/QiAXvE1dTTs6hcudnhddgddpfDbrc7hC/z4Z+fqsP/tg5A'
-    'jaNKTQJ7cjFEw+VYiGQ9ympHqMAsiNJHuPIEpN+r88k8tgOmBPq4SNHns5JFkO8/o8wn8xSteJTF8EkxTB++SopAvlfnk3lM08qq'
-    '9CFhbK0dtwbx/CbNqCcX/nWo+Yya5Zosjaxp6EjGRGPixzuxF/A83eHgOK7LznV1dXH8Z8U3HvuEgbBn7ssX/h7yYJLgL9FK1F8i'
-    'dSg4KIrB/A6+J4VpYWNldoAn6cEtUq+WggazXWYGSLj/g9dfv+DiI3+e1o9sm/LkAjl9oCUmy4qLsbrSOPlAHJaKMEgtn1nCrAxV'
-    '6lEPHzYYth7DDyAm3MCYcBpighmCwuDxW688Zs1SBeQY1N7/SAs2kXcj1ACU8MsGlcIAjiSF1j2sZj3Oo7wQLqhjbgEiZ5ENe9ZD'
-    'RSKcmBLEoZI6ZhkqhxVcjdbFWE/T0y6/OmYdEV6FPRbkJ66O8ALUGOoYrCRQaFqYY0X/k8WQIEKtoY5BJ8IdUVlAhxt/PJcWeag5'
-    '1DFYMuGOqCwPR5gbrqbUTQ+g07WSYtbAvujp4y5eQE9Hg97V5N0LOURK9TlSgxT6IzglwBiCp+q5l08zbCvqlNOumh+gs/liuUJG'
-    'qWdz2vX+GRJS5comGaWe9mnXu5gW3ZVNmTiDerC1Zb2tLqOcGtb8EGyrMIaoQD180zKSwEKtqCioeec6LjscLofX5bhwwbWaEVbt'
-    'AerA+3Z+qpc3QNG4+YmaU0QAbk0+T2OHV1kXvqzVr/PYAKoFRC3mas5OYVRNkk7ClDoPvqvVxmKoYAhhCNGSQqzhmd7c/bkrV25e'
-    'viaX7SxT0gTQkrxQJLLCauSCQD2ip/57qSI3bMSTC/KkVGFcSGqvHt0zHmW5YSMxY2NTzjG90QsF9eaE8WAFwnYNt720UoH9MC5k'
-    'F+qNCuOxtbqoaxgHr82WYT+MC9mFetOiqEVu1EjEPfYyqDXHuJBdKDcwqmrlRo3E9gFQq0yBwHah1E4KD3q/sl0jYPKDWpmB2S6U'
-    'GxtFtTSl2q6R55UBk60wCYB/3e5w2e1nOIcdKlP7j3/TPX3dpHl+NXh8kbWYx2KiJNBjHHozGsYTIXJn+jwe9DwIzxPJmI9j6sVj'
-    'NojJIo53n0tjlrWaFr5wD/9yD5N9KNEBkjlRuYXF8eSg6iguQo66Pp2ku2YhBNNDARMzzNtwfPDqOcwEYZH8Q/irr3q1S4IRZAU8'
-    'OY86qtzpLmJuiUdSuJB7iChWCU6QwgoiJo+YW+J44cRVzFZhL1FcKBkmZlBjI3CNkGMvdmdMjr1wkSVycBZ0E6MxWTCbFN/Ko5iU'
-    'OWiEZNTCiR/l8a+hVBurHRHHTvUiydv/+ale9cY3Go03uktWvbd6+ZyXGl1rVwOPekEbjTa6+q3GTPWuOJ83NtEqm3gkV+4Yb/YY'
-    'Q/+LN3vuqG/23Nav4R//XZZMrom3ZBq7h+b9G6+3iVdOGvuR5mWWTKaJ12R2iBr1L+B4vU282rNDeGlVRa/J5ZumnWjwLdco/DoI'
-    '//eaTAcCJsdWCujQuzr0oQ7JOoTrfuXb4yO2npc4S60wx/fSa2OQ40zi3nmTQbtKgJ9E2wDmt2npWcNkLYaf6WbizzMm036PaVBD'
-    'vJaua0jQkqilx4dTx2H6x37P+fe/e/ppMFCibSxS/sT340+fB91o0oP2BXbXXntYQN4XePOVK5NPgP4TbaPwv57f/84Th/+5JjPY'
-    'Q2utkZAcWhvp/MXnjBzAIA2eE20D4Ium333LMJlBDfF8u8n85LnB1sgnnxvM77k1ZFjwf4iERNuY/vfPyHOGyf5vSLjTZEw40Nka'
-    'KfSBzm/cfbXTsOCO9k20jUG/c+6H84bJmrTvr5usuQ6fao2U9fCpr++N/tKwoEEt7l+JtnGovzw79b5hMoPayr/eazL/NL/YGoWJ'
-    '+cVPvuNLGRZsQ8Ql2gZi8U9FRg2TtT3iPmgyxh1MtEZJdjDxs9KjPxgW3HX8JNoGMHd+tfRVw2QtRf8GHMD/3g=='
-)
-_SIL_TABLE_CACHE = None
-
-def _sil_table():
-    """Lazily unpack the baked silent-frame table. Returns {} if anything is off."""
-    global _SIL_TABLE_CACHE
-    if _SIL_TABLE_CACHE is None:
-        try:
-            import zlib, base64 as _b, json as _j
-            raw = zlib.decompress(_b.b64decode(_SIL_TABLE_B64))
-            cut = raw.index(b'\x00')
-            index = _j.loads(raw[:cut])
-            body = raw[cut + 1:]
-            out, pos = {}, 0
-            for layer, kbps, hz, mono, n in index:
-                out[(layer, kbps, hz, bool(mono))] = body[pos:pos + n]
-                pos += n
-            _SIL_TABLE_CACHE = out
-        except Exception:
-            _SIL_TABLE_CACHE = {}
-    return _SIL_TABLE_CACHE
-
-
-def _sil_for(spec):
-    if (spec[0],spec[1],spec[2])==(2,160,48000): return _SIL[spec[3]]
-    baked=_sil_table().get((spec[0],spec[1],spec[2],bool(spec[3])))
-    if baked: return baked
-    ff=ffmpeg_path()
-    if not ff: return b''
-    fmt='mp2' if spec[0]==2 else 'mp3'
-    with tempfile.TemporaryDirectory() as td:
-        o=os.path.join(td,'s.bin')
-        subprocess.run([ff,'-v','error','-f','lavfi','-i',
-            f'anullsrc=r={spec[2]}:cl={"mono" if spec[3] else "stereo"}','-t','0.06',
-            '-c:a','mp2' if spec[0]==2 else 'libmp3lame','-b:a',f'{spec[1]}k','-f',fmt,o,'-y'],check=True)
-        sd=open(o,'rb').read()
-    fr=walk_frames(sd[next((i for i in range(len(sd)) if frame_info(sd,i)),0):],limit=2)
-    return sd[fr[0][0]:fr[0][0]+fr[0][1][4]] if fr else b''
-
-def parse_snd(c):
-    """A .SND speech container = concatenated single-sample FSB5s.
-    Returns flat sample list across all sub-FSBs, chained + validated."""
-    flat=[]; pos=0; subs=0
-    while pos+28<=len(c):
-        if c[pos:pos+4]!=b'FSB5':
-            j=c.find(b'FSB5',pos)
-            if j==-1: break
-            pos=j
-        ver,num,shdr,ntab,dsz=struct.unpack_from('<5I',c,pos+4)
-        total=60+shdr+ntab+dsz
-        if num==0 or num>4096 or pos+total>len(c): break
-        try: fsb=parse_fsb5(c[pos:pos+total])
-        except Exception: break
-        for n,rel,sl,m in fsb['slices']:
-            flat.append(dict(name=n, rel=pos+rel, len=sl, meta=m,
-                             mode=fsb['mode'], ok=fsb['editable']))
-        subs+=1; pos+=total
-    return flat, subs
-
-def _read_container(arc, name):
-    """(v, boff, bytes, flat, kind). kind: 'fsb' or 'snd'.
-    flat: [dict(name, rel, len, meta, mode, ok)] - rel is within the container."""
-    g,reg=registry()
-    if arc not in reg: raise ValueError(f'archive {arc} not found')
-    v=reg[arc]
-    ent=[e for e in parse_cdfiles(v['cdf']) if e[2].upper()==name.upper()]
-    if not ent: raise ValueError(f'{name} not in archive {arc} index')
-    boff,bsz,_=ent[0]
-    with open(v['ar'],'rb') as f:
-        f.seek(boff); c=f.read(bsz)
-    if name.upper().endswith('.SND'):
-        flat,subs=parse_snd(c)
-        if not flat: raise ValueError('no FSB5 sub-banks found in this SND')
-        return v,boff,c,flat,'snd'
-    fsb=parse_fsb5(c)
-    flat=[dict(name=n, rel=rel, len=sl, meta=m, mode=fsb['mode'],
-               ok=fsb['editable']) for n,rel,sl,m in fsb['slices']]
-    return v,boff,c,flat,('fsb',fsb)
-
-def _find_sample(flat, idx, name):
-    if idx is not None:
-        i=int(idx)
-        if 0<=i<len(flat): return i
-        return None
-    for i,s in enumerate(flat):
-        if s['name']==name: return i
-    return None
-
-def _describe(c, s):
-    if s['mode']==11:
-        fr,padded,fi=fmod_walk(c[s['rel']:s['rel']+s['len']])
-        if not fi: return dict(spec='unusual first frame', dur=None, ok=False)
-        spb=384 if fi[0]==1 else (576 if fi[2]<32000 else 1152)
-        return dict(spec=f'L{fi[0]} {fi[1]}k {fi[2]}Hz {"mono" if fi[3] else "stereo"}',
-                    dur=round(len(fr)*spb/fi[2],2), ok=s['ok'])
-    if s['mode']==2:
-        m=s['meta']; chs={1:'mono',2:'stereo'}.get(m['ch'],f"{m['ch']}ch")
-        return dict(spec=f"PCM16 {m['hz'] or '?'}Hz {chs}",
-                    dur=(round(m['samples']/m['hz'],2) if m['hz'] else None),
-                    ok=s['ok'] and bool(m['hz']))
-    return dict(spec=FSB_MODES.get(s['mode'],'?'), dur=None, ok=False)
-
-
-
-def _full_length_audio_candidate(bank_name, container, flat, fsb):
-    """Return (eligible, reason) for the variable-size FSB5 rebuild path.
-
-    Most NASCAR 15 songs live in obviously named MUSIC banks, but several are
-    stored as one-bank-per-song and use the song title as the bank name.  A
-    title such as "LEAVE IT ON THE TRACK" was previously misclassified as
-    Track / Surface solely because it contains the word TRACK.  Treat a
-    validated, standard-layout, single-sample MPEG bank with long-form duration
-    as music without weakening any of the structural write guards.
-    """
-    if not isinstance(fsb,dict):
-        return False,'not an FSB5 bank'
-    if fsb.get('mode')!=11:
-        return False,'not an MPEG FSB5 bank'
-    if not fsb.get('editable'):
-        return False,'bank boundary validation did not pass'
-    if fsb.get('layout')!='sh6x16':
-        return False,'bank does not use the validated standard FSB5 layout'
-    if _audio_category(bank_name)=='Music':
-        return True,'named music bank'
-    if len(flat)==1:
-        try:
-            desc=_describe(container,flat[0])
-            duration=float(desc.get('dur') or 0.0)
-        except Exception:
-            duration=0.0
-        if duration>=45.0:
-            return True,f'long-form single-track MPEG bank ({duration:.2f}s)'
-    return False,'bank is not identified as music or a long-form single-track MPEG bank'
-
-
-def _audio_safe_filename(text):
-    text=re.sub(r'[^A-Za-z0-9._-]+','_',str(text)).strip('._')
-    return text[:160] or 'sound'
-
-def _audio_backup_container(v,boff,size,bank_name=None):
-    if not os.path.exists(v.get('bak','')): return None
-    if bank_name and os.path.exists(backup_path(v['cdf'])):
-        try:
-            _raw,rows,_layout=_rp_index_rows(backup_path(v['cdf']))
-            row=_rp_find_row(rows,bank_name)
-            with open(v['bak'],'rb') as f:
-                f.seek(row['offset']); data=f.read(row['size'])
-            return data if len(data)==row['size'] else None
-        except Exception:
-            pass
-    with open(v['bak'],'rb') as f:
-        f.seek(boff); data=f.read(size)
-    return data if len(data)==size else None
-
-def _audio_sample_modified(c,backup_c,s,backup_s=None):
-    if backup_c is None: return False
-    a=s['rel']; b=a+s['len']
-    if backup_s is not None:
-        ba=backup_s['rel']; bb=ba+backup_s['len']
-        return c[a:b]!=backup_c[ba:bb]
-    return c[a:b]!=backup_c[a:b]
-
-def _audio_raw_payload(c,s):
-    """Exact bytes stored in the sample slot; no padding is removed."""
-    raw=c[s['rel']:s['rel']+s['len']]
-    ext='bin'; mime='application/octet-stream'
-    if s['mode']==2:
-        ext='pcm'
-    elif s['mode']==11:
-        frames,padded,fi=fmod_walk(raw)
-        if not padded and fi:
-            ext='mp2' if fi[0]==2 else 'mp3'; mime='audio/mpeg'
-        else:
-            ext='fmod_mpeg.bin'
-    return raw,ext,mime
-
-def _audio_mpeg_payload(c,s):
-    """FMOD-de-padded MPEG elementary stream: playable anywhere, no ffmpeg.
-    FMOD stores MPEG samples with 16-byte alignment padding between frames, so
-    the exact slot bytes are not a valid MPEG file. Joining just the frames
-    yields a clean stream; nothing is re-encoded, so this is lossless."""
-    if s['mode']!=11: raise ValueError('sample is not MPEG')
-    raw=c[s['rel']:s['rel']+s['len']]
-    frames,_padded,fi=fmod_walk(raw)
-    if not frames or not fi: raise ValueError('no MPEG frames in this sample')
-    ext='mp2' if fi[0]==2 else 'mp3'
-    return b''.join(frames),ext,'audio/mpeg'
-
-def _audio_can_export_mpeg(c,s):
-    try:
-        _audio_mpeg_payload(c,s); return True
-    except Exception:
-        return False
-
-def _audio_wav_payload(c,s):
-    raw=c[s['rel']:s['rel']+s['len']]
-    if s['mode']==2 and s['meta'].get('hz'):
-        m=s['meta']; need=m['samples']*2*m['ch']
-        pcm=raw[:need] if need<=len(raw) else raw
-        hdr=(b'RIFF'+struct.pack('<I',36+len(pcm))+b'WAVEfmt '+
-             struct.pack('<IHHIIHH',16,1,m['ch'],m['hz'],m['hz']*m['ch']*2,m['ch']*2,16)+
-             b'data'+struct.pack('<I',len(pcm)))
-        return hdr+pcm
-    if s['mode']==11:
-        fr,_,_=fmod_walk(raw)
-        if fr: raw=b''.join(fr)
-    ff=ffmpeg_path()
-    if not ff:
-        raise ValueError('WAV export needs FFmpeg. Install it (ffmpeg.exe beside app.py, or anywhere on your PATH), or use Export MP3 instead.')
-    with tempfile.TemporaryDirectory() as td:
-        src=os.path.join(td,'in.bin'); out=os.path.join(td,'out.wav')
-        open(src,'wb').write(raw)
-        r=subprocess.run([ff,'-v','error','-i',src,'-f','wav',out,'-y'],
-                         capture_output=True,text=True)
-        if r.returncode!=0 or not os.path.exists(out):
-            raise ValueError('ffmpeg could not convert this sound: '+(r.stderr or '')[-240:])
-        return open(out,'rb').read()
-
-def _audio_category(name):
-    u=str(name).upper()
-    if 'ENGINE' in u or 'VEHICLE' in u: return 'Engines / Vehicles'
-    if 'HUDSND' in u or 'SPOTTER' in u or u.endswith('.SND'): return 'Spotter / Speech'
-    if 'MUSIC' in u: return 'Music'
-    if 'PIT' in u: return 'Pit Stop'
-    if 'TRACK' in u or 'AMBI' in u or 'MATERIAL' in u: return 'Track / Surface'
-    if 'FRONTEND' in u or 'MENU' in u or 'GLOBAL_HUD' in u: return 'Menus / HUD'
-    return 'Other'
 
 @app.route('/api/audio/banks')
 def audio_banks():
-    g,reg=registry()
-    if not g: return jsonify(dict(error='game not found')),400
-    out=[]
-    for k,v in sorted(reg.items()):
-        try: ent=parse_cdfiles(v['cdf'])
-        except Exception: continue
-        fh=None
-        for off,sz,nm in ent:
-            u=nm.upper()
-            if u.endswith('.FSB') or u.endswith('.SND'):
-                codec=''; n=0
-                try:
-                    if fh is None: fh=open(v['ar'],'rb')
-                    fh.seek(off); h=fh.read(28)
-                    first_sample=''
-                    if h[:4]==b'FSB5':
-                        n=struct.unpack_from('<I',h,8)[0]
-                        codec=FSB_MODES.get(struct.unpack_from('<I',h,24)[0],'?')
-                        # Single-song banks are cheap to inspect and let the UI
-                        # merge duplicate aliases such as LEAVE IT ON THE TRACK
-                        # and a generic Music bank containing the same sample.
-                        if n==1 and sz<=128*1024*1024:
-                            fh.seek(off); bank_bytes=fh.read(sz)
-                            parsed=parse_fsb5(bank_bytes)
-                            if parsed.get('slices'):
-                                first_sample=str(parsed['slices'][0][0] or '')
-                except Exception:
-                    first_sample=''
-                if u.endswith('.SND'): codec='SPEECH'; n=0; first_sample=''
-                out.append(dict(arc=k,name=nm,size=sz,codec=codec,n=n,
-                                first_sample=first_sample,
-                                category=_audio_category(nm),has_backup=os.path.exists(v['bak'])))
-        if fh: fh.close()
-    cats=sorted({x['category'] for x in out})
-    return jsonify(dict(banks=out,categories=cats,ffmpeg=bool(ffmpeg_path()),ffmpeg_details=_ffmpeg_details()))
+    try:
+        rows=_shared_audio_editor().banks()
+        banks=[dict(row,arc=row['archive'],n=row['sample_count']) for row in rows]
+        return jsonify(dict(
+            banks=banks,categories=sorted({row['category'] for row in rows}),
+            ffmpeg=bool(_shared_audio.ffmpeg_path()),ffmpeg_details=_ffmpeg_details(),
+        ))
+    except Exception as e:
+        return jsonify(dict(error=str(e))),400
 
-@app.route('/api/audio/samples', methods=['POST'])
+
+@app.route('/api/audio/samples',methods=['POST'])
 def audio_samples():
-    q=request.get_json()
-    try: v,boff,c,flat,kind=_read_container(q['arc'],q['bank'])
-    except Exception as e: return jsonify(dict(error=str(e))),400
-    backup_c=_audio_backup_container(v,boff,len(c),q['bank'])
-    backup_flat=None
-    if backup_c is not None:
-        try:
-            if q['bank'].upper().endswith('.SND'): backup_flat,_subs=parse_snd(backup_c)
-            else:
-                bfsb=parse_fsb5(backup_c)
-                backup_flat=[dict(name=n,rel=rel,len=sl,meta=m,mode=bfsb['mode'],ok=bfsb['editable']) for n,rel,sl,m in bfsb['slices']]
-        except Exception: backup_flat=None
-    smp=[]; modified_count=0
-    for i,samp in enumerate(flat):
-        d=_describe(c,samp)
-        modified=_audio_sample_modified(c,backup_c,samp,(backup_flat[i] if backup_flat and i<len(backup_flat) else None))
-        modified_count+=1 if modified else 0
-        smp.append(dict(idx=i,name=samp['name'],bytes=samp['len'],modified=modified,
-                        export_wav=bool(samp['mode']==2 or ffmpeg_path()),
-                        export_mpeg=_audio_can_export_mpeg(c,samp),
-                        export_raw=True,**d))
-    common=dict(samples=smp,modified_count=modified_count,has_backup=backup_c is not None,
-                bank=q['bank'],arc=q['arc'])
-    if kind=='snd':
-        return jsonify(dict(**common,codec='SPEECH (FSB5/MPEG chain)',editable=True,
-            note=f'{len(smp)} speech clips found in this container'))
-    fsb=kind[1]
-    music=_audio_category(q['bank'])=='Music'
-    full_candidate,full_reason=_full_length_audio_candidate(q['bank'],c,flat,fsb)
-    full_ready=bool(full_candidate and ffmpeg_path())
-    if full_candidate:
-        if full_ready:
-            note=('Full-length replacement is available for this music group ('+full_reason+'). '
-                  'Replace Full Song installs the complete imported track. '
-                  'Fit to Original Length remains available under Advanced Details.')
+    q=request.get_json(force=True)
+    try:
+        info=_shared_audio_editor().samples(str(q['arc']),q['bank'])
+        samples=[
+            dict(row,idx=row['index'],dur=row['duration'],ok=row['editable'])
+            for row in info['samples']
+        ]
+        if info['kind']=='snd':
+            note=f"{len(samples)} speech clips found in this container"
+        elif info['full_length_candidate']:
+            note=(
+                'Full-length replacement is available for this music group.'
+                if info['full_length_supported'] else
+                'This is a full-length music candidate, but FFmpeg is not installed.'
+            )
+        elif info['editable']:
+            note=None
         else:
-            note=('This is a full-length music candidate ('+full_reason+'), but the managed '
-                  'FFmpeg audio tools are not installed.')
-    elif fsb['editable']:
-        note=None
-    else:
-        note=(f'{fsb["codec"]} bank did not pass boundary validation - read-only for safety'
-              if fsb['mode'] in (2,11) else
-              f'{fsb["codec"]} codec - listed read-only for now; replacement support for this codec is a future update')
-    return jsonify(dict(**common,codec=fsb['codec'],editable=fsb['editable'],note=note,music=music,
-                        full_length_candidate=full_candidate,full_length_reason=full_reason,
-                        full_length_supported=full_ready,release_label=APP_RELEASE_LABEL))
+            note=f"{info['codec']} bank did not pass replacement validation and is read-only"
+        return jsonify(dict(
+            **info,samples=samples,note=note,
+            music=_shared_audio_category(q['bank'])=='Music',
+            release_label=APP_RELEASE_LABEL,
+        ))
+    except Exception as e:
+        return jsonify(dict(error=str(e))),400
+
 
 @app.route('/api/audio/preview')
 def audio_preview():
-    arc=request.args.get('arc'); bankn=request.args.get('bank')
-    try: v,boff,c,flat,kind=_read_container(arc,bankn)
-    except Exception as e: return jsonify(dict(error=str(e))),400
-    i=_find_sample(flat,request.args.get('idx'),request.args.get('sample'))
-    if i is None: return jsonify(dict(error='sample not found')),404
-    s=flat[i]
     try:
-        wav=_audio_wav_payload(c,s)
-        return send_file(io.BytesIO(wav),mimetype='audio/wav')
-    except Exception:
-        # No ffmpeg: a de-padded MPEG stream still plays natively in the browser.
+        editor=_shared_audio_editor()
+        arc=str(request.args.get('arc'));bank=request.args.get('bank')
+        index=int(request.args.get('idx'))
         try:
-            mp,_ext,mime=_audio_mpeg_payload(c,s)
-            return send_file(io.BytesIO(mp),mimetype=mime)
+            item=editor.sample_payload(arc,bank,index,'wav')
         except Exception:
-            raw,ext,mime=_audio_raw_payload(c,s)
-            return send_file(io.BytesIO(raw),mimetype=mime)
+            try:item=editor.sample_payload(arc,bank,index,'mpeg')
+            except Exception:item=editor.sample_payload(arc,bank,index,'raw')
+        return send_file(io.BytesIO(item['payload']),mimetype=item['mime'])
+    except Exception as e:
+        return jsonify(dict(error=str(e))),400
+
 
 @app.route('/api/audio/export')
 def audio_export():
-    arc=request.args.get('arc'); bankn=request.args.get('bank')
-    mode=(request.args.get('mode') or 'wav').lower()
-    try: v,boff,c,flat,kind=_read_container(arc,bankn)
-    except Exception as e: return jsonify(dict(error=str(e))),400
-    i=_find_sample(flat,request.args.get('idx'),request.args.get('sample'))
-    if i is None: return jsonify(dict(error='sample not found')),404
-    s=flat[i]
-    base=_audio_safe_filename(os.path.splitext(bankn)[0]+'__'+s['name'])
     try:
-        if mode=='raw':
-            data,ext,mime=_audio_raw_payload(c,s)
-        elif mode=='mpeg':
-            data,ext,mime=_audio_mpeg_payload(c,s)
-        else:
-            data,ext,mime=_audio_wav_payload(c,s),'wav','audio/wav'
-        return send_file(io.BytesIO(data),mimetype=mime,as_attachment=True,
-                         download_name=f'{base}.{ext}')
+        item=_shared_audio_editor().sample_payload(
+            str(request.args.get('arc')),request.args.get('bank'),
+            int(request.args.get('idx')),(request.args.get('mode') or 'wav').lower(),
+        )
+        return send_file(
+            io.BytesIO(item['payload']),mimetype=item['mime'],as_attachment=True,
+            download_name=item['filename'],
+        )
     except Exception as e:
         return jsonify(dict(error=str(e))),400
+
 
 @app.route('/api/audio/export_bank')
 def audio_export_bank():
-    import zipfile
-    arc=request.args.get('arc'); bankn=request.args.get('bank')
-    modified_only=request.args.get('modified') in ('1','true','yes')
-    try: v,boff,c,flat,kind=_read_container(arc,bankn)
-    except Exception as e: return jsonify(dict(error=str(e))),400
-    backup_c=_audio_backup_container(v,boff,len(c),bankn)
-    backup_flat=None
-    if backup_c is not None:
-        try:
-            if bankn.upper().endswith('.SND'): backup_flat,_subs=parse_snd(backup_c)
-            else:
-                bfsb=parse_fsb5(backup_c)
-                backup_flat=[dict(name=n,rel=rel,len=sl,meta=m,mode=bfsb['mode'],ok=bfsb['editable']) for n,rel,sl,m in bfsb['slices']]
-        except Exception: backup_flat=None
-    buf=io.BytesIO(); exported=0; manifest=[]
-    with zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED) as z:
-        for i,samp in enumerate(flat):
-            modified=_audio_sample_modified(c,backup_c,samp,(backup_flat[i] if backup_flat and i<len(backup_flat) else None))
-            if modified_only and not modified: continue
-            raw,ext,mime=_audio_raw_payload(c,samp)
-            fn=f'{i:04d}__{_audio_safe_filename(samp["name"])}.{ext}'
-            z.writestr(fn,raw); exported+=1
-            d=_describe(c,samp)
-            manifest.append(dict(index=i,name=samp['name'],file=fn,bytes=len(raw),
-                                 modified=modified,spec=d.get('spec'),duration=d.get('dur')))
-        z.writestr('manifest.json',json.dumps(dict(bank=bankn,archive=arc,
-                     modified_only=modified_only,exported=exported,samples=manifest),indent=2))
-    buf.seek(0)
-    suffix='_modified' if modified_only else ''
-    return send_file(buf,mimetype='application/zip',as_attachment=True,
-                     download_name=_audio_safe_filename(os.path.splitext(bankn)[0])+suffix+'.zip')
+    temp_path=None
+    try:
+        arc=str(request.args.get('arc'));bank=request.args.get('bank')
+        modified=request.args.get('modified') in ('1','true','yes')
+        fd,temp_path=tempfile.mkstemp(prefix='nascar_audio_export_',suffix='.zip')
+        os.close(fd)
+        result=_shared_audio_editor().export_bank(arc,bank,temp_path,modified_only=modified)
+        @after_this_request
+        def cleanup(response):
+            try:os.remove(temp_path)
+            except OSError:pass
+            return response
+        suffix='_modified' if modified else ''
+        filename=re.sub(r'[^A-Za-z0-9._-]+','_',os.path.splitext(bank)[0]).strip('._')+suffix+'.zip'
+        return send_file(result['path'],mimetype='application/zip',as_attachment=True,download_name=filename)
+    except Exception as e:
+        if temp_path:
+            try:os.remove(temp_path)
+            except OSError:pass
+        return jsonify(dict(error=str(e))),400
+
 
 @app.route('/api/audio/restore_bank',methods=['POST'])
 def audio_restore_bank():
-    q=request.get_json(force=True); arcid=str(q.get('arc')); bankn=q.get('bank')
-    tmp=None
+    q=request.get_json(force=True)
     try:
-        g,reg=registry(); v=need(reg,arcid)
-        bcdf=backup_path(v['cdf'])
-        if not os.path.exists(v.get('bak','')) or not os.path.exists(bcdf):
-            raise ValueError('the original archive/index backup pair is unavailable')
-        _lr,live_rows,_ll=_rp_index_rows(v['cdf']); live_row=_rp_find_row(live_rows,bankn)
-        _sr,stock_rows,_sl=_rp_index_rows(bcdf); stock_row=_rp_find_row(stock_rows,bankn)
-        fd,tmp=tempfile.mkstemp(prefix='n15mod_stock_audio_',suffix=os.path.splitext(bankn)[1]); os.close(fd)
-        _rp_extract_entry(v,stock_row,tmp,v['bak'])
-        stock_bytes=open(tmp,'rb').read()
-        if bankn.upper().endswith('.SND'):
-            flat,subs=parse_snd(stock_bytes)
-            if not flat: raise ValueError('stock speech container does not parse')
-            restored=len(flat)
-        else:
-            stock_fsb=parse_fsb5(stock_bytes); restored=stock_fsb['num']
-        if live_row['offset']==stock_row['offset'] and live_row['size']==stock_row['size']:
-            with open(v['ar'],'rb') as f:
-                f.seek(live_row['offset']); current=f.read(live_row['size'])
-            with open(v['ar'],'r+b') as f:
-                f.seek(live_row['offset']); f.write(stock_bytes); f.flush(); os.fsync(f.fileno())
-                f.seek(live_row['offset']); back=f.read(len(stock_bytes))
-            if back!=stock_bytes:
-                with open(v['ar'],'r+b') as f:
-                    f.seek(live_row['offset']); f.write(current); f.flush(); os.fsync(f.fileno())
-                raise ValueError('bank restore readback mismatch; previous live bank was restored')
-            method='in_place'
-        else:
-            with _RP_LOCK:
-                result=_rp_install_one(arcid,v,live_row,tmp,'Stock backup: '+bankn,False)
-            method='append_repoint'
-        return jsonify(dict(ok=True,verified=True,restored=restored,bank=bankn,method=method,
-                            stock_size=stock_row['size']))
+        result=_shared_audio_editor().restore_bank(str(q['arc']),q['bank'])
+        return jsonify(dict(ok=True,**result))
     except Exception as e:
         return jsonify(dict(error=str(e))),400
-    finally:
-        if tmp:
-            try: os.remove(tmp)
-            except OSError: pass
-
-def _pcm16_replace(v,boff,c,container_size,rel,slot_len,meta,raw,filename,kind, sample_name="", volume_mode="match_stock", custom_gain_db=0.0):
-    """Replace one validated PCM16 FSB sample without changing its slot.
-
-    Source audio is converted to signed 16-bit little-endian PCM at the exact
-    stored sample rate/channel count. Audio longer than the fixed sample window
-    is trimmed; shorter audio is silence-padded. Alignment bytes after the
-    declared sample data are preserved from the original container.
-    """
-    try:
-        hz=int(meta.get('hz') or 0); channels=int(meta.get('ch') or 0)
-        samples=int(meta.get('samples') or 0)
-    except Exception:
-        hz=channels=samples=0
-    if hz<=0 or channels not in (1,2) or samples<=0:
-        return jsonify(dict(error='PCM16 metadata is incomplete; replacement refused')),400
-    frame_bytes=channels*2
-    audio_len=samples*frame_bytes
-    if audio_len<=0 or audio_len>slot_len:
-        return jsonify(dict(error=f'PCM16 sample length {audio_len} does not fit its {slot_len}-byte slot')),400
-
-    ext=os.path.splitext(filename or '')[1].lower()
-    if ext in ('.pcm','.raw'):
-        stream=raw
-    else:
-        ff=ffmpeg_path()
-        if not ff:
-            # No ffmpeg: an uncompressed WAV can still be converted in pure Python.
-            if ext=='.wav' or raw[:4]==b'RIFF':
-                try:
-                    stream=_pcm16_from_wav(raw,channels,hz)
-                except Exception as ex:
-                    return jsonify(dict(error='Could not read that WAV without FFmpeg: '+str(ex)+
-                        '. Install FFmpeg, or re-save the file as uncompressed PCM WAV.')),400
-            else:
-                return jsonify(dict(error='Replacing this sound needs FFmpeg unless you upload an '
-                    'uncompressed .wav or raw .pcm/.raw data. Install FFmpeg (ffmpeg.exe beside '
-                    'app.py, or anywhere on your PATH).')),400
-        else:
-            with tempfile.TemporaryDirectory() as td:
-                src=os.path.join(td,'input'+(ext or '.bin')); out=os.path.join(td,'output.pcm')
-                open(src,'wb').write(raw)
-                r=subprocess.run([ff,'-v','error','-i',src,'-vn','-map_metadata','-1',
-                    '-ac',str(channels),'-ar',str(hz),'-c:a','pcm_s16le','-f','s16le',out,'-y'],
-                    capture_output=True,text=True)
-                if r.returncode!=0 or not os.path.exists(out):
-                    return jsonify(dict(error='ffmpeg could not convert that file to PCM16: '+(r.stderr or '')[-240:])),400
-                stream=open(out,'rb').read()
-
-    # Never split a PCM frame when trimming. Engine/exhaust loops are repeated
-    # across the full stock window with a short crossfade instead of becoming
-    # mostly silence, which was the main cause of very quiet replacements.
-    stream=stream[:len(stream)-(len(stream)%frame_bytes)]
-    original=c[rel:rel+slot_len]
-    if _audio_is_loop_sample(sample_name) and len(stream)<audio_len:
-        stream=_loop_fill_pcm16(stream,audio_len,channels,hz)
-    source_vals=np.frombuffer(stream[:len(stream)-(len(stream)%2)],dtype='<i2').astype(np.float64)/32768.0 if stream else np.array([],dtype=np.float64)
-    stock_vals=np.frombuffer(original[:audio_len],dtype='<i2').astype(np.float64)/32768.0 if audio_len else np.array([],dtype=np.float64)
-    gain_db=_safe_gain_db(volume_mode,_active_pcm_stats(source_vals),_active_pcm_stats(stock_vals),custom_gain_db=custom_gain_db)
-    stream=_apply_pcm_gain_i16(stream,gain_db)
-    used=min(len(stream),audio_len)
-    used-=used%frame_bytes
-    payload=stream[:used]+b'\0'*(audio_len-used)+original[audio_len:]
-    if len(payload)!=slot_len:
-        return jsonify(dict(error='PCM16 fixed-slot builder produced the wrong size')),500
-
-    ensure_backup(v['ar'],v['bak'])
-    abs_off=boff+rel
-    with open(v['ar'],'r+b') as f:
-        f.seek(abs_off); f.write(payload); f.flush(); os.fsync(f.fileno())
-        f.seek(abs_off); back=f.read(slot_len)
-    if back!=payload:
-        with open(v['ar'],'r+b') as f:
-            f.seek(abs_off); f.write(original); f.flush(); os.fsync(f.fileno())
-        return jsonify(dict(error='PCM16 readback mismatch; original sample was restored')),500
-
-    try:
-        with open(v['ar'],'rb') as f:
-            f.seek(boff); c2=f.read(container_size)
-        if kind=='snd':
-            flat,subs=parse_snd(c2)
-            if not flat: raise ValueError('no samples found after PCM16 write')
-        else:
-            parse_fsb5(c2)
-    except Exception as ex:
-        with open(v['ar'],'r+b') as f:
-            f.seek(abs_off); f.write(original); f.flush(); os.fsync(f.fileno())
-        return jsonify(dict(error='PCM16 validation failed and the original sample was restored: '+str(ex))),500
-
-    return jsonify(dict(ok=True,frames=used//frame_bytes,
-        note=(f'fitted into the {samples/hz:.2f}s PCM16 slot at {hz}Hz / {channels} channel(s); '+
-              f'volume {_audio_volume_label(volume_mode,gain_db)}'+
-              ('; loop-filled with 12 ms crossfades' if _audio_is_loop_sample(sample_name) else ''))))
 
 
-@app.route('/api/audio/replace_full', methods=['POST'])
+@app.route('/api/audio/replace_full',methods=['POST'])
 def audio_replace_full():
-    arcid=str(request.form.get('arc')); bankn=request.form.get('bank')
-    up=request.files.get('file'); tmp=None
-    if not up: return jsonify(dict(error='no file uploaded')),400
+    upload=request.files.get('file')
+    if not upload:return jsonify(dict(error='no file uploaded')),400
     try:
-        v,boff,c,flat,kind=_read_container(arcid,bankn)
-        if kind=='snd': raise ValueError('full-length rebuilding is not supported for SND chains')
-        fsb=kind[1]
-        eligible,reason=_full_length_audio_candidate(bankn,c,flat,fsb)
-        if not eligible:
-            raise ValueError('full-length rebuilding is unavailable: '+reason)
-        if not ffmpeg_path():
-            raise ValueError('full-length music replacement needs the installed LGPL audio tools')
-        idx=_find_sample(flat,request.form.get('idx'),request.form.get('sample'))
-        if idx is None: raise ValueError('sample not found')
-        s=flat[idx]; stock_spec=frame_info(c,s['rel'])
-        if not stock_spec: raise ValueError('stock song has an unrecognized MPEG format')
-        raw=up.read()
-        volume_mode=_audio_volume_mode(request.form.get('volume_mode'))
-        custom_gain_db=_audio_custom_gain_db(request.form.get('volume_gain_db'),volume_mode)
-        target_sample=flat[idx]
-        stock_payload=c[target_sample['rel']:target_sample['rel']+target_sample['len']]
-        gain_db=_mpeg_gain_db(volume_mode,raw,up.filename or '',stock_payload,stock_spec,custom_gain_db=custom_gain_db)
-        stream,sample_count,_channels=_encode_full_length_mpeg(raw,up.filename or '',stock_spec,gain_db=gain_db)
-        rebuilt,info=_rebuild_fsb5_full_mpeg_sample(c,idx,stream,sample_count)
-        if len(rebuilt)>_RP_MAX_SINGLE:
-            raise ValueError('rebuilt music bank exceeds the 768 MB repoint safety limit')
-        fd,tmp=tempfile.mkstemp(prefix='n15mod_full_music_',suffix='.FSB'); os.close(fd)
-        open(tmp,'wb').write(rebuilt)
-        _raw,rows,_layout=_rp_index_rows(v['cdf']); row=_rp_find_row(rows,bankn)
-        with _RP_LOCK:
-            install=_rp_install_one(arcid,v,row,tmp,up.filename or 'Full song replacement',False)
-        # The temp bank was fully parsed/decoded before install; _rp_install_one
-        # then verifies the appended bytes by SHA-256 and the CDF offset/size by
-        # readback. Avoid a second post-commit failure path that could report an
-        # error after a valid transaction has already completed.
-        duration=float(sample_count)/float(info['hz'] or stock_spec[2])
-        return jsonify(dict(ok=True,verified=True,full_length=True,duration=round(duration,3),
-                            bank_growth=info['growth'],archive_growth=install['plan']['growth'],
-                            old_bank_size=info['old_bank_size'],new_bank_size=info['new_bank_size'],
-                            alignment=info['alignment'],frames=info['frames'],loop=info['loop'],
-                            volume_mode=volume_mode,applied_gain_db=round(float(gain_db),2),
-                            note=(f'full song installed at {duration:.2f}s; volume {_audio_volume_label(volume_mode,gain_db)}; FSB5 bank rebuilt and repointed; '
-                                  f'{info["frames"]} MPEG frames; {info["alignment"]}-byte frame alignment; '
-                                  f'bank growth {info["growth"]:+,} bytes')))
+        result=_shared_audio_editor().replace_full_song(
+            str(request.form.get('arc')),request.form.get('bank'),
+            int(request.form.get('idx')),upload.read(),upload.filename or '',
+            request.form.get('volume_mode') or 'match_stock',
+            request.form.get('volume_gain_db') or 0.0,
+        )
+        result['note']=(
+            f"full song installed at {result['duration']:.2f}s; "
+            f"{result['frames']} MPEG frames; bank growth {result['growth']:+,} bytes"
+        )
+        return jsonify(dict(ok=True,**result))
     except Exception as e:
         return jsonify(dict(error=str(e))),400
-    finally:
-        if tmp:
-            try: os.remove(tmp)
-            except OSError: pass
 
-@app.route('/api/audio/replace', methods=['POST'])
+
+@app.route('/api/audio/replace',methods=['POST'])
 def audio_replace():
-    arc=request.form.get('arc'); bankn=request.form.get('bank')
-    up=request.files.get('file')
-    if not up: return jsonify(dict(error='no file uploaded')),400
-    try: v,boff,c,flat,kind=_read_container(arc,bankn)
-    except Exception as e: return jsonify(dict(error=str(e))),400
-    i=_find_sample(flat,request.form.get('idx'),request.form.get('sample'))
-    if i is None: return jsonify(dict(error='sample not found')),404
-    s=flat[i]
-    if not s['ok']:
-        return jsonify(dict(error='this sample is read-only (unsupported codec or failed validation)')),400
-    raw=up.read(); rel,sl=s['rel'],s['len']
-    volume_mode=_audio_volume_mode(request.form.get('volume_mode'))
+    upload=request.files.get('file')
+    if not upload:return jsonify(dict(error='no file uploaded')),400
     try:
-        custom_gain_db=_audio_custom_gain_db(request.form.get('volume_gain_db'),volume_mode)
-    except ValueError as ex:
-        return jsonify(dict(error=str(ex))),400
-    if s['mode']==2:
-        return _pcm16_replace(v,boff,c,len(c),rel,sl,s['meta'],raw,up.filename or '',kind,
-                              sample_name=s.get('name') or '', volume_mode=volume_mode,
-                              custom_gain_db=custom_gain_db)
-    spec=frame_info(c,rel)
-    if not spec: return jsonify(dict(error='original sample has unrecognized format - not safe to replace')),400
-    original=c[rel:rel+sl]
-    gain_db=_mpeg_gain_db(volume_mode,raw,up.filename or '',original,spec,custom_gain_db=custom_gain_db)
-    fr=walk_frames(raw,limit=4)
-    # A pre-encoded upload may bypass FFmpeg only when its complete MPEG
-    # configuration matches the stock slot. RC9 accidentally omitted bitrate
-    # here, allowing (for example) a 192 kbps MP3 into a 128 kbps stock song.
-    # The later topology guard then correctly refused it instead of converting it.
-    uploaded_spec=fr[0][1] if fr and fr[0][0]==0 else None
-    if uploaded_spec and uploaded_spec[:4]==spec[:4] and volume_mode=='source' and not _audio_is_loop_sample(s.get('name')):
-        stream=raw
-    else:
-        ff=ffmpeg_path()
-        if not ff: return jsonify(dict(error='Replacing with WAV/MP3 needs FFmpeg. Install it (ffmpeg.exe beside app.py, or anywhere on your PATH), or upload a pre-matched MPEG stream.')),400
-        fmt='mp2' if spec[0]==2 else 'mp3'
-        with tempfile.TemporaryDirectory() as td:
-            i2=os.path.join(td,'in'+os.path.splitext(up.filename or 'x.wav')[1]); o=os.path.join(td,'o.bin')
-            open(i2,'wb').write(raw)
-            cmd=[ff,'-v','error']
-            if _audio_is_loop_sample(s.get('name')):
-                cmd += ['-stream_loop','-1']
-            cmd += ['-i',i2,'-vn','-map_metadata','-1',
-                '-ar',str(spec[2]),'-ac','1' if spec[3] else '2']
-            duration=(float((s.get('meta') or {}).get('samples') or 0)/float((s.get('meta') or {}).get('hz') or spec[2]))
-            if _audio_is_loop_sample(s.get('name')) and duration>0:
-                cmd += ['-t',f'{duration:.6f}']
-            if abs(float(gain_db))>0.01:
-                cmd += ['-af',f'volume={float(gain_db):.3f}dB,alimiter=limit=0.97']
-            cmd += ['-c:a','mp2' if spec[0]==2 else 'libmp3lame','-b:a',f'{spec[1]}k']
-            if spec[0]!=2:
-                # Do not spend one of the fixed stock frame cells on a Xing/Info
-                # metadata frame or prepend an ID3 tag to the elementary stream.
-                cmd += ['-write_xing','0','-id3v2_version','0']
-            cmd += ['-f',fmt,o,'-y']
-            r=subprocess.run(cmd,capture_output=True,text=True)
-            if r.returncode!=0: return jsonify(dict(error='ffmpeg could not read that file: '+r.stderr[-200:])),400
-            enc=open(o,'rb').read()
-        j0=next((i3 for i3 in range(len(enc)) if frame_info(enc,i3)),None)
-        if j0 is None: return jsonify(dict(error='encode produced no frames')),400
-        stream=enc[j0:]
-        encoded_spec=frame_info(stream,0)
-        if not encoded_spec or encoded_spec[:4]!=spec[:4]:
-            def _sl(x):
-                return ('unknown' if not x else
-                    f'Layer {x[0]} / {x[1]} kbps / {x[2]} Hz / '+('mono' if x[3] else 'stereo'))
-            return jsonify(dict(error='FFmpeg conversion did not match the stock MPEG format: stock '+
-                _sl(spec)+', encoded '+_sl(encoded_spec))),400
-    try:
-        payload,fit=_fit_mpeg_to_stock_topology(stream,original,s.get('meta') or {})
+        result=_shared_audio_editor().replace_sample(
+            str(request.form.get('arc')),request.form.get('bank'),
+            int(request.form.get('idx')),upload.read(),upload.filename or '',
+            request.form.get('volume_mode') or 'match_stock',
+            request.form.get('volume_gain_db') or 0.0,
+        )
+        result['note']='installed through the shared transactional audio editor'
+        return jsonify(dict(ok=True,**result))
     except Exception as e:
-        return jsonify(dict(error='stock-topology MPEG fit refused: '+str(e))),400
-    ok_decode,decode_error=_verify_mpeg_decode(payload)
-    if not ok_decode:
-        return jsonify(dict(error='rebuilt MPEG did not decode cleanly: '+str(decode_error))),400
-    ensure_backup(v['ar'],v['bak'])
-    abs_off=boff+rel
-    with open(v['ar'],'r+b') as f:
-        f.seek(abs_off); f.write(payload); f.flush(); os.fsync(f.fileno())
-        f.seek(abs_off); back=f.read(sl)
-    if back!=payload:
-        with open(v['ar'],'r+b') as f:
-            f.seek(abs_off); f.write(original); f.flush(); os.fsync(f.fileno())
-        return jsonify(dict(error='readback mismatch; original sample was restored')),500
-    try:
-        with open(v['ar'],'rb') as f:
-            f.seek(boff); c2=f.read(len(c))
-        if kind=='snd':
-            flat2,subs=parse_snd(c2)
-            if not flat2: raise ValueError('speech container no longer parses')
-        else:
-            parse_fsb5(c2)
-    except Exception as ex:
-        with open(v['ar'],'r+b') as f:
-            f.seek(abs_off); f.write(original); f.flush(); os.fsync(f.fileno())
-        return jsonify(dict(error='replacement failed container validation; original sample was restored: '+str(ex))),500
-    duration=(float(fit.get('samples') or 0)/float(fit.get('hz') or 1)) if fit.get('samples') else None
-    detail=(f"{fit['audio_frames']} replacement + {fit['silent_frames']} silent frames; "
-            f"{fit['stock_frames']} stock frame positions preserved")
-    if duration is not None:
-        detail+=f"; stock sample window {duration:.2f}s"
-    loop_note='; engine/exhaust source loop-filled to the stock window' if _audio_is_loop_sample(s.get('name')) else ''
-    return jsonify(dict(ok=True,frames=fit['audio_frames'],topology_preserved=True,
-        stock_frames=fit['stock_frames'],silent_frames=fit['silent_frames'],
-        applied_gain_db=round(float(gain_db),2),volume_mode=volume_mode,
-        note='installed with the stock MPEG frame map ('+detail+f'; volume {_audio_volume_label(volume_mode,gain_db)}{loop_note})'))
+        return jsonify(dict(error=str(e))),400
 
-@app.route('/api/audio/restore', methods=['POST'])
+
+@app.route('/api/audio/restore',methods=['POST'])
 def audio_restore():
-    q=request.get_json()
-    try: v,boff,c,flat,kind=_read_container(q['arc'],q['bank'])
-    except Exception as e: return jsonify(dict(error=str(e))),400
-    if not os.path.exists(v['bak']) or not os.path.exists(backup_path(v['cdf'])):
-        return jsonify(dict(error='no original backup pair is available for this game file')),400
-    i=_find_sample(flat,q.get('idx'),q.get('sample'))
-    if i is None: return jsonify(dict(error='sample not found')),404
+    q=request.get_json(force=True)
     try:
-        _lr,live_rows,_ll=_rp_index_rows(v['cdf']); live_row=_rp_find_row(live_rows,q['bank'])
-        _sr,stock_rows,_sl=_rp_index_rows(backup_path(v['cdf'])); stock_row=_rp_find_row(stock_rows,q['bank'])
-    except Exception as ex:
-        return jsonify(dict(error='could not resolve the stock bank: '+str(ex))),400
-    if live_row['offset']!=stock_row['offset'] or live_row['size']!=stock_row['size']:
-        return jsonify(dict(error='this bank was rebuilt for a full-length song. Restore the entire sound group instead of one sample.')),400
-    samp=flat[i]; abs_off=boff+samp['rel']
-    current=c[samp['rel']:samp['rel']+samp['len']]
-    with open(v['bak'],'rb') as f:
-        f.seek(abs_off); orig=f.read(samp['len'])
-    if len(orig)!=samp['len']:
-        return jsonify(dict(error='backup sample is shorter than the live slot; restore refused')),400
-    with open(v['ar'],'r+b') as f:
-        f.seek(abs_off); f.write(orig); f.flush(); os.fsync(f.fileno())
-        f.seek(abs_off); back=f.read(samp['len'])
-    if back!=orig:
-        with open(v['ar'],'r+b') as f:
-            f.seek(abs_off); f.write(current); f.flush(); os.fsync(f.fileno())
-        return jsonify(dict(error='sample restore readback mismatch; previous live bytes were restored')),500
-    try:
-        with open(v['ar'],'rb') as f:
-            f.seek(boff); c2=f.read(len(c))
-        if kind=='snd':
-            flat2,subs=parse_snd(c2)
-            if not flat2: raise ValueError('speech container no longer parses')
-        else:
-            parse_fsb5(c2)
-    except Exception as ex:
-        with open(v['ar'],'r+b') as f:
-            f.seek(abs_off); f.write(current); f.flush(); os.fsync(f.fileno())
-        return jsonify(dict(error='restored sample failed container validation; previous live bytes were put back: '+str(ex))),500
-    return jsonify(dict(ok=True,verified=True))
+        result=_shared_audio_editor().restore_sample(
+            str(q['arc']),q['bank'],int(q['idx'])
+        )
+        return jsonify(dict(ok=True,**result))
+    except Exception as e:
+        return jsonify(dict(error=str(e))),400
 
 # ==================== end v0.8 AUDIO LAB ====================
 
@@ -6747,72 +3901,10 @@ REPOINT_FIELDS = {('RACEDATA_c','RaceLaps'): 1}
 
 # v0.9.15 AI Behavior Lab. These names come from the real DB_AICONFIG_SCRIPT
 # constructors. New fields remain experimental until individually verified in-game.
-AI_TRACK_FIELDS = [
-    'FormationOffsetDirection',
-    'TurnOneBearsLeft',
-    'UsePenaltySystem',
-    'BumpDraftingEnabled',
-    'BumpDraftingConsiderGearing',
-    'PABBMaxInflationZ',
-    'BumpDraftingMaxPackSize',
-    'BumpDraftingRoadStraightness',
-    'CatchupWantSpeedModifierEasy',
-    'CatchupWantSpeedModifierHard',
-    'UseDrivingControllerSmoothing',
-    'PacecarIgnorePitEntryTripwire',
-    'HasDoubleYellowLine',
-    'BumpdraftPlayerRoadStraightness',
-    'PitStrategy100PitChance',
-    'PitStrategy100FuelOnlyChance',
-    'PitStrategy100TwoTyresChance',
-    'PitStrategy100FourTyresChance',
-    'PitStrategy75PitChance',
-    'PitStrategy75FuelOnlyChance',
-    'PitStrategy75TwoTyresChance',
-    'PitStrategy75FourTyresChance',
-    'PitStrategy50PitChance',
-    'PitStrategy50FuelOnlyChance',
-    'PitStrategy50TwoTyresChance',
-    'PitStrategy50FourTyresChance',
-    'PitStrategy25PitChance',
-    'PitStrategy25FuelOnlyChance',
-    'PitStrategy25TwoTyresChance',
-    'PitStrategy25FourTyresChance',
-    'PitStrategy0FuelOnlyChance',
-    'PitStrategy0TwoTyresChance',
-    'PitStrategy0FourTyresChance',
-    'PitStrategy0PitChance',
-    'CanSwitchFromStagnantRacingLine',
-    'StayBehindRegionScaled',
-    'StateMachineWeightingOvertake',
-    'StateMachineWeightingBumpDraft',
-    'StayAlongsideGap',
-    'StayBehindRegion',
-    'ThrottleLiftToleranceDeg',
-    'CatchupPowModifier',
-]
-AI_GLOBAL_FIELDS = [
-    'OutbrakingEffort',
-    'AggressionVariation',
-    'DesireForRacingLine',
-    'AggressionRivalModifier',
-    'AggressionTeamModifier',
-    'PitstopStrategyGreenWindowPercentage',
-    'PitstopStrategyGreenWindowLapReserve',
-]
-WORLD_PACE_FIELDS = [
-    'PracticeEasyBestTime',
-    'PracticeEasyWorstTime',
-    'PracticeHardBestTime',
-    'PracticeHardWorstTime',
-    'QualifyBaseTimeModifier',
-    'QualRecSpeed',
-    'RaceRecSpeed',
-    'TempAirC',
-    'TempTrackC',
-    'TempAirCEnd',
-    'TempTrackCEnd',
-]
+AI_TRACK_FIELDS = list(SHARED_AI_TRACK_FIELDS)
+AI_GLOBAL_FIELDS = list(SHARED_AI_GLOBAL_FIELDS)
+WORLD_PACE_FIELDS = list(SHARED_WORLD_PACE_FIELDS)
+
 AI_EDITABLE_BY_CLASS = {
     'RACEDATA_c': {'RaceLaps'},
     'AIRACINGTRACKCONFIG_c': set(AI_TRACK_FIELDS),
@@ -6832,13 +3924,8 @@ def _direct_scalar(v):
 
 def repoint_mod():
     """Load the bundled isolated-repoint helper."""
-    p=component_path(REPOINT_NAME)
-    if not os.path.exists(p): return None
     try:
-        import importlib.util as _iu
-        spec=_iu.spec_from_file_location('n15repoint', p)
-        m=_iu.module_from_spec(spec); spec.loader.exec_module(m)
-        return m
+        return _load_internal_module(REPOINT_NAME, 'n15repoint')
     except Exception:
         return None
 
@@ -6938,6 +4025,8 @@ def _cdfiles_path():
 def mapper_records(pyc_file, class_name, fields, archive=None):
     """Enumerate records via `mapper records ... --csv <tmp>`.
     archive defaults to the LIVE archive; pass a temp archive to diff a patch."""
+    if archive is None:
+        return _shared_pyc_editor().records_for(pyc_file,class_name,fields)
     live=archive or _live_archive(); cdf=_cdfiles_path()
     if not live or not cdf: raise RuntimeError('game archive not found')
     m,p=mapper_paths()
@@ -6992,12 +4081,12 @@ _MAPPER_DIRECT_CACHE=None
 def _mapper_direct_module():
     global _MAPPER_DIRECT_CACHE
     if _MAPPER_DIRECT_CACHE is not None:return _MAPPER_DIRECT_CACHE
-    path=component_path(MAPPER_NAME)
-    spec=importlib.util.spec_from_file_location('n15mod_mapper_direct',path)
-    if spec is None or spec.loader is None:raise RuntimeError('could not load PYC mapper module')
-    mod=importlib.util.module_from_spec(spec);sys.modules[spec.name]=mod;spec.loader.exec_module(mod)
-    _MAPPER_DIRECT_CACHE=mod
-    return mod
+    _MAPPER_DIRECT_CACHE = _load_internal_module(
+        MAPPER_NAME,
+        'n15mod_mapper_direct',
+        load_message='could not load PYC mapper module',
+    )
+    return _MAPPER_DIRECT_CACHE
 
 def _pyc_live_blob(pyc_file):
     g,reg=registry();v=need(reg,'0')
@@ -7006,362 +4095,59 @@ def _pyc_live_blob(pyc_file):
     if len(data)!=row['size']:raise ValueError(f'short {pyc_file} read')
     return v,row,data
 
-def _py2_ops(code):
-    i=0;ext=0
-    while i<len(code):
-        off=i;op=code[i];i+=1;arg=None;arg_off=None
-        if op>=90:
-            if i+2>len(code):break
-            raw=code[i]|(code[i+1]<<8);arg=raw|ext;arg_off=i;i+=2
-            if op==143:ext=raw<<16;continue
-            ext=0
-        yield off,op,arg,arg_off
-
 def _mapped_rows_from_pyc_bytes(pyc,class_name,fields):
-    M=_mapper_direct_module();root=M.parse_pyc(pyc);schemas=M.build_schemas(root);records=M.map_records(root,schemas)
-    rows=[]
-    for rec in records:
-        if rec.class_name!=class_name:continue
-        row={'uid':M.value_plain_for_compare(rec.uid)}
-        for f in fields:
-            row[f]=M.value_plain_for_compare(rec.fields.get(f)) if f in rec.fields else None
-        rows.append(row)
-    return rows,root,records,schemas
+    return _shared_mapped_rows_from_pyc_bytes(pyc,class_name,fields)
 
 def _scalar_same_type(a,b):
-    if isinstance(a,bool) or isinstance(b,bool):return isinstance(a,bool) and isinstance(b,bool) and a is b
-    if isinstance(a,int) and not isinstance(a,bool):return isinstance(b,int) and not isinstance(b,bool) and a==b
-    if isinstance(a,float):
-        try:return isinstance(b,(int,float)) and not isinstance(b,bool) and abs(float(a)-float(b))<1e-12
-        except Exception:return False
-    return a==b
+    return _shared_scalar_same_type(a,b)
 
 def _coerce_scalar_like(old,value):
-    if isinstance(old,bool):
-        if isinstance(value,bool):return value
-        t=str(value).strip().lower()
-        if t in ('true','1','yes','on'):return True
-        if t in ('false','0','no','off'):return False
-        raise ValueError('boolean fields accept True or False')
-    if isinstance(old,int) and not isinstance(old,bool):
-        x=float(value)
-        if not _math.isfinite(x) or abs(x-round(x))>1e-9:raise ValueError('this field requires a whole number')
-        x=int(round(x))
-        if not -(2**63)<=x<2**63:raise ValueError('integer is outside the supported range')
-        return x
-    if isinstance(old,float):
-        x=float(value)
-        if not _math.isfinite(x):raise ValueError('NaN and infinity are blocked')
-        if abs(x)>1_000_000_000:raise ValueError('absolute values above one billion are blocked')
-        return x
-    raise ValueError('field is not a direct scalar')
-
-def _marshal_scalar_bytes(value,old):
-    if isinstance(value,bool):return b'T' if value else b'F'
-    if isinstance(old,int) and not isinstance(old,bool):
-        if -(2**31)<=value<2**31:return b'i'+struct.pack('<i',int(value))
-        return b'I'+struct.pack('<q',int(value))
-    return b'g'+struct.pack('<d',float(value))
-
-def _root_const_index(root,mval):
-    M=_mapper_direct_module();co=root.value
-    for i,c in enumerate(co.consts):
-        if c is mval:return i
-        if isinstance(mval,M.MVal) and isinstance(c,M.MVal) and c.tag_offset==mval.tag_offset:return i
-    return None
-
-def _root_existing_const(root,value):
-    M=_mapper_direct_module()
-    for i,c in enumerate(root.value.consts):
-        if _scalar_same_type(M.value_plain_for_compare(c),value):return i
-    return None
+    return _shared_coerce_scalar_like(old,value)
 
 def _patch_load_const_operand(pyc,operand_abs,new_index,new_value=None,old_value=None):
-    if new_index>0xffff:raise ValueError('constant index needs EXTENDED_ARG')
-    out=bytearray(pyc);struct.pack_into('<H',out,operand_abs,new_index)
-    if new_value is None:return bytes(out),False,new_index
-    layout=_stat_root_layout(pyc);new_index=layout['count']
-    if new_index>0xffff:raise ValueError('constant table has reached the LOAD_CONST limit')
-    struct.pack_into('<H',out,operand_abs,new_index)
-    struct.pack_into('<i',out,layout['count_pos'],new_index+1)
-    out[layout['const_end']:layout['const_end']]=_marshal_scalar_bytes(new_value,old_value)
-    vals=_pyc_consts(bytes(out))
-    if len(vals)!=new_index+1 or not _scalar_same_type(vals[new_index],new_value):raise ValueError('rebuilt PYC constant readback failed')
-    return bytes(out),True,new_index
+    return _shared_patch_load_const_operand(pyc,operand_abs,new_index,new_value,old_value)
 
 def _exact_field_variant(pyc,class_name,uid,field,value):
-    fields=_DIFF_FIELDS.get(class_name,[field]);before,root,records,_schemas=_mapped_rows_from_pyc_bytes(pyc,class_name,fields)
-    M=_mapper_direct_module();rec=M.find_record_for_patch(records,class_name,uid)
-    if rec is None or field not in rec.fields:return dict(handled=False,error='record field not found')
-    raw_old=rec.fields[field];old=M.value_plain_for_compare(raw_old);new=_coerce_scalar_like(old,value)
-    if _scalar_same_type(old,new):return dict(handled=True,ok=False,error='value already matches the live field')
-    co=root.value;layout=_stat_root_layout(pyc);candidates=[]
-    old_indices=[]
-    if isinstance(raw_old,M.MVal):
-        oi=_root_const_index(root,raw_old)
-        if oi is not None:old_indices=[oi]
-    if not old_indices:
-        old_indices=[i for i,c in enumerate(co.consts) if _scalar_same_type(M.value_plain_for_compare(c),old)]
-    for off,op,arg,arg_off in _py2_ops(co.code_bytes):
-        if op==100 and arg in old_indices and off<rec.call_offset:
-            candidates.append(('const',layout['code_off']+arg_off,arg,off))
-    # Python 2 sometimes loads True/False by name rather than LOAD_CONST.
-    if isinstance(old,bool):
-        old_name='True' if old else 'False';new_name='True' if new else 'False'
-        if old_name in co.names and new_name in co.names:
-            oi=co.names.index(old_name);ni=co.names.index(new_name)
-            for off,op,arg,arg_off in _py2_ops(co.code_bytes):
-                if op in (101,116) and arg==oi and off<rec.call_offset:
-                    candidates.append(('name',layout['code_off']+arg_off,ni,off))
-    if not candidates:return dict(handled=False,error='could not locate an isolated bytecode source for this field')
-    existing=_root_existing_const(root,new)
-    wanted={(str(uid),field)}
-    attempts=[]
-    # Nearest source instructions are most likely to feed this constructor call.
-    for kind,operand_abs,index,code_off in sorted(candidates,key=lambda x:x[3],reverse=True)[:128]:
-        try:
-            if kind=='name':
-                out=bytearray(pyc);struct.pack_into('<H',out,operand_abs,index);rebuilt=bytes(out);grew=False;new_index=index
-            elif existing is not None:
-                rebuilt,grew,new_index=_patch_load_const_operand(pyc,operand_abs,existing)
-            else:
-                rebuilt,grew,new_index=_patch_load_const_operand(pyc,operand_abs,0,new,old)
-            after,_r,_recs,_s=_mapped_rows_from_pyc_bytes(rebuilt,class_name,fields)
-            changes=_diff_records(before,after,fields)
-            actual={(str(u),f) for u,f,o,n in changes}
-            if actual==wanted:
-                changed=next(c for c in changes if str(c[0])==str(uid) and c[1]==field)
-                if not (_scalar_same_type(changed[3],new) or _num_eq(changed[3],new)):
-                    continue
-                return dict(handled=True,ok=True,pyc=rebuilt,before=before,after=after,old=old,new=new,
-                            grew=grew,const_index=new_index,operand_offset=operand_abs,
-                            method=('append_constant_repoint' if grew else 'isolated_operand_repoint'))
-            attempts.append(dict(offset=code_off,changes=len(changes)))
-        except Exception as ex:
-            attempts.append(dict(offset=code_off,error=str(ex)))
-    return dict(handled=False,error='no candidate bytecode operand produced an exact one-field diff',attempts=attempts[-8:])
+    return _shared_exact_field_variant(pyc,class_name,uid,field,value,_DIFF_FIELDS.get(class_name,[field]))
 
-def _install_exact_field_variant(pyc_file,class_name,uid,field,value,dry_run=False,source_pyc=None):
-    v,row,pyc=_pyc_live_blob(pyc_file)
-    if source_pyc is not None:pyc=source_pyc
-    plan=_exact_field_variant(pyc,class_name,uid,field,value)
-    if not plan.get('ok'):return plan
-    if dry_run:return dict(ok=True,handled=True,old=plan['old'],new=plan['new'],affected=[str(uid)],affected_count=1,method=plan['method'],note='dry-run: exact one-field bytecode diff verified')
-    rebuilt=plan['pyc'];_rp_backup_pair(v)
-    if len(rebuilt)==row['size']:
-        with open(v['ar'],'r+b') as fh:
-            fh.seek(row['offset']);before=fh.read(row['size']);fh.seek(row['offset']);fh.write(rebuilt);fh.flush();os.fsync(fh.fileno())
-            fh.seek(row['offset']);check=fh.read(row['size'])
-        if check!=rebuilt:
-            with open(v['ar'],'r+b') as fh:fh.seek(row['offset']);fh.write(before);fh.flush();os.fsync(fh.fileno())
-            raise ValueError('isolated PYC readback failed; previous bytes restored')
-        result=dict(method='same_size_exact_operand')
-    else:
-        fd,tmp=tempfile.mkstemp(prefix='n15mod_exact_pyc_',suffix='.PYC');os.close(fd)
-        try:
-            open(tmp,'wb').write(rebuilt)
-            with _RP_LOCK:result=_rp_install_one('0',v,row,tmp,source_name=f'Exact {class_name} {uid}/{field}',allow_magic=True)
-        finally:
-            try:os.remove(tmp)
-            except OSError:pass
-    _v,_row,live=_pyc_live_blob(pyc_file);rows,_root,_records,_schemas=_mapped_rows_from_pyc_bytes(live,class_name,[field])
-    got=next((r.get(field) for r in rows if str(r.get('uid'))==str(uid)),None)
-    if not (_scalar_same_type(got,plan['new']) or _num_eq(got,plan['new'])):raise ValueError(f'exact-field live readback failed: wanted {plan["new"]}, got {got}')
-    return dict(ok=True,handled=True,old=plan['old'],new=plan['new'],verified=True,readback=got,affected=[str(uid)],affected_count=1,method=plan['method'],file=result)
+
+def _shared_pyc_workflow(pyc_file,class_name):
+    mapping={
+        (DBFILE,'RACEDATA_c'):'race_laps',
+        (AICFG,'AIRACINGTRACKCONFIG_c'):'ai_track',
+        (AICFG,'AIRACINGGLOBALCONFIG_c'):'ai_global',
+        (DBFILE,'WORLDSCRIPT_c'):'world_pace',
+    }
+    try:return mapping[(pyc_file,class_name)]
+    except KeyError as ex:raise ValueError(f'unsupported PYC class/file: {class_name} / {pyc_file}') from ex
 
 def mapper_set_value(pyc_file, class_name, uid, field, value, dry_run=False):
-    """Patch one field on one record with a MANDATORY full-diff guard.
-
-    Because the mapper edits marshalled constant payloads, a value shared by
-    several records (e.g. many RaceLaps=999 or StayBehindRegion=0.5) would be
-    changed for ALL of them. So we ALWAYS:
-      1. read every record of this class BEFORE,
-      2. patch to a TEMP archive,
-      3. read every record from the TEMP archive AFTER,
-      4. diff, and install ONLY if exactly the intended uid+field changed.
-    Dry-run performs the same temp-patch + diff and reports the affected count
-    WITHOUT installing.
-    """
-    live=_live_archive(); cdf=_cdfiles_path()
-    if not live or not cdf: raise RuntimeError('game archive not found')
-    m,p=mapper_paths()
-    g,reg=registry(); bak=reg['0']['bak']
-    diff_fields=_DIFF_FIELDS.get(class_name, [field])
-
-    # v0.9.26.7: first try an exact bytecode-operand edit. This clones/reuses
-    # a constant and repoints only the selected field, so shared constants no
-    # longer force collateral changes. Boolean fields are supported too.
-    if class_name in ('RACEDATA_c','AIRACINGTRACKCONFIG_c','AIRACINGGLOBALCONFIG_c','WORLDSCRIPT_c'):
-        exact=_install_exact_field_variant(pyc_file,class_name,uid,field,value,dry_run=dry_run)
-        if exact.get('ok') or exact.get('handled'):
-            return exact
-
-    # 1. snapshot BEFORE (from live)
+    """Compatibility seam; shared PycRecordEditor owns every live write."""
     try:
-        before=mapper_records(pyc_file, class_name, diff_fields)
-    except Exception as e:
-        return dict(ok=False, error=f'pre-read failed: {e}')
+        workflow=_shared_pyc_workflow(pyc_file,class_name)
+        change=dict(uid=uid,field=field,value=value)
+        editor=_shared_pyc_editor()
+        result=editor.preview(workflow,[change]) if dry_run else editor.apply(workflow,[change])
+        result.pop('_payload',None)
+        return result
+    except Exception as ex:
+        return dict(ok=False,error=str(ex))
 
-    # 2. always patch to a temp archive (even for dry-run, so we can diff)
-    tmp_out=os.path.join(_tf.gettempdir(), f'n15mod_patch_{os.getpid()}.AR')
-    if os.path.exists(tmp_out):
-        try: os.remove(tmp_out)
-        except OSError: pass
-
-    old=new=None; method='mapper'
-    # current value from the BEFORE snapshot (needed to find the right arg slot)
-    cur_val=None
-    for rw in before:
-        if str(rw.get('uid'))==str(uid): cur_val=rw.get(field); break
-
-    if class_name in ('AIRACINGTRACKCONFIG_c','AIRACINGGLOBALCONFIG_c','WORLDSCRIPT_c'):
-        if cur_val is None:
-            return dict(ok=False, error=f'{field} was not found on UID {uid}')
-        if not _direct_scalar(cur_val):
-            return dict(ok=False, read_only_nested=True,
-                        error=f'{field} is a nested/non-scalar value and is read-only until its exact structure is mapped')
-
-    use_repoint = ((class_name, field) in REPOINT_FIELDS) and repoint_mod() is not None and cur_val is not None
-    if use_repoint:
-        # ISOLATED UID EDIT: repoint this record's LOAD_CONST operand; never mutate
-        # a constant that other records share.
-        try: iv=int(float(cur_val)); nv=int(float(value))
-        except Exception:
-            return dict(ok=False, error='RaceLaps must be a whole number')
-        rp=isolated_repoint(pyc_file, uid, iv, nv, tmp_out)
-        if not rp.get('ok'):
-            return dict(ok=False, error=rp.get('error','repoint failed'),
-                        unavailable_value=rp.get('unavailable_value'),
-                        available=rp.get('available'))
-        old, new, method = str(iv), str(nv), 'repoint'
-    else:
-        args=['set-record-value','--archive',live,'--cdfiles',cdf,'--patcher',p,
-              '--file',pyc_file,'--class',class_name,
-              '--uid',str(uid),'--field',field,'--value',str(value),
-              '--out-archive',tmp_out]
-        rc,out,err=_run_mapper(args)
-        if rc!=0:
-            return dict(ok=False, error=(err.strip() or out.strip() or 'mapper failed'))
-        if not os.path.exists(tmp_out):
-            return dict(ok=False, error='mapper did not produce an output archive')
-        for line in out.splitlines():
-            if f'{field}:' in line and '->' in line:
-                try:
-                    seg=line.split(f'{field}:',1)[1]
-                    old,new=[s.strip() for s in seg.split('->',1)]
-                except Exception: pass
-
-    # 3. snapshot AFTER (from the temp patched archive)
-    try:
-        after=mapper_records(pyc_file, class_name, diff_fields, archive=tmp_out)
-    except Exception as e:
-        try: os.remove(tmp_out)
-        except OSError: pass
-        return dict(ok=False, error=f'post-read failed: {e}')
-
-    # 4. full diff
-    changes=_diff_records(before, after, diff_fields)
-    intended=[(u,f) for (u,f,o,n) in changes if str(u)==str(uid) and f==field]
-    collateral=[(u,f) for (u,f,o,n) in changes if not (str(u)==str(uid) and f==field)]
-
-    if collateral:
-        affected=sorted({u for (u,f) in [(c[0],c[1]) for c in changes]})
-        try: os.remove(tmp_out)
-        except OSError: pass
-        return dict(ok=False, shared_constant=True,
-            error='Patch would affect multiple records: '+', '.join('UID '+u for u in affected),
-            affected=affected, changes=[dict(uid=c[0],field=c[1],old=c[2],new=c[3]) for c in changes])
-
-    if not intended:
-        try: os.remove(tmp_out)
-        except OSError: pass
-        return dict(ok=False, error='Patch produced no change to the selected record (value may already be set, or not a direct constant).')
-
-    # ---- at this point exactly one record/field changed ----
-    if dry_run:
-        try: os.remove(tmp_out)
-        except OSError: pass
-        return dict(ok=True, old=old, new=new, affected=[str(uid)], affected_count=1,
-                    method=method,
-                    note='dry-run: exactly 1 record would change (safe to apply)')
-
-    # SAFETY: pristine backup of the live archive before we touch it.
-    ensure_backup(live, bak)
-    if os.path.getsize(tmp_out)!=os.path.getsize(live):
-        os.remove(tmp_out)
-        return dict(ok=False, error='patched archive size differs from live; refused')
-    shutil.copyfile(tmp_out, live)
-    try: os.remove(tmp_out)
-    except OSError: pass
-    # final readback verify from live
-    try:
-        rows=mapper_records(pyc_file, class_name, [field])
-        got=None
-        for rw in rows:
-            if str(rw.get('uid'))==str(uid): got=rw.get(field); break
-        verified = got is not None and _num_eq(got, value)
-    except Exception as e:
-        verified=False; got=f'(verify error: {e})'
-    return dict(ok=True, old=old, new=new, verified=verified, readback=got,
-                affected=[str(uid)], affected_count=1, method=method)
 
 
 
 def mapper_set_values_batch(pyc_file, class_name, changes, dry_run=False):
-    """Atomically preview/apply exact isolated field changes in one rebuilt PYC."""
-    if class_name not in ('AIRACINGTRACKCONFIG_c','AIRACINGGLOBALCONFIG_c'):
-        return dict(ok=False,error='batch editing is available only for AI behavior classes')
-    if not isinstance(changes,list) or not changes:return dict(ok=False,error='no changes supplied')
-    if len(changes)>100:return dict(ok=False,error='batch is limited to 100 fields')
-    allowed=AI_EDITABLE_BY_CLASS.get(class_name,set())
-    if pyc_file!=AICFG:return dict(ok=False,error=f'{class_name} must be edited in {AICFG}')
-    try:v,row,current=_pyc_live_blob(pyc_file)
-    except Exception as ex:return dict(ok=False,error=str(ex))
-    normalized=[];seen=set()
+    """Compatibility seam for shared exact-field batch editing."""
     try:
-        rows,_root,_records,_schemas=_mapped_rows_from_pyc_bytes(current,class_name,_DIFF_FIELDS[class_name])
-        by_uid={str(r.get('uid')):r for r in rows}
-        for raw in changes:
-            uid=str(raw.get('uid'));field=str(raw.get('field',''));ident=(uid,field)
-            if field not in allowed:return dict(ok=False,error=f'{field} is not editable for {class_name}')
-            if ident in seen:return dict(ok=False,error=f'duplicate target UID {uid} / {field}')
-            seen.add(ident);old=by_uid.get(uid,{}).get(field)
-            if old is None:return dict(ok=False,error=f'UID {uid} / {field} was not found')
-            wanted=_coerce_scalar_like(old,raw.get('value'))
-            if _scalar_same_type(old,wanted) or _num_eq(old,wanted):continue
-            normalized.append(dict(uid=uid,field=field,value=wanted,old=old))
-    except Exception as ex:return dict(ok=False,error=str(ex))
-    if not normalized:return dict(ok=False,error='all supplied values already match the live records')
-    work=current;summary=[]
-    for ch in normalized:
-        plan=_exact_field_variant(work,class_name,ch['uid'],ch['field'],ch['value'])
-        if not plan.get('ok'):
-            return dict(ok=False,error=f"{ch['field']} could not be isolated: {plan.get('error','unknown error')}")
-        work=plan['pyc'];summary.append(dict(uid=ch['uid'],field=ch['field'],old=ch['old'],new=ch['value'],method=plan['method']))
-    # Final class-wide diff must match exactly the requested targets.
-    before,_r,_recs,_s=_mapped_rows_from_pyc_bytes(current,class_name,_DIFF_FIELDS[class_name])
-    after,_r,_recs,_s=_mapped_rows_from_pyc_bytes(work,class_name,_DIFF_FIELDS[class_name])
-    actual=_diff_records(before,after,_DIFF_FIELDS[class_name]);expected={(c['uid'],c['field']) for c in normalized}
-    got={(str(u),f) for u,f,o,n in actual}
-    if got!=expected:
-        return dict(ok=False,collateral=True,error='final batch diff did not exactly match requested fields; nothing installed',changes=[dict(uid=u,field=f,old=o,new=n) for u,f,o,n in actual[:100]])
-    if dry_run:return dict(ok=True,dry_run=True,affected_count=len(summary),changes=summary,note='exact isolated PYC batch verified')
-    fd,tmp=tempfile.mkstemp(prefix='n15mod_ai_batch_',suffix='.PYC');os.close(fd)
-    try:
-        open(tmp,'wb').write(work)
-        _rp_backup_pair(v)
-        with _RP_LOCK:result=_rp_install_one('0',v,row,tmp,source_name=f'AI exact batch {class_name}',allow_magic=True)
-    finally:
-        try:os.remove(tmp)
-        except OSError:pass
-    _v,_row,live=_pyc_live_blob(pyc_file)
-    verify,_r,_recs,_s=_mapped_rows_from_pyc_bytes(live,class_name,_DIFF_FIELDS[class_name]);verify_by_uid={str(r.get('uid')):r for r in verify}
-    failed=[]
-    for c in normalized:
-        gotv=verify_by_uid.get(c['uid'],{}).get(c['field'])
-        if not (_scalar_same_type(gotv,c['value']) or _num_eq(gotv,c['value'])):failed.append(dict(uid=c['uid'],field=c['field'],wanted=c['value'],got=gotv))
-    if failed:return dict(ok=False,error='one or more exact batch readbacks failed',failed=failed)
-    return dict(ok=True,affected_count=len(summary),changes=summary,verified=True,file=result)
+        workflow=_shared_pyc_workflow(pyc_file,class_name)
+        editor=_shared_pyc_editor()
+        result=editor.preview(workflow,changes) if dry_run else editor.apply(workflow,changes)
+        result.pop('_payload',None)
+        return result
+    except Exception as ex:
+        return dict(ok=False,error=str(ex))
+
+
 
 
 # ---- stock baseline management ----
@@ -7549,9 +4335,6 @@ def pyc_set():
     try:
         res=mapper_set_value(q['file'], q['class'], q['uid'], q['field'], q['value'],
                              dry_run=bool(q.get('dry_run')))
-        if (res.get('ok') and not bool(q.get('dry_run')) and cls=='RACEDATA_c' and field=='RaceLaps'):
-            try:_SCHEDULE_CACHE.clear();_SCHEDULE_SOURCE_CACHE.clear()
-            except Exception:pass
         return jsonify(res if 'ok' in res else dict(ok=True, **res))
     except Exception as e:
         return jsonify(dict(ok=False, error=str(e))),400
@@ -7752,18 +4535,10 @@ def _scr_kv(data, key):
     return None,None,None
 
 def _scr_role(name):
-    u=name.upper()
-    if u.startswith('PACECAR'): return None          # hidden: pace car
-    if u.endswith('PLAYER_SCR.ARC'): return 'player'
-    if u.endswith('AI_SCR.ARC'): return 'ai'
-    return None                                       # driver SCRs carry no aero
+    return _shared_scr_role(name)
 
 def _scr_track(name):
-    u=name.upper().replace('_SCR.ARC','')
-    if u.startswith('NASCAR'): u=u[6:]
-    for suf in ('PLAYER','AI'):
-        if u.endswith(suf): u=u[:-len(suf)]
-    return u.title() or name
+    return _shared_scr_track(name)
 
 def scr_entries(archive_override=None):
     """Enumerate SCR entries that actually contain an AERODYNAMICS block.
@@ -7848,34 +4623,28 @@ def _scr_stock_source():
 @app.route('/api/scr/list')
 def scr_list():
     try:
-        ents=scr_entries()
+        ents=_shared_scr_editor().inventory(include_stock=True)
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))),400
-    stock={}
-    spath,scdf,slabel=_scr_stock_source()
-    if spath:
-        try:
-            base_rows=_scr_numeric_inventory(archive_override=spath,archive_id='0',cdf_override=scdf)
-            stock={(e['name'],e['key']):e['value'] for e in base_rows if int(e.get('occurrence',0))==0}
-        except Exception:
-            stock={}; slabel=None
     tracks={}
     for e in ents:
+        if int(e.get('occurrence',0)) or e['key'].upper() not in SCR_KEYS:continue
         t=tracks.setdefault(e['track'], dict(track=e['track'], player=None, ai=None,
                                              plate=e['track'] in PLATE_TRACKS))
-        t[e['role']]=dict(name=e['name'], arc=e['arc'], values=e['values'],
-                          stock={k:stock.get((e['name'],k)) for k in e['values']} if stock else None,
-                          lengths={k:v['length'] for k,v in e['offsets'].items()})
+        side=t[e['role']] or dict(name=e['name'],arc=e['archive'],values={},stock={},lengths={})
+        side['values'][e['key']]=e['value'];side['stock'][e['key']]=e.get('stock');side['lengths'][e['key']]=e['length']
+        t[e['role']]=side
     rows=sorted(tracks.values(), key=lambda x:(not x['plate'], x['track']))
     return jsonify(dict(ok=True, rows=rows, keys=SCR_KEYS, count=len(ents),
-                        stock_source=slabel))
+                        stock_source='backup'))
 
 @app.route('/api/scr/set', methods=['POST'])
 def scr_set_api():
     q=request.get_json()
     try:
-        result=scr_key_set(str(q.get('arc','0')),q['name'],q['key'],q['value'],
-                           dry_run=bool(q.get('dry_run')),occurrence=int(q.get('occurrence',0)))
+        change=dict(archive=str(q.get('arc','0')),name=q['name'],key=q['key'],
+                    value=q['value'],occurrence=int(q.get('occurrence',0)))
+        editor=_shared_scr_editor();result=editor.preview([change]) if q.get('dry_run') else editor.apply([change])
         return jsonify(result),(200 if result.get('ok') else 400)
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))),400
@@ -7947,93 +4716,17 @@ SCR_DESCRIPTIONS={
     'MAX-STEERING-ANGLE':'Maximum steering lock / angle.',
     'ACKERMANN':'Ackermann steering geometry amount.',
 }
-SCR_CATEGORY_ORDER=[
-    'Draft / Aero','Grip / Tires','Suspension','Brakes','Engine / Gearing',
-    'Steering','AI Behavior','Camera / Visual','Other'
-]
-
-def _scr_clean_ascii(raw):
-    if not raw: return ''
-    s=raw.decode('latin1','ignore')
-    s=re.sub(r'^[^\x20-\x7E]+','',s)
-    s=re.sub(r'[^\x20-\x7E]+$','',s)
-    if not s or any(ord(c)<32 or ord(c)>126 for c in s): return ''
-    return s
-
 def _scr_parse_numeric_rows(data):
-    """Parse every named numeric scalar and preserve duplicate occurrences.
-
-    The old explorer kept only the first occurrence of each key in a file. That
-    hid the four wheel-specific MAXLATFRICTION/MAXLONGFRICTION/etc. rows. This
-    parser tracks brace nesting and assigns a stable occurrence number per key.
-    """
-    toks=[]; pos=0
-    for raw in data.split(b'\0'):
-        toks.append((pos,_scr_clean_ascii(raw)))
-        pos+=len(raw)+1
-
-    stack=[]; previous=''; counts={}; rows=[]
-    for i,(key_off,tok) in enumerate(toks):
-        if tok=='{':
-            if previous and previous not in ('{','}') and not SCR_NUMRX.match(previous):
-                stack.append(previous)
-            previous=''; continue
-        if tok=='}':
-            if stack: stack.pop()
-            previous=''; continue
-        if not tok: continue
-
-        if i+1<len(toks):
-            value_off,value=toks[i+1]
-            if SCR_KEY_RX.match(tok) and SCR_NUMRX.match(value):
-                ku=tok.upper(); occurrence=counts.get(ku,0); counts[ku]=occurrence+1
-                rows.append(dict(
-                    key=tok,value=value,length=len(value),occurrence=occurrence,
-                    key_rel=key_off,value_rel=value_off,path='/'.join(stack)
-                ))
-        previous=tok
-    return rows
+    return _shared_scr_parse_numeric_rows(data)
 
 def _scr_wheel(path):
-    u=path.upper().replace('_','-')
-    for raw,label in (
-        ('FRONT-RIGHT','Front Right'),('FRONT-LEFT','Front Left'),
-        ('REAR-RIGHT','Rear Right'),('REAR-LEFT','Rear Left')):
-        if raw in u: return label
-    return ''
+    return _shared_scr_wheel(path)
 
 def _scr_context(path,key):
-    u=path.upper(); wheel=_scr_wheel(path)
-    if wheel: return wheel
-    if 'HANDBRAKE' in u: return 'Handbrake'
-    for raw,label in (
-        ('AERODYNAMICS','Aerodynamics'),('ANTI-ROLL-BAR','Anti-roll bar'),
-        ('SUSPENSION','Suspension'),('BRAKES','Brakes'),('GEARBOX','Gearbox'),
-        ('ENGINE','Engine'),('DRIVETRAIN','Drivetrain'),('STEERING','Steering'),
-        ('GSCHASSIS','AI chassis'),('CHASSIS','Chassis'),('MOVER','Vehicle mover')):
-        if raw in u: return label
-    parts=[p for p in path.split('/') if p and p not in ('VEHICLE','!VEHICLE','GSRACECAR','DATA')]
-    return parts[-1].replace('-',' ').title() if parts else 'General'
+    return _shared_scr_context(path)
 
 def _scr_category(key,path):
-    k=key.upper(); p=path.upper()
-    if k in SCR_KEYS or 'AERODYNAMICS' in p or any(x in k for x in ('DRAFT','DOWNFORCE','DRAG-CDA','SPLITTER','TAPE')):
-        return 'Draft / Aero'
-    if any(x in k for x in ('GRIP','FRICTION','SLIP','TREADWEAR','PRESSURE','TYRE','TIRE')) or '/TYRE' in p:
-        return 'Grip / Tires'
-    if any(x in k for x in ('SPRING','DAMPING','CAMBER','TOE','JOUNCE','ROLL-CENTRE','BUMP-STOP')) or any(x in p for x in ('SUSPENSION','ANTI-ROLL-BAR')):
-        return 'Suspension'
-    if any(x in k for x in ('BRAKE','FADE')) or 'BRAKES' in p or 'HANDBRAKE' in p:
-        return 'Brakes'
-    if any(x in k for x in ('GEAR','RATIO','RPM','TORQUE','LIMITER','CLUTCH','DIFF','EFFICIENCY','FUEL')) or any(x in p for x in ('ENGINE','GEARBOX','DRIVETRAIN')):
-        return 'Engine / Gearing'
-    if any(x in k for x in ('STEER','ACKERMANN')) or 'STEERING' in p:
-        return 'Steering'
-    if k.startswith('AI-') or k.startswith('AI_') or 'AI-' in k:
-        return 'AI Behavior'
-    if any(x in k for x in ('VIEW','CAMERA','TILT','FOV','LOD','LIGHT','SHADOW','SOUND')):
-        return 'Camera / Visual'
-    return 'Other'
+    return _shared_scr_category(key,path)
 
 def _scr_status(key):
     k=key.upper()
@@ -8104,315 +4797,12 @@ def _scr_public_row(row,stock):
         r.pop(k,None)
     return r
 
-def _scr_key_batch_fixed(changes,dry_run=False):
-    """Fast surgical path for batches whose encoded values keep their original widths."""
-    if not isinstance(changes,list) or not changes:
-        return dict(ok=False,error='no pending changes')
-    if len(changes)>2500:
-        return dict(ok=False,error='batch is too large; limit is 2500 values')
-
-    rows=_scr_numeric_inventory()
-    by_ident={_scr_row_ident(r):r for r in rows}
-    requested=[]; seen=set(); archives=set(); width_mismatch=False
-
-    for item in changes:
-        try:
-            ident=(str(item.get('arc','0')),str(item['name']).upper(),
-                   str(item['key']).upper(),int(item.get('occurrence',0)))
-        except Exception:
-            return dict(ok=False,error='invalid change target')
-        if ident in seen:
-            return dict(ok=False,error=f'duplicate target in batch: {ident[2]} occurrence {ident[3]}')
-        seen.add(ident)
-        row=by_ident.get(ident)
-        if not row:
-            return dict(ok=False,error=f'target not found: {ident[1]}/{ident[2]} occurrence {ident[3]}')
-
-        value=str(item.get('value','')).strip()
-        if not SCR_NUMRX.match(value):
-            return dict(ok=False,error=f'{row["key"]}: value must be a plain number')
-        if len(value)!=row['length']:
-            width_mismatch=True
-        archives.add(str(row['arc']))
-        if value!=row['value']:
-            requested.append((ident,row,value))
-
-    if not requested:
-        return dict(ok=False,error='all pending values already match the game')
-    if len(archives)!=1:
-        return dict(ok=False,error='one atomic batch may target only one archive')
-    # This function is also reached by older UI paths and Season Pack code.
-    # Never reject a width-changing value here: hand the normalized targets to
-    # the variable-size ARCC rebuild/repoint path instead.
-    if width_mismatch:
-        return _scr_variable_batch(requested,dry_run)
-
-    arcid=next(iter(archives)); g,reg=registry()
-    if arcid not in reg: return dict(ok=False,error=f'ARCHIVE{arcid} is unavailable')
-    live=reg[arcid]['ar']; bak=reg[arcid]['bak']; original_size=os.path.getsize(live)
-    before={_scr_row_ident(r):r['value'] for r in rows}
-    expected={ident:value for ident,row,value in requested}
-    tmp=os.path.join(_tf.gettempdir(),f'n15mod_scrbatch_{os.getpid()}_{abs(hash(tuple(sorted(expected))))%99999}.AR')
-
-    try:
-        if os.path.exists(tmp): os.remove(tmp)
-        shutil.copyfile(live,tmp)
-        with open(tmp,'r+b') as fh:
-            for ident,row,value in requested:
-                fh.seek(row['abs_off'])
-                existing=fh.read(row['length']).decode('ascii','replace')
-                if existing!=row['value']:
-                    return dict(ok=False,error=f'{row["key"]}: live bytes changed since scan; reload the editor')
-                fh.seek(row['abs_off']); fh.write(value.encode('ascii'))
-            fh.flush(); os.fsync(fh.fileno())
-
-        if os.path.getsize(tmp)!=original_size:
-            return dict(ok=False,error='temporary archive size changed; batch refused')
-
-        after=_scr_numeric_snapshot(tmp,arcid)
-        actual={}
-        for ident in set(before)|set(after):
-            ov=before.get(ident); nv=after.get(ident)
-            if ov!=nv: actual[ident]=(ov,nv)
-
-        unexpected=[ident for ident in actual if ident not in expected]
-        missing=[ident for ident in expected if ident not in actual]
-        wrong=[ident for ident,value in expected.items() if ident in actual and actual[ident][1]!=value]
-        if unexpected or missing or wrong:
-            details=[]
-            for ident in unexpected[:10]: details.append(f'unexpected {ident[1]}/{ident[2]}#{ident[3]}')
-            for ident in missing[:10]: details.append(f'missing {ident[1]}/{ident[2]}#{ident[3]}')
-            for ident in wrong[:10]: details.append(f'wrong value {ident[1]}/{ident[2]}#{ident[3]}')
-            return dict(ok=False,collateral=bool(unexpected),affected_count=len(actual),
-                        error='full SCR diff guard blocked the batch: '+'; '.join(details),
-                        changes=[dict(arc=i[0],name=i[1],key=i[2],occurrence=i[3],old=v[0],new=v[1])
-                                 for i,v in list(actual.items())[:50]])
-
-        summary=[dict(id=row['id'],track=row['track'],role=row['role'],key=row['key'],
-                      occurrence=row['occurrence'],context=row['context'],old=row['value'],new=value)
-                 for ident,row,value in requested]
-        track_count=len({row['track'] for ident,row,value in requested})
-        if dry_run:
-            return dict(ok=True,dry_run=True,affected_count=len(requested),
-                        track_count=track_count,changes=summary,
-                        note='preview confirmed every requested setting and no unrelated changes')
-
-        ensure_backup(live,bak)
-        # Commit only the validated value bytes, not a whole-archive copy. This
-        # preserves every unrelated mod already present in the live archive and
-        # gives us a surgical rollback if readback ever fails.
-        with open(live,'r+b') as fh:
-            for ident,row,value in requested:
-                fh.seek(row['abs_off'])
-                existing=fh.read(row['length']).decode('ascii','replace')
-                if existing!=row['value']:
-                    return dict(ok=False,error=f'{row["key"]}: live bytes changed after preview; reload and retry')
-                fh.seek(row['abs_off']); fh.write(value.encode('ascii'))
-            fh.flush(); os.fsync(fh.fileno())
-
-        if os.path.getsize(live)!=original_size:
-            with open(live,'r+b') as fh:
-                for ident,row,value in requested:
-                    fh.seek(row['abs_off']); fh.write(row['value'].encode('ascii'))
-            return dict(ok=False,error='live archive size changed; requested bytes were rolled back')
-
-        readback=_scr_numeric_snapshot()
-        failed=[ident for ident,value in expected.items() if readback.get(ident)!=value]
-        if failed:
-            with open(live,'r+b') as fh:
-                for ident,row,value in requested:
-                    fh.seek(row['abs_off']); fh.write(row['value'].encode('ascii'))
-                fh.flush(); os.fsync(fh.fileno())
-            return dict(ok=False,error='batch readback failed; requested bytes were rolled back',
-                        failed=[f'{i[1]}/{i[2]}#{i[3]}' for i in failed[:20]])
-
-        return dict(ok=True,verified=True,affected_count=len(requested),
-                    track_count=track_count,changes=summary)
-    finally:
-        try:
-            if os.path.exists(tmp): os.remove(tmp)
-        except OSError: pass
-
-
-# ---- v0.9.26 variable-size SCR rebuild + repoint ----
-def _scr_pack_type_size(record_type,size):
-    if not (0<=int(size)<0x1000000): raise ValueError('SCR ARCC record exceeds 24-bit size field')
-    return int.from_bytes(bytes((int(record_type)&0xff,))+int(size).to_bytes(3,'big'),'little')
-
-
-def _scr_arcc_records(raw):
-    if raw[:4]!=b'ARCC' or len(raw)<0x80: raise ValueError('SCR entry is not an ARCC container')
-    count=struct.unpack_from('<I',raw,4)[0];base=0x80+count*16
-    if count<=0 or count>4096 or base>len(raw): raise ValueError('invalid SCR ARCC record table')
-    rows=[];max_end=base
-    for i in range(count):
-        key,off,nref,packed=struct.unpack_from('<4I',raw,0x80+i*16)
-        b=packed.to_bytes(4,'little');typ=b[0];size=int.from_bytes(b[1:4],'big');absolute=base+off
-        if absolute<base or absolute+size>len(raw): raise ValueError(f'SCR ARCC record {i} exceeds the file')
-        rows.append(dict(index=i,key=key,name_ref=nref,record_type=typ,size=size,absolute=absolute,
-                         payload=bytes(raw[absolute:absolute+size])))
-        max_end=max(max_end,absolute+size)
-    tail=bytes(raw[max_end:])
-    if tail and any(tail): raise ValueError('SCR ARCC has an unknown non-zero tail; variable rebuild refused')
-    return count,base,rows
-
-
-def _scr_rebuild_arcc(raw,replacements):
-    """Replace one or more absolute byte ranges inside ARCC record payloads.
-
-    replacements: iterable of (absolute_offset, old_length, new_bytes, label).
-    Every untouched record remains byte-identical. Records are rebuilt on 16-byte
-    absolute boundaries and the 24-bit payload size fields are updated.
-    """
-    count,base,records=_scr_arcc_records(raw)
-    by_record=collections.defaultdict(list)
-    for absolute,old_len,new_bytes,label in replacements:
-        hit=None
-        for rec in records:
-            if rec['absolute']<=absolute and absolute+old_len<=rec['absolute']+rec['size']:
-                hit=rec;break
-        if hit is None: raise ValueError(f'{label}: value range is outside every SCR record')
-        by_record[hit['index']].append((absolute-hit['absolute'],old_len,bytes(new_bytes),label))
-    payloads=[]
-    for rec in records:
-        edits=sorted(by_record.get(rec['index'],[]),key=lambda x:x[0])
-        src=rec['payload'];out=bytearray();cursor=0
-        for rel,old_len,new_bytes,label in edits:
-            if rel<cursor or rel+old_len>len(src): raise ValueError(f'{label}: overlapping or invalid SCR edit')
-            out+=src[cursor:rel];out+=new_bytes;cursor=rel+old_len
-        out+=src[cursor:];payloads.append(bytes(out))
-    header=bytearray(raw[:0x80]);table=bytearray(count*16);data=bytearray();cursor=0
-    for rec,payload in zip(records,payloads):
-        absolute=(base+cursor+15)&~15;pad=absolute-(base+cursor)
-        if pad:data+=b'\0'*pad;cursor+=pad
-        off=cursor;data+=payload;cursor+=len(payload)
-        struct.pack_into('<4I',table,rec['index']*16,rec['key'],off,rec['name_ref'],
-                         _scr_pack_type_size(rec['record_type'],len(payload)))
-    rebuilt=bytes(header+table+data)
-    c2,b2,r2=_scr_arcc_records(rebuilt)
-    if c2!=count or b2!=base: raise ValueError('SCR ARCC rebuild changed its table shape')
-    changed=set(by_record)
-    for old,new in zip(records,r2):
-        if (old['key'],old['name_ref'],old['record_type'])!=(new['key'],new['name_ref'],new['record_type']):
-            raise ValueError('SCR ARCC rebuild changed record identity')
-        if old['index'] not in changed and old['payload']!=new['payload']:
-            raise ValueError(f'SCR ARCC rebuild changed untouched record {old["index"]}')
-    return rebuilt
-
-
-def _scr_entry_value_map(data):
-    return {(r['key'].upper(),int(r['occurrence'])):r['value'] for r in _scr_parse_numeric_rows(data)}
-
-
-def _scr_variable_batch(requested,dry_run=False):
-    """Rebuild changed SCR entries and atomically append/repoint them.
-
-    This path is selected only when at least one value changes encoded width.
-    It never overwrites an indexed entry in place; all affected files are
-    validated independently and then installed as one rollback-capable package.
-    """
-    g,reg=registry()
-    if not g: return dict(ok=False,error='game folder not found')
-    archives={str(row['arc']) for ident,row,value in requested}
-    if len(archives)!=1:return dict(ok=False,error='one atomic SCR batch may target only one archive')
-    arcid=next(iter(archives));v=reg.get(arcid)
-    if not v:return dict(ok=False,error=f'ARCHIVE{arcid} is unavailable')
-    _,index_rows,_=_rp_index_rows(v['cdf'])
-    groups=collections.defaultdict(list)
-    for ident,row,value in requested:groups[row['name'].upper()].append((ident,row,value))
-    td=tempfile.mkdtemp(prefix='n15mod_scr_repoint_');plans=[];expected={}
-    try:
-        for n,(name,items) in enumerate(sorted(groups.items())):
-            idxrow=_rp_find_row(index_rows,items[0][1]['name'])
-            with open(v['ar'],'rb') as fh:fh.seek(idxrow['offset']);current=fh.read(idxrow['size'])
-            if len(current)!=idxrow['size']:raise ValueError(name+': short archive read')
-            current_map=_scr_entry_value_map(current);repls=[]
-            for ident,row,value in items:
-                key=(row['key'].upper(),int(row['occurrence']))
-                if current_map.get(key)!=row['value']:
-                    raise ValueError(f'{row["key"]}: live SCR changed since scan; reload the editor')
-                val=value.encode('ascii')
-                # Inventory offsets are absolute archive offsets. Convert them to
-                # offsets inside the current indexed SCR entry before rebuilding.
-                rel=int(row['abs_off'])-int(row['entry_off'])
-                repls.append((rel,int(row['length']),val,f'{row["name"]}/{row["key"]}#{row["occurrence"]}'))
-                expected[(name,key[0],key[1])]=value
-            rebuilt=_scr_rebuild_arcc(current,repls)
-            after_map=_scr_entry_value_map(rebuilt)
-            for ident,row,value in items:
-                key=(row['key'].upper(),int(row['occurrence']))
-                if after_map.get(key)!=value:raise ValueError(f'{row["key"]}: rebuilt SCR failed value readback')
-            changed={k for k in set(current_map)|set(after_map) if current_map.get(k)!=after_map.get(k)}
-            intended={(row['key'].upper(),int(row['occurrence'])) for ident,row,value in items}
-            if changed!=intended:
-                extra=sorted(changed-intended)[:10];missing=sorted(intended-changed)[:10]
-                raise ValueError(f'{name}: rebuilt SCR diff mismatch; extra={extra} missing={missing}')
-            fp=os.path.join(td,f'{n:03d}_{os.path.basename(items[0][1]["name"])}')
-            open(fp,'wb').write(rebuilt)
-            plan=_rp_plan(arcid,v,idxrow,fp,False)
-            plans.append(dict(row=idxrow,path=fp,name=items[0][1]['name'],before=current,
-                              after=rebuilt,plan=plan,items=items))
-        summary=[dict(id=row['id'],track=row['track'],role=row['role'],key=row['key'],occurrence=row['occurrence'],
-                      context=row['context'],old=row['value'],new=value,old_width=row['length'],new_width=len(value))
-                 for ident,row,value in requested]
-        if dry_run:
-            return dict(ok=True,dry_run=True,method='rebuild_repoint',affected_count=len(requested),
-                        track_count=len({row['track'] for ident,row,value in requested}),file_count=len(plans),
-                        changes=summary,files=[dict(name=p['name'],old_size=len(p['before']),new_size=len(p['after']),
-                                                   delta=len(p['after'])-len(p['before']),growth=p['plan']['growth']) for p in plans],
-                        note='Each changed SCR container was rebuilt, reparsed, and diffed; apply will append/repoint all files atomically.')
-        touched={arcid:dict(v=v,archive_size=os.path.getsize(v['ar']),cdf=open(v['cdf'],'rb').read())}
-        _rp_backup_pair(v);results=[]
-        try:
-            with _RP_LOCK:
-                for p in plans:results.append(_rp_install_one(arcid,v,p['row'],p['path'],'SCR variable-size rebuild',False,history=False))
-                hist=_rp_load_history();hist.extend(r['history'] for r in results);_rp_save_history(hist)
-        except Exception as install_ex:
-            state=touched[arcid]
-            rollback_archive_cdf(v,state['archive_size'],state['cdf'],'.scr_rollback.tmp',install_ex)
-            raise
-        # Final live inventory verifies every requested value after all cdfiles
-        # entries have moved to their new offsets.
-        live_rows=_scr_numeric_inventory();live_by={_scr_row_ident(r):r['value'] for r in live_rows}
-        failed=[ident for ident,row,value in requested if live_by.get(ident)!=value]
-        if failed:
-            state=touched[arcid]
-            verify_error=ValueError('variable-size SCR readback failed; the atomic install was rolled back')
-            rollback_archive_cdf(v,state['archive_size'],state['cdf'],'.scr_verify_rollback.tmp',verify_error)
-            raise verify_error
-        return dict(ok=True,verified=True,method='rebuild_repoint',affected_count=len(requested),
-                    track_count=len({row['track'] for ident,row,value in requested}),file_count=len(plans),
-                    changes=summary,results=[r['history'] for r in results])
-    finally:
-        shutil.rmtree(td,ignore_errors=True)
 
 
 def scr_key_batch(changes,dry_run=False):
-    """Auto-select fixed-slot or rebuilt/repoint SCR installation."""
-    if not isinstance(changes,list) or not changes:return dict(ok=False,error='no pending changes')
-    if len(changes)>2500:return dict(ok=False,error='batch is too large; limit is 2500 values')
-    rows=_scr_numeric_inventory();by_ident={_scr_row_ident(r):r for r in rows};requested=[];seen=set()
-    for item in changes:
-        try:ident=(str(item.get('arc','0')),str(item['name']).upper(),str(item['key']).upper(),int(item.get('occurrence',0)))
-        except Exception:return dict(ok=False,error='invalid change target')
-        if ident in seen:return dict(ok=False,error=f'duplicate target in batch: {ident[2]} occurrence {ident[3]}')
-        seen.add(ident);row=by_ident.get(ident)
-        if not row:return dict(ok=False,error=f'target not found: {ident[1]}/{ident[2]} occurrence {ident[3]}')
-        value=str(item.get('value','')).strip()
-        if not SCR_NUMRX.fullmatch(value):return dict(ok=False,error=f'{row["key"]}: value must be a plain finite number')
-        if len(value)>32:return dict(ok=False,error=f'{row["key"]}: values are limited to 32 characters')
-        try:num=float(value)
-        except Exception:return dict(ok=False,error=f'{row["key"]}: invalid number')
-        if not _math.isfinite(num):return dict(ok=False,error=f'{row["key"]}: NaN and infinity are blocked')
-        if abs(num)>1_000_000_000:return dict(ok=False,error=f'{row["key"]}: absolute values above 1,000,000,000 are blocked')
-        if value!=row['value']:requested.append((ident,row,value))
-    if not requested:return dict(ok=False,error='all pending values already match the game')
-    if all(len(value)==row['length'] for ident,row,value in requested):
-        normalized=[dict(arc=row['arc'],name=row['name'],key=row['key'],
-                         occurrence=row['occurrence'],value=value)
-                    for ident,row,value in requested]
-        return _scr_key_batch_fixed(normalized,dry_run)
-    return _scr_variable_batch(requested,dry_run)
+    """Compatibility seam; the shared service owns all SCR writes."""
+    editor=_shared_scr_editor()
+    return editor.preview(changes) if dry_run else editor.apply(changes)
 
 def scr_key_set(arcid,name,key,new_value,dry_run=False,occurrence=0):
     return scr_key_batch([dict(arc=arcid,name=name,key=key,
@@ -8429,37 +4819,21 @@ def scr_keys_api():
         limit=max(1,min(5000,int(request.args.get('limit','1500'))))
 
         if meta:
-            all_rows=_scr_numeric_inventory()
+            all_rows=_shared_scr_editor().inventory(include_stock=True)
             tracks=sorted({r['track'] for r in all_rows})
             counts={c:0 for c in SCR_CATEGORY_ORDER}
             for r in all_rows: counts[r['category']]=counts.get(r['category'],0)+1
-            spath,scdf,slabel=_scr_stock_source()
+            has_stock=any(r.get('stock') is not None for r in all_rows)
             return jsonify(dict(ok=True,tracks=tracks,total=len(all_rows),
                 unique_keys=len({r['key'].upper() for r in all_rows}),
                 categories=SCR_CATEGORY_ORDER,category_counts=counts,
-                stock_source=slabel,has_stock=bool(spath)))
+                stock_source=('backup' if has_stock else None),has_stock=has_stock))
 
-        rows=_scr_numeric_inventory(track_filter=track or None,
-                                    role_filter=role,
-                                    query=query,
-                                    recommended_only=recommended)
-        spath,scdf,slabel=_scr_stock_source(); stock={}
-        if spath:
-            try:
-                stock={_scr_row_ident(r):r['value'] for r in _scr_numeric_inventory(
-                    archive_override=spath,archive_id='0',cdf_override=scdf,
-                    track_filter=track or None,role_filter=role,
-                    query=None,recommended_only=recommended)
-                       if str(r['arc'])=='0'}
-            except Exception:
-                stock={}; slabel=None
-        public=[_scr_public_row(r,stock) for r in rows]
-        order={name:i for i,name in enumerate(SCR_CATEGORY_ORDER)}
-        public.sort(key=lambda r:(r['track'],order.get(r['category'],99),
-                                  r['context'],r['key'],r['occurrence'],0 if r['role']=='player' else 1))
-        total=len(public); public=public[:limit]
-        return jsonify(dict(ok=True,rows=public,count=total,returned=len(public),
-                            truncated=total>limit,stock_source=slabel,
+        rows=_shared_scr_editor().inventory(track=track,role=role,query=query,
+                                            recommended_only=recommended,include_stock=True)
+        total=len(rows);rows=rows[:limit];has_stock=any(r.get('stock') is not None for r in rows)
+        return jsonify(dict(ok=True,rows=rows,count=total,returned=len(rows),
+                            truncated=total>limit,stock_source=('backup' if has_stock else None),
                             categories=SCR_CATEGORY_ORDER,editable=True,
                             note='Same-width edits use surgical writes. Different-width values rebuild each SCR container and install them through atomic append/repoint. Every path performs a full all-key diff.'))
     except Exception as ex:
@@ -8498,10 +4872,10 @@ DISCOVERED_TEXTURE_CSV = os.path.join(DATA,'discovered_texture_assets.csv')
 TEXTURE_DISCOVERY_REPORT = os.path.join(DATA,'texture_discovery_live_report.json')
 
 def _discovered_texture_csv():
-    return os.path.join(_profile_dir(),'discovered_texture_assets.csv') if ACTIVE_GAME=='nascar14' else DISCOVERED_TEXTURE_CSV
+    return _profile_scoped_state(DISCOVERED_TEXTURE_CSV,'discovered_texture_assets.csv')
 
 def _texture_discovery_report():
-    return os.path.join(_profile_dir(),'texture_discovery_live_report.json') if ACTIVE_GAME=='nascar14' else TEXTURE_DISCOVERY_REPORT
+    return _profile_scoped_state(TEXTURE_DISCOVERY_REPORT,'texture_discovery_live_report.json')
 TEXTURE_DISCOVERY_TOOL = component_path('nascar15_texture_discovery_v0_1.py')
 
 # Confirmed, user-facing assets. png_replace_safe gates the experimental
@@ -8779,7 +5153,7 @@ def _ui_index():
 UI_MAPPING_FILE = os.path.join(APP_DIR,'data','ui_mapping_overrides.json')
 
 def _ui_mapping_file():
-    return os.path.join(_profile_dir(),'ui_mapping_overrides.json') if ACTIVE_GAME=='nascar14' else UI_MAPPING_FILE
+    return _profile_scoped_state(UI_MAPPING_FILE,'ui_mapping_overrides.json')
 
 def _ui_mapping_key(row):
     return f"{row.get('archive','')}|{str(row.get('container','')).upper()}|{row.get('entry','')}|{_ui_payload_identity(row.get('payload_abs'))}"
@@ -8796,12 +5170,7 @@ def _ui_mapping_overrides():
         return {}
 
 def _ui_save_mapping_overrides(d):
-    path=_ui_mapping_file()
-    os.makedirs(os.path.dirname(path),exist_ok=True)
-    tmp=path+'.tmp'
-    with open(tmp,'w',encoding='utf-8') as f:
-        json.dump(d,f,indent=2,sort_keys=True)
-    os.replace(tmp,path)
+    atomic_write_json(_ui_mapping_file(), d, indent=2, sort_keys=True)
 
 def _ui_pretty_name(s):
     s=re.sub(r'\.(tga|dds|png)$','',str(s),flags=re.I)
@@ -9801,12 +6170,12 @@ def _ui_prepare_encoded(q,arc,e,safe,row):
 
 
 def _texture_discovery_module():
-    if not os.path.exists(TEXTURE_DISCOVERY_TOOL):
-        raise RuntimeError('texture discovery helper is missing')
-    spec=importlib.util.spec_from_file_location('nascar15_texture_discovery_runtime',TEXTURE_DISCOVERY_TOOL)
-    if spec is None or spec.loader is None: raise RuntimeError('could not load texture discovery helper')
-    mod=importlib.util.module_from_spec(spec); sys.modules[spec.name]=mod; spec.loader.exec_module(mod)
-    return mod
+    return _load_module_from_path(
+        TEXTURE_DISCOVERY_TOOL,
+        'nascar15_texture_discovery_runtime',
+        missing_message='texture discovery helper is missing',
+        load_message='could not load texture discovery helper',
+    )
 
 def _ui_discovery_family(container, entry):
     """Classify newly discovered texture rows without pretending the exact consumer is verified."""
@@ -10037,10 +6406,10 @@ def ui_list():
     for r,a,m,safe,dedicated in candidates:
         ident=(str(r['archive']),r['container'],r['entry'],_ui_payload_identity(r.get('payload_abs'))); modified=modified_states.get(ident) if modified_only else None
         if modified_only and not modified: continue
-        special=_ui_special_handler(r); n14_guarded=(ACTIVE_GAME=='nascar14')
-        current_3dnum=bool(dedicated.get('dedicated_current_target')) and not n14_guarded
-        replacement_route=('exact_raw' if n14_guarded else ('specialized_png' if current_3dnum else _ui_replacement_route(r,a,m)))
-        replace_reason=("NASCAR '14 Smart Import stays locked in this beta; use Raw Export/Exact Raw Import only for reviewed ARCHIVE0/1 assets." if n14_guarded else ('' if current_3dnum else _ui_replace_reason(r)))
+        special=_ui_special_handler(r); limited_guard=_limited_editor_profile()
+        current_3dnum=bool(dedicated.get('dedicated_current_target')) and not limited_guard
+        replacement_route=('exact_raw' if limited_guard else ('specialized_png' if current_3dnum else _ui_replacement_route(r,a,m)))
+        replace_reason=(f"{active_game_name()} Smart Import stays locked while its layouts are under validation; use Raw Export/Exact Raw Import only for reviewed ARCHIVE0/1 assets." if limited_guard else ('' if current_3dnum else _ui_replace_reason(r)))
         recipe=_ui_layout_recipe(r)
         out.append(dict(archive=r['archive'],container=r['container'],entry=r['entry'],payload_abs=r.get('payload_abs'),
                         w=r['w'],h=r['h'],fmt=r['fmt'],payload_size=r['payload_size'],mip_count=r.get('mip_count'),
@@ -10061,7 +6430,7 @@ def ui_list():
                         user_mapped=bool(m.get('user_mapped')),source_group=r.get('source_index') or r.get('family','ui_assets'),
                         note=m['note'],modified=modified,
                         has_backup=bool(str(r['archive']) in _reg and os.path.exists(_reg[str(r['archive'])]['bak'])),
-                        png_replace_safe=(False if n14_guarded else (current_3dnum or (bool(r.get('decoded')) and safe in ('safe_replace','guarded_replace') and special!='driver_select_3dnum_dedicated'))),
+                        png_replace_safe=(False if limited_guard else (current_3dnum or (bool(r.get('decoded')) and safe in ('safe_replace','guarded_replace') and special!='driver_select_3dnum_dedicated'))),
                         profile=dict(profile=(a['id'] if a else r.get('family') or 'indexed_ui_texture'),
                                      alpha_supported=(r['fmt']=='DXT5'),
                                      inferred_mips=_ui_infer_mips(r['w'],r['h'],r['fmt'],r['payload_size']),
@@ -10440,742 +6809,67 @@ def ui_restore():
 
 
 # ==================== v0.9.26.7 GAMEPLAY-CONFIRMED SCHEDULE EDITOR ====================
-SCHEDULE_HELPER_NAME='nascar15_schedule_editor_v0_1.py'
-SCHEDULE_LINK_HELPER_NAME='nascar15_schedule_raceevent_links_v0_1.py'
-MAX_RACE_LAPS=2147483647  # largest signed Python-2 marshal int; higher values require a long-object layout
-_SCHEDULE_MOD=None
-_SCHEDULE_LINK_MOD=None
-_SCHEDULE_CACHE={}
-
-def schedule_mod():
-    global _SCHEDULE_MOD
-    if _SCHEDULE_MOD is None:
-        path=component_path(SCHEDULE_HELPER_NAME)
-        if not os.path.exists(path): raise RuntimeError(f'{SCHEDULE_HELPER_NAME} is missing from the internal tools folder')
-        import importlib.util as _iu
-        spec=_iu.spec_from_file_location('n15_schedule_editor',path)
-        mod=_iu.module_from_spec(spec); sys.modules['n15_schedule_editor']=mod; spec.loader.exec_module(mod); _SCHEDULE_MOD=mod
-    if hasattr(_SCHEDULE_MOD,'configure'):
-        _SCHEDULE_MOD.configure(active_game_profile().get('season_year',2015))
-    return _SCHEDULE_MOD
-
-
-def schedule_link_mod():
-    global _SCHEDULE_LINK_MOD
-    if _SCHEDULE_LINK_MOD is not None:return _SCHEDULE_LINK_MOD
-    path=component_path(SCHEDULE_LINK_HELPER_NAME)
-    if not os.path.exists(path):raise RuntimeError(f'{SCHEDULE_LINK_HELPER_NAME} is missing from the internal tools folder')
-    import importlib.util as _iu
-    spec=_iu.spec_from_file_location('n15_schedule_raceevent_links',path)
-    mod=_iu.module_from_spec(spec);sys.modules['n15_schedule_raceevent_links']=mod;spec.loader.exec_module(mod);_SCHEDULE_LINK_MOD=mod
-    return mod
-
-def _schedule_archive_source(source='live',verify_hash=True):
-    """Archive-0 stock/baseline source. Live schedules use discovery across every archive."""
-    g,reg=registry()
-    if not g or '0' not in reg: raise RuntimeError('ARCHIVE0 not found')
-    live_cdf=reg['0']['cdf']
-    if source=='baseline':
-        entry=stock_baselines().get('0')
-        if not entry: raise RuntimeError('no clean baseline registered')
-        path=_verify_baseline_entry('0',entry,verify_hash=verify_hash)
-        pristine_cdf=backup_path(live_cdf)
-        if os.path.exists(pristine_cdf):
-            return path,pristine_cdf,'baseline'
-        if os.path.getsize(path)!=os.path.getsize(reg['0']['ar']):
-            raise RuntimeError('clean baseline needs a paired pristine cdfiles backup after repoint installs')
-        return path,live_cdf,'baseline'
-    if source=='backup':
-        path=reg['0']['bak'];cdf=backup_path(live_cdf)
-        if not os.path.exists(path) or not os.path.exists(cdf): raise RuntimeError('no paired pristine ARCHIVE0/cdfiles backup exists')
-        return path,cdf,'backup'
-    return reg['0']['ar'],live_cdf,'live'
-
-
-def _schedule_key(archive,cdf,label):
-    ast=os.stat(archive); cst=os.stat(cdf)
-    return (label,os.path.realpath(archive),ast.st_size,ast.st_mtime_ns,
-            os.path.realpath(cdf),cst.st_size,cst.st_mtime_ns)
-
-
-def _schedule_public_rows(rows,raw=None):
-    public=[r.public() for r in rows]
-    runtime_links={}
-    if raw is not None:
-        try:runtime_links=schedule_link_mod().inspect_links(raw)
-        except Exception:runtime_links={}
-    for row in public:
-        if row.get('event_uid') is None:
-            text=str(row.get('race_event') or '')
-            m=re.search(r'\bEVENT_c\s*\(\s*(-?\d+)',text)
-            if m:row['event_uid']=int(m.group(1))
-        link=runtime_links.get(int(row.get('uid'))) if row.get('uid') is not None else None
-        row['gameplay_event_uid']=(None if not link else int(link['event_uid']))
-        row['worldpointer_event_uid']=row['gameplay_event_uid']
-        row['worldpointer_matches']=(row.get('event_uid') is not None and row['gameplay_event_uid']==int(row['event_uid']))
-    return public
-
-
-def _schedule_effective_rows(rows,catalog_rows):
-    """Resolve the live track link to one friendly stock event definition.
-
-    Several named races share the same physical track link (for example the
-    Coca-Cola 600 and Bank of America 500).  A track UID alone therefore cannot
-    preserve the correct race name or event-specific lap default.  The app keeps
-    the chosen stock definition per season slot in config and falls back to that
-    slot's original stock definition when no custom assignment has been saved.
-    """
-    by_key={};by_event_uid=collections.defaultdict(list);by_slot_uid={}
-    for raw in catalog_rows or []:
-        try:
-            row=dict(raw);uid=int(row.get('event_uid'));name=str(row.get('event') or '')
-        except Exception:continue
-        if not name:continue
-        key=_schedule_definition_key(uid,name);row['definition_key']=key
-        by_key.setdefault(key,row);by_event_uid[uid].append(row)
-        try:by_slot_uid[int(row.get('uid'))]=row
-        except Exception:pass
-    assignments=_schedule_assignment_map()
-    out=[]
-    for raw in rows or []:
-        row=dict(raw)
-        row['visible_event_uid']=row.get('event_uid');row['visible_event']=row.get('event');row['visible_track']=row.get('track')
-        try:linked_uid=int(row.get('gameplay_event_uid'))
-        except Exception:linked_uid=None
-        try:target_uid=int(row.get('uid'))
-        except Exception:target_uid=None
-        if linked_uid is None:
-            try:linked_uid=int(row.get('event_uid'))
-            except Exception:linked_uid=None
-        meta=None
-        saved_key=assignments.get(str(target_uid)) if target_uid is not None else None
-        if saved_key in by_key and int(by_key[saved_key]['event_uid'])==linked_uid:
-            meta=by_key[saved_key]
-        if meta is None and target_uid in by_slot_uid and int(by_slot_uid[target_uid]['event_uid'])==linked_uid:
-            meta=by_slot_uid[target_uid]
-        if meta is None:
-            try:visible_key=_schedule_definition_key(linked_uid,row.get('event'))
-            except Exception:visible_key=None
-            if visible_key in by_key:meta=by_key[visible_key]
-        if meta is None and linked_uid in by_event_uid:
-            meta=by_event_uid[linked_uid][0]
-        if linked_uid is not None:row['event_uid']=linked_uid
-        if meta:
-            row['definition_key']=meta['definition_key']
-            for key in ('event','track','race_event'):
-                if meta.get(key) is not None:row[key]=meta.get(key)
-            row['source_uid']=meta.get('uid')
-        else:
-            row['definition_key']=_schedule_definition_key(linked_uid,row.get('event') or '') if linked_uid is not None else ''
-        row['worldpointer_matches']=(linked_uid is not None and row.get('event_uid') is not None and int(row['event_uid'])==linked_uid)
-        out.append(row)
-    return out
-
-_SCHEDULE_SOURCE_CACHE={}
-
-def _schedule_live_source_key(reg):
-    parts=[]
-    for arcid,v in sorted(reg.items(),key=lambda kv:int(kv[0])):
-        try:
-            a=os.stat(v['ar']);c=os.stat(v['cdf'])
-            parts.append((str(arcid),a.st_size,a.st_mtime_ns,c.st_size,c.st_mtime_ns))
-        except OSError: continue
-    return tuple(parts)
-
-
-def _schedule_live_sources(use_cache=True):
-    """Find every indexed DB_GAME_LOCAL_SCRIPT.PYC that contains a valid active-season Cup schedule.
-
-    Update/DLC archives can contain overriding copies. The old editor always patched only
-    ARCHIVE0; this discovery pass lets preview/apply verify and patch every schedule-bearing
-    copy atomically.
-    """
-    g,reg=registry()
-    if not g: raise RuntimeError('game folder not selected')
-    key=_schedule_live_source_key(reg)
-    if use_cache and key in _SCHEDULE_SOURCE_CACHE:
-        return _SCHEDULE_SOURCE_CACHE[key]
-    mod=schedule_mod();mp=component_path(MAPPER_NAME);rp=component_path(REPOINT_NAME)
-    mapper,repoint=mod.load_helpers(mp,rp)
-    found=[];errors=[]
-    for arcid,v in sorted(reg.items(),key=lambda kv:int(kv[0])):
-        try: entries=parse_cdfiles(v['cdf'])
-        except Exception as ex:
-            errors.append(dict(archive=str(arcid),error='index parse: '+str(ex)));continue
-        for occurrence,(off,size,name) in enumerate((x for x in entries if str(x[2]).upper()==DBFILE.upper())):
-            try:
-                with open(v['ar'],'rb') as fh:
-                    fh.seek(off);raw=fh.read(size)
-                if len(raw)!=size: raise RuntimeError('short archive read')
-                rows,_records=mod.map_schedule(raw,mapper)
-                public=_schedule_public_rows(rows,raw)
-                if len(public)!=36: raise RuntimeError(f"found {len(public)} normal {active_game_profile().get('season_year',2015)} Cup slots")
-                found.append(dict(archive_id=str(arcid),archive=v['ar'],cdf=v['cdf'],offset=int(off),size=int(size),
-                                  occurrence=occurrence,raw=raw,rows=public,mapper=mapper,repoint=repoint,
-                                  sha256=_hl.sha256(raw).hexdigest()))
-            except Exception as ex:
-                errors.append(dict(archive=str(arcid),entry=name,offset=int(off),size=int(size),error=str(ex)))
-    if not found:
-        detail='; '.join(f"ARCHIVE{x.get('archive')}: {x.get('error')}" for x in errors[:6])
-        raise RuntimeError('no schedule-bearing DB_GAME_LOCAL_SCRIPT.PYC was found'+(('; '+detail) if detail else ''))
-    found.sort(key=lambda x:(x['archive_id']!='0',int(x['archive_id']),x['offset']))
-    result=dict(sources=found,errors=errors,key=key)
-    _SCHEDULE_SOURCE_CACHE.clear();_SCHEDULE_SOURCE_CACHE[key]=result
-    return result
-
-
-def _schedule_read(source='live',use_cache=True,verify_hash=True):
-    mod=schedule_mod()
-    if source=='live':
-        discovered=_schedule_live_sources(use_cache=use_cache);primary=discovered['sources'][0]
-        meta=dict(primary, label='live', sources=discovered['sources'], source_errors=discovered['errors'])
-        rows=[dict(r) for r in primary['rows']]
-        catalog=[]
-        for candidate in ('backup','baseline'):
-            try:
-                catalog,_catmeta=_schedule_read(candidate,use_cache=use_cache,verify_hash=False)
-                if catalog:break
-            except Exception:pass
-        if catalog:
-            rows=_schedule_effective_rows(rows,catalog)
-            meta['stock_rows']=[dict(r) for r in catalog]
-            meta['stock_source']=str(_catmeta.get('label') or candidate)
-        else:
-            meta['stock_rows']=[]
-            meta['stock_source']=None
-        return rows,meta
-    archive,cdf,label=_schedule_archive_source(source,verify_hash=verify_hash)
-    key=_schedule_key(archive,cdf,label)
-    if use_cache and key in _SCHEDULE_CACHE:
-        rows,meta=_SCHEDULE_CACHE[key]
-        return [dict(r) for r in rows],dict(meta)
-    mp=component_path(MAPPER_NAME); rp=component_path(REPOINT_NAME)
-    raw,off,size,mapper,repoint=mod.extract(archive,cdf,DBFILE,mp,rp)
-    rows,_=mod.map_schedule(raw,mapper);public=_schedule_public_rows(rows,raw)
-    meta=dict(archive=archive,cdf=cdf,label=label,offset=off,size=size,raw=raw,mapper=mapper,repoint=repoint,sources=[])
-    for old in list(_SCHEDULE_CACHE):
-        if old[0]==label and old[1]==os.path.realpath(archive): _SCHEDULE_CACHE.pop(old,None)
-    _SCHEDULE_CACHE[key]=(public,meta)
-    return [dict(r) for r in public],dict(meta)
-
-
-def _schedule_stock_sources():
-    g,reg=registry(); out=[]
-    if g and '0' in reg and os.path.exists(reg['0']['bak']) and os.path.exists(backup_path(reg['0']['cdf'])): out.append('backup')
-    entry=stock_baselines().get('0')
-    if entry:
-        try:
-            _verify_baseline_entry('0',entry,verify_hash=False); out.append('baseline')
-        except Exception: pass
-    return out
-
-
-SCHEDULE_EVENT_LAP_PROFILE_KEY='schedule_event_lap_profiles_v2'
-SCHEDULE_EVENT_LAP_PROFILE_LEGACY_KEY='schedule_event_lap_profiles_v1'
-SCHEDULE_ASSIGNMENT_KEY='schedule_event_assignments_v2'
-SCHEDULE_ASSIGNMENT_LEGACY_KEY='schedule_event_assignments_v1'
-
-
-def _schedule_definition_key(event_uid,event_name):
-    return f"{int(event_uid)}|{str(event_name or '')}"
-
-
-def _schedule_assignment_map():
-    raw=load_cfg().get(SCHEDULE_ASSIGNMENT_KEY)
-    return {str(k):str(v) for k,v in raw.items()} if isinstance(raw,dict) else {}
-
-
-def _schedule_save_assignments(desired):
-    cfg=load_cfg();mapping={}
-    for item in desired or []:
-        try:mapping[str(int(item['target_uid']))]=_schedule_definition_key(item['event_uid'],item['event_name'])
-        except Exception:continue
-    cfg[SCHEDULE_ASSIGNMENT_KEY]=mapping;save_cfg(cfg)
-    return mapping
-
-
-def _schedule_validate_lap(value,label='lap count'):
-    try:value=int(value)
-    except Exception:raise ValueError(f'{label} must be a whole number')
-    if not (1<=value<=MAX_RACE_LAPS):
-        raise ValueError(f'{label} must be 1-{MAX_RACE_LAPS:,}')
-    return value
-
-
-def _schedule_event_lap_profile_rows(save_missing=True):
-    """Return all 36 stock event definitions with definition-specific defaults.
-
-    Named events can share one physical track link, so profiles are keyed by
-    ``event UID + event token`` instead of event UID alone.  This keeps the
-    Coca-Cola 600 separate from the Bank of America 500 while still letting a
-    Bristol Night default follow that named event wherever it is scheduled.
-    """
-    sources=_schedule_stock_sources()
-    if not sources:raise RuntimeError('no clean original game copy or previous backup is available')
-    source='backup' if 'backup' in sources else sources[0]
-    stock,_=_schedule_read(source,verify_hash=False)
-    live,_=_schedule_read('live')
-    cfg=load_cfg();stored=cfg.get(SCHEDULE_EVENT_LAP_PROFILE_KEY)
-    if not isinstance(stored,dict):stored={}
-    legacy=cfg.get(SCHEDULE_EVENT_LAP_PROFILE_LEGACY_KEY)
-    if not isinstance(legacy,dict):legacy={}
-    changed=False;rows=[];profiles={}
-    for row in sorted(stock,key=lambda x:int(x['order'])):
-        event_uid=int(row['event_uid']);event=str(row.get('event') or '')
-        profile_key=_schedule_definition_key(event_uid,event);stock_laps=int(row['laps'])
-        raw=stored.get(profile_key)
-        if raw is None:raw=legacy.get(str(event_uid))
-        try:profile=_schedule_validate_lap(raw,'stored event lap') if raw is not None else None
-        except Exception:profile=None
-        if profile is None:profile=stock_laps
-        if stored.get(profile_key)!=profile:
-            stored[profile_key]=profile;changed=True
-        profiles[profile_key]=profile
-        occurrences=[r for r in live if str(r.get('definition_key') or _schedule_definition_key(r.get('event_uid'),r.get('event'))) == profile_key]
-        live_laps=sorted({int(r['laps']) for r in occurrences})
-        out=dict(row);out.update(slot=int(row['order']),uid=int(row['uid']),event_uid=event_uid,
-            event=event,track=str(row.get('track') or ''),profile_key=profile_key,definition_key=profile_key,
-            stock_laps=stock_laps,profile_laps=profile,current_laps=profile,modified=(profile!=stock_laps),
-            current_occurrences=len(occurrences),occurrence_laps=live_laps)
-        rows.append(out)
-    if changed and save_missing:
-        cfg[SCHEDULE_EVENT_LAP_PROFILE_KEY]=stored;save_cfg(cfg)
-    return rows,profiles,source
-
-
-def _schedule_resolve_profile_key(value=None,event_uid=None,event_name=None):
-    rows,_profiles,_source=_schedule_event_lap_profile_rows(save_missing=True)
-    known={str(r['profile_key']):r for r in rows}
-    if value is not None and str(value) in known:return str(value)
-    if event_uid is not None and event_name:
-        key=_schedule_definition_key(event_uid,event_name)
-        if key in known:return key
-    if event_uid is not None:
-        matches=[k for k,r in known.items() if int(r['event_uid'])==int(event_uid)]
-        if len(matches)==1:return matches[0]
-        if len(matches)>1:raise ValueError('that track has multiple named events; choose the exact event row')
-    raise ValueError('event definition was not found in the stock 36-event catalog')
-
-
-def _schedule_set_event_lap_profile(profile_key,laps):
-    laps=_schedule_validate_lap(laps);profile_key=_schedule_resolve_profile_key(profile_key)
-    cfg=load_cfg();stored=cfg.get(SCHEDULE_EVENT_LAP_PROFILE_KEY)
-    if not isinstance(stored,dict):stored={}
-    stored[profile_key]=laps;cfg[SCHEDULE_EVENT_LAP_PROFILE_KEY]=stored;save_cfg(cfg)
-    return laps
-
-
-def _schedule_enrich_profile_laps(rows,profiles):
-    out=[]
-    for raw in rows or []:
-        row=dict(raw)
-        key=str(row.get('definition_key') or _schedule_definition_key(row.get('event_uid'),row.get('event')))
-        row['definition_key']=key;row['profile_key']=key
-        profile=profiles.get(key)
-        if profile is None:
-            try:profile=int(row.get('laps'))
-            except Exception:profile=None
-        row['profile_laps']=profile
-        try:row['lap_override']=(profile is not None and int(row.get('laps'))!=int(profile))
-        except Exception:row['lap_override']=False
-        out.append(row)
-    return out
-
-
-def _schedule_current_desired_with_event_profile(profile_key,laps):
-    live,_=_schedule_read('live');profile_key=_schedule_resolve_profile_key(profile_key);laps=_schedule_validate_lap(laps)
-    desired=[];matches=0
-    for row in sorted(live,key=lambda x:int(x['order'])):
-        key=str(row.get('definition_key') or _schedule_definition_key(row['event_uid'],row['event']))
-        same=(key==profile_key)
-        if same:matches+=1
-        desired.append(dict(slot=int(row['order']),target_uid=int(row['uid']),source_uid=int(row.get('source_uid') or row['uid']),
-                            event_uid=int(row['event_uid']),event_name=str(row['event']),definition_key=key,
-                            laps=(laps if same else int(row['laps']))))
-    return desired,matches
-
-
-def _schedule_apply_event_profile(profile_key,laps,dry_run=False):
-    profile_key=_schedule_resolve_profile_key(profile_key);laps=_schedule_validate_lap(laps)
-    profile_rows,_profiles,_source=_schedule_event_lap_profile_rows(save_missing=not dry_run)
-    meta=next((r for r in profile_rows if str(r['profile_key'])==profile_key),None)
-    if meta is None:raise ValueError('event definition is not in the stock 36-event catalog')
-    desired,matches=_schedule_current_desired_with_event_profile(profile_key,laps)
-    result=(_schedule_patch(desired,dry_run=dry_run,patch_laps=True) if matches else
-            dict(ok=True,dry_run=bool(dry_run),changes=[],change_count=0,worldpointer_change_count=0,exact_lap_change_count=0,elapsed_ms=0))
-    result.update(profile_key=profile_key,event_uid=int(meta['event_uid']),event_name=meta['event'],track=meta['track'],
-                  profile_laps=laps,current_occurrences=matches,profile_only=(matches==0))
-    if not dry_run:_schedule_set_event_lap_profile(profile_key,laps)
-    return result
-
-
-def _schedule_apply_event_profiles_batch(entries,dry_run=False):
-    if not isinstance(entries,list) or not entries:raise ValueError('no event lap defaults were supplied')
-    rows,_profiles,_source=_schedule_event_lap_profile_rows(save_missing=not dry_run)
-    known={str(r['profile_key']):r for r in rows};updates={}
-    for item in entries:
-        if not isinstance(item,dict):raise ValueError('every event-lap row must be an object')
-        key=_schedule_resolve_profile_key(item.get('profile_key'),item.get('event_uid'),item.get('event_name'))
-        updates[key]=_schedule_validate_lap(item.get('laps'))
-    live,_=_schedule_read('live');desired=[];matched=0
-    for row in sorted(live,key=lambda x:int(x['order'])):
-        key=str(row.get('definition_key') or _schedule_definition_key(row['event_uid'],row['event']))
-        wanted=updates.get(key,int(row['laps']))
-        if key in updates:matched+=1
-        desired.append(dict(slot=int(row['order']),target_uid=int(row['uid']),source_uid=int(row.get('source_uid') or row['uid']),
-                            event_uid=int(row['event_uid']),event_name=str(row['event']),definition_key=key,laps=wanted))
-    result=_schedule_patch(desired,dry_run=dry_run,patch_laps=True)
-    result.update(profile_updates=len(updates),current_occurrences=matched)
-    if not dry_run:
-        cfg=load_cfg();stored=cfg.get(SCHEDULE_EVENT_LAP_PROFILE_KEY)
-        if not isinstance(stored,dict):stored={}
-        stored.update({k:int(v) for k,v in updates.items()});cfg[SCHEDULE_EVENT_LAP_PROFILE_KEY]=stored;save_cfg(cfg)
-    return result
-
-def _schedule_reference_raw(src):
-    """Return a PYC whose semantic EVENT constant indices are still stock.
-
-    After a repeated-event schedule is applied, the live runtime assignments may
-    all point to one event.  The paired pristine backup recovers the original
-    event-UID -> constant-index map needed to switch to any track later.
-    """
-    g,reg=registry();arcid=str(src['archive_id']);occurrence=int(src.get('occurrence',0))
-    def read_from(archive,cdf,label):
-        matches=[(o,z,n) for o,z,n in parse_cdfiles(cdf) if str(n).upper()==DBFILE.upper()]
-        if not matches:raise RuntimeError(f'{DBFILE} not found in {label} index')
-        hit=matches[occurrence] if occurrence<len(matches) else (matches[0] if len(matches)==1 else None)
-        if hit is None:raise RuntimeError(f'{DBFILE} occurrence {occurrence} missing from {label}')
-        with open(archive,'rb') as fh:fh.seek(hit[0]);raw=fh.read(hit[1])
-        if len(raw)!=hit[1]:raise RuntimeError(f'short {label} PYC read')
-        return raw,label
-    v=reg.get(arcid)
-    if v:
-        bar=v['bak'];bcdf=backup_path(v['cdf'])
-        if os.path.exists(bar) and os.path.exists(bcdf):
-            try:return read_from(bar,bcdf,'pristine backup')
-            except Exception:pass
-    if arcid=='0':
-        try:
-            archive,cdf,label=_schedule_archive_source('baseline',verify_hash=False)
-            return read_from(archive,cdf,label)
-        except Exception:pass
-    return src['raw'],'live reference'
-
-
-def _schedule_desired(q):
-    slots=q.get('slots') or []
-    if not isinstance(slots,list) or len(slots)!=36:
-        raise ValueError('custom schedule must contain exactly 36 slots')
-    out=[]
-    for i,item in enumerate(slots,1):
-        if not isinstance(item,dict):raise ValueError(f'slot {i} is not an object')
-        try:
-            row=dict(slot=i,target_uid=int(item['target_uid']),source_uid=(None if item.get('source_uid') is None else int(item['source_uid'])),
-                     event_uid=int(item['event_uid']),event_name=str(item['event_name']),definition_key=str(item.get('definition_key') or _schedule_definition_key(item['event_uid'],item['event_name'])),laps=int(item['laps']))
-        except Exception:raise ValueError(f'slot {i} has invalid target/source/event/laps values')
-        if not row['event_name']:raise ValueError(f'slot {i} event name is empty')
-        if not (1<=row['laps']<=MAX_RACE_LAPS):raise ValueError(f'slot {i} laps must be 1-{MAX_RACE_LAPS:,}')
-        out.append(row)
-    return out
-
-
-def _schedule_allowed_catalog():
-    rows=[]
-    try:
-        d=_schedule_live_sources()
-        for src in d['sources']:rows.extend(src['rows'])
-    except Exception:pass
-    for source in ('backup','baseline'):
-        try:rows.extend(_schedule_read(source,verify_hash=False)[0])
-        except Exception:pass
-    return {(int(r.get('event_uid')),str(r.get('event'))):r for r in rows if r.get('event_uid') is not None and r.get('event')}
-
-
-def _schedule_patch_laps_exact(pyc,local):
-    """Apply requested RaceLaps values through the exact-field path.
-
-    The older implementation re-parsed the full database once for every one of
-    the 36 slots even when most lap values were unchanged.  This version maps
-    the live values once, skips no-op rows immediately, and only invokes the
-    heavier one-field verifier for records that actually need a change.
-    """
-    out=bytes(pyc);changes=[]
-    initial,_root,_records,_schemas=_mapped_rows_from_pyc_bytes(out,'RACEDATA_c',['RaceLaps'])
-    current={str(r.get('uid')):r.get('RaceLaps') for r in initial}
-    for item in local:
-        uid=int(item['target_uid']);wanted=int(item['laps']);key=str(uid)
-        if key not in current:raise RuntimeError(f'RACEDATA UID {uid} disappeared while patching laps')
-        old=current[key]
-        if _num_eq(old,wanted):continue
-        plan=_exact_field_variant(out,'RACEDATA_c',uid,'RaceLaps',wanted)
-        if not plan.get('ok'):
-            raise RuntimeError(f'RACEDATA UID {uid} exact lap repoint failed: {plan.get("error","unknown error")}')
-        out=plan['pyc'];current[key]=wanted
-        changes.append(dict(target_uid=uid,old_laps=int(float(old)),new_laps=wanted,
-                            method=plan.get('method'),grew=bool(plan.get('grew')),
-                            const_index=plan.get('const_index'),operand_offset=plan.get('operand_offset')))
-    if changes:
-        final,_r,_records,_schemas=_mapped_rows_from_pyc_bytes(out,'RACEDATA_c',['RaceLaps'])
-        final_by_uid={str(r.get('uid')):r.get('RaceLaps') for r in final}
-        for change in changes:
-            got=final_by_uid.get(str(change['target_uid']))
-            if not _num_eq(got,change['new_laps']):
-                raise RuntimeError(f"RACEDATA UID {change['target_uid']} final lap verification failed")
-    return out,changes
-
-def _schedule_cdf_row_for_source(v,src):
-    raw,rows,_layout=_rp_index_rows(v['cdf'])
-    matches=[r for r in rows if str(r['name']).upper()==DBFILE.upper()
-             and int(r['offset'])==int(src['offset']) and int(r['size'])==int(src['size'])]
-    if len(matches)==1:return raw,matches[0]
-    same=[r for r in rows if str(r['name']).upper()==DBFILE.upper()]
-    occ=int(src.get('occurrence',0))
-    if occ<len(same):return raw,same[occ]
-    raise RuntimeError(f"ARCHIVE{src['archive_id']} could not resolve the exact {DBFILE} index row")
-
-
-def _schedule_install_variant(src,patched):
-    """Install one schedule PYC, appending/repointing when its constant table grew."""
-    g,reg=registry();arcid=str(src['archive_id']);v=need(reg,arcid)
-    if len(patched)==int(src['size']):
-        with open(v['ar'],'r+b') as fh:
-            fh.seek(int(src['offset']));fh.write(patched);fh.flush();os.fsync(fh.fileno())
-            fh.seek(int(src['offset']));check=fh.read(len(patched))
-        if check!=patched:raise RuntimeError(f'ARCHIVE{arcid} same-size schedule readback mismatch')
-        return dict(method='same_size',offset=int(src['offset']),size=len(patched),growth=0)
-    raw,row=_schedule_cdf_row_for_source(v,src)
-    old_archive_size=os.path.getsize(v['ar'])
-    new_off=(old_archive_size+(_RP_ALIGNMENT-1))&~(_RP_ALIGNMENT-1)
-    if new_off+len(patched)>=2**32:raise RuntimeError('schedule PYC repoint would exceed the 32-bit archive limit')
-    with open(v['ar'],'ab') as fh:
-        pad=new_off-old_archive_size
-        if pad:fh.write(b'\0'*pad)
-        fh.write(patched);fh.flush();os.fsync(fh.fileno())
-    if _rp_sha256_range(v['ar'],new_off,len(patched))!=_hl.sha256(patched).hexdigest():
-        raise RuntimeError(f'ARCHIVE{arcid} appended schedule SHA-256 mismatch')
-    struct.pack_into('<I',raw,row['size_pos'],len(patched))
-    struct.pack_into('<I',raw,row['offset_pos'],new_off)
-    tmp=v['cdf']+'.schedule.tmp'
-    with open(tmp,'wb') as fh:fh.write(raw);fh.flush();os.fsync(fh.fileno())
-    os.replace(tmp,v['cdf'])
-    _raw2,rows2,_layout2=_rp_index_rows(v['cdf'])
-    vr=next((r for r in rows2 if str(r['name']).upper()==DBFILE.upper()
-             and int(r['offset'])==new_off and int(r['size'])==len(patched)),None)
-    if vr is None:raise RuntimeError(f'ARCHIVE{arcid} cdfiles schedule repoint readback failed')
-    return dict(method='append_repoint',offset=new_off,size=len(patched),growth=(new_off+len(patched)-old_archive_size))
-
-
-def _schedule_semantic_equal(a,b):
-    if isinstance(a,bool) or isinstance(b,bool):return isinstance(a,bool) and isinstance(b,bool) and a is b
-    if isinstance(a,(bytes,bytearray)) and isinstance(b,str):
-        try:return bytes(a).decode('latin1')==b
-        except Exception:return False
-    if isinstance(b,(bytes,bytearray)) and isinstance(a,str):
-        try:return bytes(b).decode('latin1')==a
-        except Exception:return False
-    if isinstance(a,(bytes,bytearray)) or isinstance(b,(bytes,bytearray)):
-        try:return bytes(a)==bytes(b)
-        except Exception:return False
-    if isinstance(a,float) or isinstance(b,float):
-        try:return abs(float(a)-float(b))<1e-12
-        except Exception:return False
-    return type(a) is type(b) and a==b
-
-
-def _schedule_find_live_const(root,value,preferred=None):
-    consts=root['consts']
-    if preferred is not None and 0<=int(preferred)<len(consts) and _schedule_semantic_equal(consts[int(preferred)],value):
-        return int(preferred)
-    hits=[i for i,c in enumerate(consts) if _schedule_semantic_equal(c,value)]
-    return hits[0] if hits else None
-
-
-def _schedule_transplant_constructor(live_pyc,reference_pyc,local,mapper,repoint,mod):
-    """Build the desired visible schedule against a pristine PYC, then transplant
-    only its LOAD_CONST operand choices onto the current live PYC.
-
-    The legacy helper validates operands against stock. That is correct for a
-    first edit but rejects the second custom schedule because those operands no
-    longer point at stock constants. Running it on the pristine reference keeps
-    its safety checks useful; semantic transplanting makes the result repeatable
-    after Stock, Random 36, 36 Daytonas, or any other prior schedule.
-    """
-    ref_rows,_=mod.map_schedule(reference_pyc,mapper)
-    ref_public=_schedule_public_rows(ref_rows,reference_pyc)
-    ref_by_order={int(r['order']):r for r in ref_public}
-    if sorted(ref_by_order)!=list(range(1,37)):
-        raise RuntimeError('pristine schedule reference does not expose slots 1-36')
-    ref_local=[]
-    for item in local:
-        stock=ref_by_order[int(item['slot'])]
-        h=dict(item)
-        h['target_uid']=int(stock['uid'])
-        # RaceLaps is handled later by the exact UID/field path. Keeping the
-        # pristine lap here limits the legacy helper to EventName/RaceEvent.
-        h['laps']=int(stock['laps'])
-        ref_local.append(h)
-    ref_patched,ref_changes,inference=mod.apply_custom(reference_pyc,ref_local,mapper,repoint)
-    linkmod=schedule_link_mod()
-    before_root=linkmod.parse_root(reference_pyc);after_root=linkmod.parse_root(ref_patched)
-    before_ins=linkmod._instructions(before_root['code']);after_ins=linkmod._instructions(after_root['code'])
-    if len(before_ins)!=len(after_ins):raise RuntimeError('schedule constructor helper changed bytecode instruction count')
-    changes=[];out=bytes(live_pyc)
-    for bi,ai in zip(before_ins,after_ins):
-        if bi['offset']!=ai['offset'] or bi['opcode']!=ai['opcode']:
-            raise RuntimeError('schedule constructor helper changed bytecode instruction layout')
-        if bi.get('arg')==ai.get('arg'):continue
-        if ai['opcode']!=100 or ai.get('arg') is None or ai.get('arg_offset') is None:
-            raise RuntimeError(f'schedule constructor helper changed unsupported opcode {ai["opcode"]} at 0x{ai["offset"]:X}')
-        if ai['arg']>=len(after_root['consts']):raise RuntimeError('constructor helper selected an invalid constant index')
-        desired_value=after_root['consts'][ai['arg']]
-        live_root=linkmod.parse_root(out)
-        live_idx=_schedule_find_live_const(live_root,desired_value,preferred=ai['arg'])
-        operand_abs=int(live_root['code_offset'])+int(ai['arg_offset'])
-        old_idx=int.from_bytes(out[operand_abs:operand_abs+2],'little')
-        if live_idx is None:
-            old_value=live_root['consts'][old_idx] if 0<=old_idx<len(live_root['consts']) else None
-            if isinstance(desired_value,bool) or (isinstance(desired_value,(int,float)) and not isinstance(desired_value,bool)):
-                out,grew,live_idx=_patch_load_const_operand(out,operand_abs,0,desired_value,old_value)
-            else:
-                raise RuntimeError(f'live PYC no longer contains required schedule constant {desired_value!r}')
-        else:
-            if live_idx>0xFFFF:raise RuntimeError('schedule constant requires EXTENDED_ARG')
-            buf=bytearray(out);struct.pack_into('<H',buf,operand_abs,int(live_idx));out=bytes(buf);grew=False
-        changes.append(dict(code_offset=int(ai['offset']),operand_offset=operand_abs,
-                            old_const_index=old_idx,new_const_index=int(live_idx),
-                            desired_value=(desired_value.decode('latin1','replace') if isinstance(desired_value,bytes) else desired_value),
-                            grew=bool(grew)))
-    mapped,_=mod.map_schedule(out,mapper);public=_schedule_public_rows(mapped,out);by_order={int(r['order']):r for r in public}
-    for item in local:
-        row=by_order[int(item['slot'])]
-        if int(row.get('event_uid'))!=int(item['event_uid']) or str(row.get('event'))!=str(item['event_name']):
-            raise RuntimeError(f'slot {item["slot"]}: repeat-safe visible schedule transplant verification failed')
-    info=dict(inference or {}) if isinstance(inference,dict) else dict(legacy_inference=str(inference))
-    info.update(method='pristine_constructor_semantic_transplant',transplanted_operands=len(changes),operand_changes=changes)
-    return out,ref_changes,info
-
-
-def _schedule_patch(desired,dry_run=False,patch_laps=True):
-    import time
-    started=time.perf_counter()
-    mod=schedule_mod();linkmod=schedule_link_mod()
-    discovered=_schedule_live_sources(use_cache=True);sources=discovered['sources']
-    primary_rows=sources[0]['rows'];allowed=_schedule_allowed_catalog()
-    for i,item in enumerate(desired,1):
-        if (int(item['event_uid']),str(item['event_name'])) not in allowed:
-            raise ValueError(f'slot {i}: event {item["event_name"]} / UID {item["event_uid"]} is not in the live or clean Cup catalog')
-    patches=[]
-    for src in sources:
-        effective_source_rows=_schedule_effective_rows(src['rows'],list(allowed.values()))
-        by_order={int(r['order']):r for r in effective_source_rows}
-        if sorted(by_order)!=list(range(1,37)):
-            raise RuntimeError(f"ARCHIVE{src['archive_id']} does not expose a unique 1-36 schedule")
-        local=[]
-        for item in desired:
-            row=dict(item);row['target_uid']=int(by_order[int(item['slot'])]['uid']);local.append(row)
-
-        # WorldPointer is the gameplay-confirmed schedule source and each
-        # RACEDATA assignment has its own operand. The visible constructor uses
-        # shared LOAD_CONST operands, so editing it can make slot 21 (and other
-        # repeated-track slots) collide inside one 36-slot batch. Leave that
-        # shared constructor untouched and patch only the isolated runtime link.
-        reference_raw,reference_label=_schedule_reference_raw(src)
-        constructor_patched=bytes(src['raw'])
-        constructor_changes=[]
-        inference=dict(method='worldpointer_authoritative_no_constructor_write',
-                       transplanted_operands=0,
-                       note='Visible event labels are derived from the verified gameplay link and clean event catalog.')
-        linked,link_changes,link_info=linkmod.patch_links(constructor_patched,local,reference_raw)
-        patched,lap_changes=(_schedule_patch_laps_exact(linked,local) if patch_laps else (linked,[]))
-        final_rows,_final_records=mod.map_schedule(patched,src['mapper'])
-        final_public=_schedule_effective_rows(_schedule_public_rows(final_rows,patched),list(allowed.values()))
-        final_by_order={int(r['order']):r for r in final_public}
-        link_by_uid={int(x['target_uid']):x for x in link_changes}
-        combined=[]
-        for item in local:
-            old=by_order[int(item['slot'])];final=final_by_order[int(item['slot'])];link=link_by_uid[int(item['target_uid'])]
-            old_gameplay=old.get('gameplay_event_uid')
-            visible_changed=(str(old.get('event'))!=str(item['event_name']) or
-                             int(old.get('event_uid'))!=int(item['event_uid']) or
-                             (patch_laps and int(old.get('laps'))!=int(item['laps'])))
-            world_changed=(old_gameplay is None or int(old_gameplay)!=int(item['event_uid']))
-            if visible_changed or world_changed:
-                combined.append(dict(slot=int(item['slot']),target_uid=int(item['target_uid']),
-                    source_uid=item.get('source_uid'),old_event=str(old.get('event')),new_event=str(item['event_name']),
-                    old_event_uid=int(old.get('event_uid')),new_event_uid=int(item['event_uid']),
-                    old_laps=int(old.get('laps')),new_laps=int(item['laps']),
-                    old_gameplay_event_uid=old_gameplay,new_gameplay_event_uid=int(item['event_uid']),
-                    visible_changed=bool(visible_changed),worldpointer_changed=bool(world_changed),
-                    operand_pyc_offset=int(link['operand_pyc_offset'])))
-        patches.append(dict(src=src,patched=patched,changes=combined,inference=inference,local=local,
-                            constructor_changes=constructor_changes,link_changes=link_changes,
-                            lap_changes=lap_changes,final_rows=final_public,
-                            link_info=link_info,reference_label=reference_label))
-    changed=patches[0]['changes']
-    result=dict(ok=True,dry_run=bool(dry_run),changes=changed,change_count=len(changed),
-                worldpointer_change_count=sum(1 for x in changed if x['worldpointer_changed']),
-                visible_change_count=sum(1 for x in changed if x['visible_changed']),
-                exact_lap_change_count=len(patches[0]['lap_changes']),
-                inference=patches[0]['inference'],link_inference=patches[0]['link_info'],
-                repeats=36-len({(int(x['event_uid']),str(x['event_name'])) for x in desired}),
-                before=[dict(uid=r['uid'],order=r['order'],date=r['date'],track=r['track'],
-                             event_uid=r.get('event_uid'),gameplay_event_uid=r.get('gameplay_event_uid')) for r in primary_rows],
-                schedule_sources=len(patches),sources=[dict(archive=x['src']['archive_id'],offset=x['src']['offset'],
-                    old_size=x['src']['size'],new_size=len(x['patched']),sha256=x['src']['sha256'][:16],reference=x['reference_label']) for x in patches],
-                laps_preserved=not bool(patch_laps),
-                elapsed_ms=round((time.perf_counter()-started)*1000),
-                existing_mode_cache_warning='Career and Single Season may cache their calendar when the save is created. Test with a brand-new disposable mode after applying.')
-    if dry_run:
-        result['after']=patches[0]['final_rows']
-        result['source_previews']=[dict(archive=x['src']['archive_id'],change_count=len(x['changes']),
-            worldpointer_change_count=sum(1 for c in x['changes'] if c['worldpointer_changed']),
-            exact_lap_change_count=len(x['lap_changes']),old_size=x['src']['size'],new_size=len(x['patched']),
-            variable_size=(len(x['patched'])!=x['src']['size']),
-            changed_bytes=x['link_info']['changed_bytes'],reference=x['reference_label']) for x in patches]
-        return result
-    if _rp_game_running():raise RuntimeError('NASCAR15.exe is running; close the game first')
-
-    # One transaction across every overriding archive copy. Variable-size PYC
-    # installs append/repoint; any install OR final semantic verification failure
-    # restores the original cdfiles bytes, archive size, and same-size segments.
-    g,reg=registry();states={};installed=[];verified_sources=[]
-    try:
-        for x in patches:
-            src=x['src'];arcid=str(src['archive_id']);v=need(reg,arcid);key=os.path.realpath(v['ar'])
-            if key not in states:
-                states[key]=dict(v=v,archive_size=os.path.getsize(v['ar']),cdf_bytes=open(v['cdf'],'rb').read(),segments=[])
-            state=states[key];_rp_backup_pair(v)
-            if len(x['patched'])==int(src['size']):state['segments'].append((int(src['offset']),bytes(src['raw'])))
-            install=_schedule_install_variant(src,x['patched']);installed.append(dict(archive=arcid,**install))
-        _SCHEDULE_CACHE.clear();_SCHEDULE_SOURCE_CACHE.clear()
-        verified_sources=_schedule_live_sources(use_cache=False)['sources']
-        for src in verified_sources:
-            by_order={int(r['order']):r for r in src['rows']}
-            for item in desired:
-                row=by_order[int(item['slot'])]
-                if (int(row.get('gameplay_event_uid'))!=int(item['event_uid']) or
-                    (patch_laps and int(row.get('laps'))!=int(item['laps']))):
-                    raise RuntimeError(f"ARCHIVE{src['archive_id']} live gameplay schedule verification failed at slot {item['slot']}")
-    except Exception as install_ex:
-        rollback_errors=[]
-        for key,state in states.items():
-            try:
-                with open(state['v']['ar'],'r+b') as fh:
-                    for off,raw in state['segments']:fh.seek(off);fh.write(raw)
-                    fh.truncate(state['archive_size']);fh.flush();os.fsync(fh.fileno())
-                atomic_write_bytes(state['v']['cdf'],state['cdf_bytes'],'.schedule.rollback')
-            except Exception as rb:
-                rollback_errors.append(f'{key}: {rb}')
-        _SCHEDULE_CACHE.clear();_SCHEDULE_SOURCE_CACHE.clear()
-        if rollback_errors:
-            raise RollbackFailed(install_ex,'; '.join(rollback_errors))
-        raise
-    _schedule_save_assignments(desired)
-    _SCHEDULE_CACHE.clear()
-    effective_rows,_effective_meta=_schedule_read('live',use_cache=False)
-    result['verified']=True;result['gameplay_verified']=True;result['installed']=installed
-    result['verified_sources']=len(verified_sources);result['rows']=effective_rows
-    return result
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # ---- v0.9.26.12 atomic bulk Images & Textures actions ----
 def _ui_bulk_identity(t):
@@ -11385,1162 +7079,257 @@ def ui_bulk_replace():
 @app.route('/api/schedule')
 def schedule_get():
     try:
-        import time
-        started=time.perf_counter(); rows,meta=_schedule_read('live')
-        profile_rows,profiles,profile_source=_schedule_event_lap_profile_rows(save_missing=True)
-        rows=_schedule_enrich_profile_laps(rows,profiles)
-        stock_rows=_schedule_enrich_profile_laps(meta.get('stock_rows') or [],profiles)
-        sources=_schedule_stock_sources()
-        source_rows=meta.get('sources') or []
-        link_mismatches=sum(1 for r in rows if not r.get('worldpointer_matches'))
-        return jsonify(dict(ok=True,rows=rows,count=len(rows),
-                            stock_rows=stock_rows,stock_source=meta.get('stock_source'),
-                            event_lap_profiles=profiles,profile_source=profile_source,
-                            stock_available=bool(sources),stock_sources=sources,
-                            schedule_sources=len(source_rows) or 1,worldpointer_mismatches=link_mismatches,gameplay_links_verified=(link_mismatches==0),
-                            source_archives=[str(x.get('archive_id')) for x in source_rows],
-                            source_errors=meta.get('source_errors') or [],
-                            load_ms=round((time.perf_counter()-started)*1000),
-                            helper=SCHEDULE_HELPER_NAME,link_helper=SCHEDULE_LINK_HELPER_NAME,read_only_fields=['NumDrivers'],max_race_laps=MAX_RACE_LAPS,
-                            cache_warning='Existing Career and Single Season saves may retain the calendar created when that mode began. Test schedule changes with a brand-new disposable mode.',
-                            note='The 36-race season and lap values are verified before any file is written.'))
+        editor=_shared_schedule_editor()
+        rows=editor.rows();profiles=editor.event_lap_profiles()
+        return jsonify(dict(
+            ok=True,rows=rows,stock_rows=editor.catalog(),
+            event_lap_profiles=profiles['profiles'],profile_rows=profiles['rows'],
+            profile_source=profiles['source'],season=editor.installation.profile.content_season,
+            schedule_sources=1,gameplay_links_verified=True,
+            cache_warning='Existing Career and Single Season saves may retain the calendar created when that mode began. Test changes with a brand-new disposable mode.',
+        ))
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
+
 
 @app.route('/api/schedule/stock')
 def schedule_stock_get():
     try:
-        import time
-        started=time.perf_counter(); sources=_schedule_stock_sources()
-        if not sources: raise RuntimeError('no clean original game copy or previous backup is available')
-        # The pristine app backup is fastest and requires no multi-gigabyte hash pass.
-        source='backup' if 'backup' in sources else sources[0]
-        rows,_=_schedule_read(source,verify_hash=False)
-        _profile_rows,profiles,_profile_source=_schedule_event_lap_profile_rows(save_missing=True)
-        rows=_schedule_enrich_profile_laps(rows,profiles)
-        return jsonify(dict(ok=True,rows=rows,stock_source=source,event_lap_profiles=profiles,
-                            load_ms=round((time.perf_counter()-started)*1000)))
+        editor=_shared_schedule_editor();profiles=editor.event_lap_profiles()
+        return jsonify(dict(ok=True,rows=editor.catalog(),stock_source='pristine backup',
+                            event_lap_profiles=profiles['profiles']))
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
+
 
 @app.route('/api/schedule/preview',methods=['POST'])
 def schedule_preview():
     try:
-        q=request.get_json(force=True) or {}
-        return jsonify(_schedule_patch(_schedule_desired(q),True,patch_laps=not bool(q.get('preserve_laps'))))
+        q=request.get_json(force=True)
+        return jsonify(_shared_schedule_editor().preview_custom(q.get('slots') or []))
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
+
 
 @app.route('/api/schedule/apply',methods=['POST'])
 def schedule_apply():
     try:
-        q=request.get_json(force=True) or {}
-        return jsonify(_schedule_patch(_schedule_desired(q),False,patch_laps=not bool(q.get('preserve_laps'))))
+        q=request.get_json(force=True)
+        return jsonify(_shared_schedule_editor().apply_custom(q.get('slots') or []))
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
+
 
 @app.route('/api/schedule/restore',methods=['POST'])
 def schedule_restore():
-    try:
-        stock=None; src=None
-        for candidate in ('baseline','backup'):
-            try: stock,_=_schedule_read(candidate); src=candidate; break
-            except Exception: pass
-        if not stock: raise RuntimeError('no clean original game copy or previous backup is available')
-        live,_=_schedule_read('live'); targets={int(r['order']):r for r in live}
-        desired=[dict(slot=i,target_uid=int(targets[i]['uid']),source_uid=int(r['uid']),
-                      event_uid=int(r['event_uid']),event_name=str(r['event']),laps=int(r['laps']))
-                 for i,r in sorted(((int(x['order']),x) for x in stock),key=lambda kv:kv[0])]
-        out=_schedule_patch(desired,False,patch_laps=False); out['restored_from']=src; return jsonify(out)
+    try:return jsonify(dict(ok=True,**_shared_schedule_editor().restore()))
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
 
 
 @app.route('/api/schedule/stock36_laps')
 def schedule_stock36_laps_get():
-    """Return the locked stock 36 event identities with persistent lap profiles."""
-    try:
-        import time
-        started=time.perf_counter();rows,profiles,source=_schedule_event_lap_profile_rows(save_missing=True)
-        return jsonify(dict(ok=True,rows=rows,count=len(rows),stock_source=source,
-                            load_ms=round((time.perf_counter()-started)*1000),
-                            max_race_laps=MAX_RACE_LAPS,
-                            note='Each named event keeps its own lap default and carries that value wherever it is placed in the season.'))
+    try:return jsonify(dict(ok=True,**_shared_schedule_editor().event_lap_profiles()))
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
 
 
 @app.route('/api/schedule/event_lap/preview',methods=['POST'])
 def schedule_event_lap_preview():
     try:
-        q=request.get_json(force=True) or {}
-        key=_schedule_resolve_profile_key(q.get('profile_key'),q.get('event_uid'),q.get('event_name'))
-        return jsonify(_schedule_apply_event_profile(key,q.get('laps'),dry_run=True))
+        q=request.get_json(force=True)
+        return jsonify(_shared_schedule_editor().preview_event_laps([q]))
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
 
 
 @app.route('/api/schedule/event_lap/apply',methods=['POST'])
 def schedule_event_lap_apply():
     try:
-        q=request.get_json(force=True) or {}
-        key=_schedule_resolve_profile_key(q.get('profile_key'),q.get('event_uid'),q.get('event_name'))
-        return jsonify(_schedule_apply_event_profile(key,q.get('laps'),dry_run=False))
+        q=request.get_json(force=True)
+        return jsonify(_shared_schedule_editor().apply_event_laps([q]))
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
 
 
 @app.route('/api/schedule/event_laps/batch/preview',methods=['POST'])
 def schedule_event_laps_batch_preview():
     try:
-        q=request.get_json(force=True) or {}
-        return jsonify(_schedule_apply_event_profiles_batch(q.get('entries') or [],dry_run=True))
+        q=request.get_json(force=True)
+        return jsonify(_shared_schedule_editor().preview_event_laps(q.get('entries') or []))
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
 
 
 @app.route('/api/schedule/event_laps/batch/apply',methods=['POST'])
 def schedule_event_laps_batch_apply():
     try:
-        q=request.get_json(force=True) or {}
-        return jsonify(_schedule_apply_event_profiles_batch(q.get('entries') or [],dry_run=False))
+        q=request.get_json(force=True)
+        return jsonify(_shared_schedule_editor().apply_event_laps(q.get('entries') or []))
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
 
 
 @app.route('/api/schedule/stock36_laps/restore',methods=['POST'])
 def schedule_stock36_laps_restore():
-    try:
-        rows,_profiles,source=_schedule_event_lap_profile_rows(save_missing=True)
-        defaults={str(r['profile_key']):int(r['stock_laps']) for r in rows}
-        entries=[dict(profile_key=k,laps=v) for k,v in defaults.items()]
-        out=_schedule_apply_event_profiles_batch(entries,dry_run=False)
-        cfg=load_cfg();cfg[SCHEDULE_EVENT_LAP_PROFILE_KEY]=defaults;save_cfg(cfg)
-        out['restored_laps_from']=source;out['profiles_restored']=len(defaults)
-        return jsonify(out)
+    try:return jsonify(_shared_schedule_editor().restore_event_laps())
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
 
-_TRACK_CACHE={}
-_CDF_ENTRY_CACHE={}
-try:
-    import threading as _threading
-    _TRACK_LOCK=_threading.Lock()
-except Exception:
-    _TRACK_LOCK=None
-TRACK_ALIAS_HINTS={
- 'Auto Club':['AUTOCLUB','FONTANA'],'Charlotte':['CHARLOTTE','LOWES'],'Sonoma':['SONOMA','INFINEON'],
- 'Watkins Glen':['WATKINSGLEN','WATKINS','GLEN'],'New Hampshire':['NEWHAMPSHIRE','LOUDON'],
- 'Indianapolis':['INDIANAPOLIS','INDY'],'Darlington':['DARLINGTON'],'Homestead':['HOMESTEAD'],
- 'Talladega':['TALLADEGA'],'Daytona':['DAYTONA'],'Martinsville':['MARTINSVILLE'],
- 'Bristol':['BRISTOL'],'Richmond':['RICHMOND'],'Dover':['DOVER'],'Pocono':['POCONO'],
- 'Michigan':['MICHIGAN'],'Kansas':['KANSAS'],'Atlanta':['ATLANTA'],'Texas':['TEXAS'],
- 'Phoenix':['PHOENIX'],'Las Vegas':['LASVEGAS','VEGAS'],'Kentucky':['KENTUCKY'],
- 'Chicagoland':['CHICAGOLAND','CHICAGO']
-}
-
-def _track_norm(s): return re.sub(r'[^A-Z0-9]','',str(s).upper())
-
-def _cdf_entries_cached(path):
-    st=os.stat(path); key=(os.path.realpath(path),st.st_size,st.st_mtime_ns)
-    if key in _CDF_ENTRY_CACHE:return _CDF_ENTRY_CACHE[key]
-    rows=parse_cdfiles(path)
-    for old in list(_CDF_ENTRY_CACHE):
-        if old[0]==key[0] and old!=key:_CDF_ENTRY_CACHE.pop(old,None)
-    _CDF_ENTRY_CACHE[key]=rows
-    return rows
-
-def _track_aliases(entries_by_archive=None):
-    # Display aliases must never trigger archive payload reads. v0.9.21 called
-    # scr_entries() here, which scanned SCR containers and could block the tab.
-    aliases={k:set(map(_track_norm,v+[k])) for k,v in TRACK_ALIAS_HINTS.items()}
-    for entries in (entries_by_archive or {}).values():
-        for _off,_size,name in entries:
-            if not name.upper().endswith('_SCR.ARC'): continue
-            role=_scr_role(name)
-            if not role: continue
-            track=_scr_track(name)
-            stem=name.upper().replace('_SCR.ARC','')
-            if stem.startswith('NASCAR'):stem=stem[6:]
-            for tail in ('PLAYER','AI'):
-                if stem.endswith(tail):stem=stem[:-len(tail)]
-            aliases.setdefault(track,set()).update({_track_norm(track),_track_norm(stem)})
-    return {k:{a for a in v if len(a)>=4} for k,v in aliases.items()}
-
-def _track_category(name):
-    u=name.upper()
-    if u.endswith('_SCR.ARC') or any(k in u for k in ('PHYS','CHASSIS','TIRE','TYRE','AERO')): return 'Physics / Vehicle Config'
-    if any(k in u for k in ('AICONFIG','AI_','_AI','RACINGLINE','RACE_LINE')): return 'AI / Racing Line'
-    if any(k in u for k in ('CAMERA','CAM_','REPLAY')): return 'Cameras'
-    if any(k in u for k in ('TRACKCARD','TRACKDETAIL','CALENDAR_TRACK','TRACKSELECT','MINIMAP','MAPIMAGE','LOADING')): return 'UI / Track Images'
-    if any(k in u for k in ('FSB','SOUND','AUDIO','AMBIENT')): return 'Audio / Ambience'
-    if any(k in u for k in ('RACEDATA','EVENT','SCHEDULE','RACESETTING')): return 'Race Metadata'
-    if any(k in u for k in ('WORLD','MESH','MODEL','GEOM','COLLISION','BARRIER','WALL','TRACK')): return 'World / Geometry'
-    if any(k in u for k in ('TEXTURE','TEX','DDS','MATERIAL','BILLBOARD','SPONSOR')): return 'Textures / Materials'
-    return 'Unknown / Other'
-
-def _track_stamp(reg):
-    out=[]
-    for k,v in sorted(reg.items(),key=lambda x:int(x[0])):
-        st=os.stat(v['cdf']); out.append([str(k),os.path.realpath(v['cdf']),st.st_size,st.st_mtime_ns])
-    return out
-
-def _track_cache_path(): return os.path.join(_profile_dir(),'track_files_cache_v1.json')
-
-def _track_inventory_build(reg,stamp):
-    entries_by_archive={}
-    for arcid,r in sorted(reg.items(),key=lambda x:int(x[0])):
-        try:entries_by_archive[str(arcid)]=_cdf_entries_cached(r['cdf'])
-        except Exception:entries_by_archive[str(arcid)]=[]
-    aliases=_track_aliases(entries_by_archive); alias_pairs=[]
-    for track,als in aliases.items():
-        for alias in als:alias_pairs.append((alias,track))
-    alias_pairs.sort(key=lambda x:len(x[0]),reverse=True)
-    rows=[]
-    for arcid,entries in entries_by_archive.items():
-        for off,size,name in entries:
-            n=_track_norm(name); matched={track for alias,track in alias_pairs if alias in n}
-            generic=any(k in name.upper() for k in ('TRACK','RACEWAY','SPEEDWAY','CIRCUIT','ROADCOURSE'))
-            if not matched and not generic: continue
-            if not matched: matched={'Shared / Unmapped'}
-            cat=_track_category(name)
-            for track in sorted(matched):
-                rows.append(dict(track=track,archive=str(arcid),name=name,offset=off,size=size,category=cat,
-                                 extension=os.path.splitext(name)[1].upper() or '(none)',
-                                 confidence='likely' if track!='Shared / Unmapped' else 'unknown'))
-    rows.sort(key=lambda x:(x['track'],x['category'],x['name'],int(x['archive'])))
-    try:
-        os.makedirs(os.path.dirname(_track_cache_path()),exist_ok=True)
-        tmp=_track_cache_path()+'.tmp'
-        with open(tmp,'w',encoding='utf-8') as f:json.dump(dict(stamp=stamp,rows=rows),f,separators=(',',':'))
-        os.replace(tmp,_track_cache_path())
-    except Exception:pass
-    return rows
-
-def _track_inventory(force=False):
-    import time
-    g,reg=registry()
-    if not g: raise RuntimeError('game folder not found')
-    stamp=_track_stamp(reg)
-    if not force and _TRACK_CACHE.get('stamp')==stamp:return _TRACK_CACHE['rows']
-    lock=_TRACK_LOCK
-    if lock:lock.acquire()
-    try:
-        if not force and _TRACK_CACHE.get('stamp')==stamp:return _TRACK_CACHE['rows']
-        if not force:
-            try:
-                with open(_track_cache_path(),'r',encoding='utf-8') as f:disk=json.load(f)
-                if disk.get('stamp')==stamp and isinstance(disk.get('rows'),list):
-                    _TRACK_CACHE.update(stamp=stamp,rows=disk['rows'],cache_hit='disk',build_ms=0)
-                    return _TRACK_CACHE['rows']
-            except Exception:pass
-        started=time.perf_counter();rows=_track_inventory_build(reg,stamp)
-        _TRACK_CACHE.update(stamp=stamp,rows=rows,cache_hit='built',build_ms=round((time.perf_counter()-started)*1000))
-        return rows
-    finally:
-        if lock:lock.release()
-
-def _track_filter(q):
-    rows=_track_inventory(); track=(q.get('track') or 'all'); cat=(q.get('category') or 'all'); text=(q.get('q') or '').lower()
-    return [r for r in rows if (track=='all' or r['track']==track) and (cat=='all' or r['category']==cat)
-            and (not text or text in (r['name']+' '+r['category']+' '+r['track']+' ARCHIVE'+r['archive']).lower())]
 
 @app.route('/api/tracks/files',methods=['POST'])
 def track_files():
     try:
-        q=request.get_json(silent=True) or {}; allrows=_track_inventory(force=bool(q.get('force'))); rows=_track_filter(q)
-        page=max(0,int(q.get('page',0))); per=max(1,min(500,int(q.get('per',200))))
-        tracks=sorted({r['track'] for r in allrows},key=lambda x:(x=='Shared / Unmapped',x))
-        cats=sorted({r['category'] for r in allrows})
-        from collections import Counter
-        counts=dict(Counter(r['track'] for r in allrows))
-        return jsonify(dict(ok=True,total=len(rows),page=page,per=per,rows=rows[page*per:(page+1)*per],
-                            tracks=tracks,categories=cats,track_counts=counts,read_only=True,
-                            cache=_TRACK_CACHE.get('cache_hit','memory'),build_ms=_TRACK_CACHE.get('build_ms',0)))
-    except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
+        q=request.get_json(silent=True) or {}
+        inventory=_shared_track_inventory()
+        summary=inventory.summary()
+        rows=inventory.filter(
+            track=q.get('track') or 'all',
+            category=q.get('category') or 'all',
+            query=q.get('q') or '',
+        )
+        page=max(0,int(q.get('page',0)));per=max(1,min(500,int(q.get('per',200))))
+        return jsonify(dict(
+            ok=True,total=len(rows),page=page,per=per,
+            rows=rows[page*per:(page+1)*per],
+            tracks=summary['tracks'],categories=summary['categories'],
+            track_counts=summary['track_counts'],read_only=True,cache='shared',
+        ))
+    except Exception as ex:
+        return jsonify(dict(ok=False,error=str(ex))),400
+
 
 @app.route('/api/tracks/compare',methods=['POST'])
 def track_compare():
     try:
-        q=request.get_json(force=True); a=q.get('a'); b=q.get('b')
-        if not a or not b or a==b: raise ValueError('choose two different tracks')
-        rows=_track_inventory(); aliases=_track_aliases()
-        def patterns(track):
-            out={}
-            for r in rows:
-                if r['track']!=track: continue
-                p=_track_norm(r['name'])
-                for al in aliases.get(track,()): p=p.replace(al,'TRACK')
-                out.setdefault((r['category'],p),[]).append(r)
-            return out
-        pa,pb=patterns(a),patterns(b); shared=sorted(set(pa)&set(pb)); onlya=sorted(set(pa)-set(pb)); onlyb=sorted(set(pb)-set(pa))
-        def pub(keys,src):return [dict(category=k[0],pattern=k[1],files=src[k]) for k in keys]
-        return jsonify(dict(ok=True,a=a,b=b,shared=pub(shared,pa),only_a=pub(onlya,pa),only_b=pub(onlyb,pb),
-                            summary=dict(shared=len(shared),only_a=len(onlya),only_b=len(onlyb))))
-    except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
+        q=request.get_json(force=True)
+        return jsonify(dict(ok=True,**_shared_track_inventory().compare(q.get('a'),q.get('b'))))
+    except Exception as ex:
+        return jsonify(dict(ok=False,error=str(ex))),400
+
 
 @app.route('/api/tracks/report')
 def track_report():
     try:
-        import zipfile,datetime
-        track=request.args.get('track','all'); rows=_track_filter(dict(track=track,category='all',q=''))
-        b=io.BytesIO()
-        with zipfile.ZipFile(b,'w',zipfile.ZIP_DEFLATED) as z:
-            out=io.StringIO(); w=_csv.DictWriter(out,fieldnames=['track','archive','name','offset','size','category','extension','confidence']);w.writeheader();w.writerows(rows)
-            z.writestr('track_files.csv',out.getvalue().encode('utf-8-sig'))
-            z.writestr('SUMMARY.txt',(f'NASCAR 15 Modding App v{APP_VERSION} Track Files Report\nTrack: {track}\nEntries: {len(rows)}\nCreated: {datetime.datetime.now().isoformat()}\n\nRead-only inventory. Classification is heuristic until verified in game.\n').encode())
-        b.seek(0); safe=re.sub(r'[^A-Za-z0-9_.-]+','_',track)
-        return send_file(b,mimetype='application/zip',as_attachment=True,download_name=f'nascar15_track_files_{safe}.zip')
-    except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
+        track=request.args.get('track','all')
+        payload=_shared_track_inventory().report_bytes(track)
+        safe=re.sub(r'[^A-Za-z0-9_.-]+','_',track)
+        return send_file(io.BytesIO(payload),mimetype='application/zip',as_attachment=True,
+                         download_name=f'nascar_track_files_{safe}.zip')
+    except Exception as ex:
+        return jsonify(dict(ok=False,error=str(ex))),400
+
 
 @app.route('/api/tracks/export')
 def track_export():
+    temp_path=None
     try:
-        import zipfile
         track=request.args.get('track')
-        if not track or track=='all' or track=='Shared / Unmapped': raise ValueError('choose one mapped track')
-        rows=_track_filter(dict(track=track,category='all',q='')); g,reg=registry(); total=sum(int(r['size']) for r in rows)
-        if total>512*1024*1024: raise ValueError('selected track exceeds the 512 MB safety limit; use the inventory report first')
-        b=tempfile.SpooledTemporaryFile(max_size=32*1024*1024,mode='w+b'); manifest=[]
-        handles={}
-        try:
-            with zipfile.ZipFile(b,'w',zipfile.ZIP_STORED) as z:
-                for i,r in enumerate(rows):
-                    fh=handles.setdefault(r['archive'],open(reg[r['archive']]['ar'],'rb')); fh.seek(r['offset']); data=fh.read(r['size'])
-                    if len(data)!=r['size']: raise RuntimeError('short read: '+r['name'])
-                    clean=re.sub(r'[^A-Za-z0-9_.-]+','_',r['name'])
-                    z.writestr(f'ARCHIVE{r["archive"]}/{i:04d}_{clean}',data); manifest.append(r)
-                z.writestr('manifest.json',json.dumps(dict(track=track,count=len(rows),files=manifest),indent=2))
-        finally:
-            for fh in handles.values(): fh.close()
-        b.seek(0); safe=re.sub(r'[^A-Za-z0-9_.-]+','_',track)
-        return send_file(b,mimetype='application/zip',as_attachment=True,download_name=f'nascar15_{safe}_track_files.zip')
-    except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
+        fd,temp_path=tempfile.mkstemp(prefix='nascar_track_export_',suffix='.zip')
+        os.close(fd)
+        result=_shared_track_inventory().export_track(track,temp_path)
+        @after_this_request
+        def cleanup(response):
+            try:os.remove(temp_path)
+            except OSError:pass
+            return response
+        safe=re.sub(r'[^A-Za-z0-9_.-]+','_',track)
+        return send_file(result['path'],mimetype='application/zip',as_attachment=True,
+                         download_name=f'nascar_{safe}_track_files.zip')
+    except Exception as ex:
+        if temp_path:
+            try:os.remove(temp_path)
+            except OSError:pass
+        return jsonify(dict(ok=False,error=str(ex))),400
+
 
 # ==================== end v0.9.21 SCHEDULE / TRACK FILES ====================
 
-# ==================== v0.9.21 COMPLETE SEASON PACKS / PRESETS / CHECKUP ====================
-PACK_FORMAT = 'nascar15-modding-pack'
-PACK_FORMAT_ALIASES = {PACK_FORMAT, 'nascar15-gridpack'}  # old v2 packs remain importable
-PACK_VERSION = 2
-PACK_CATEGORIES = (
-    'schemes','names','ratings','menus','ui','ui_text','audio',
-    'race','ai_track','ai_global','scr','presets','pit_log'
-)
-
-def _version_tuple(value):
-    nums=[]
-    for part in re.findall(r'\d+',str(value))[:4]:
-        try: nums.append(int(part))
-        except Exception: nums.append(0)
-    return tuple(nums+[0]*(4-len(nums)))
-
-def _pack_json_bytes(obj):
-    return json.dumps(obj,indent=2,ensure_ascii=False).encode('utf-8')
-
-def _pack_safe_member(name):
-    """Reject absolute/traversal ZIP paths and normalize separators."""
-    name=str(name or '').replace('\\','/').lstrip('/')
-    parts=[p for p in name.split('/') if p not in ('','.')]
-    if any(p=='..' for p in parts):
-        raise ValueError('pack contains an unsafe path')
-    return '/'.join(parts)
-
-def _pack_read_json(z,name,default=None):
-    try:
-        raw=z.read(name)
-    except KeyError:
-        return default
-    if len(raw)>8*1024*1024:
-        raise ValueError(f'{name} is unexpectedly large')
-    return json.loads(raw.decode('utf-8-sig'))
-
-def _pack_stock_archive0():
-    try:
-        p=baseline_archive('0')
-        if p: return p,'baseline'
-    except Exception:
-        pass
-    try:
-        _g,reg=registry(); p=reg['0']['bak']
-        if os.path.exists(p): return p,'backup'
-    except Exception:
-        pass
-    return None,None
-
-def _pack_pyc_changes(pyc_file,class_name,fields):
-    """Return only live fields that differ from the best clean reference."""
-    if not mapper_ready(): return [],'mapper unavailable'
-    stock,label=_pack_stock_archive0()
-    if not stock: return [],'no clean original game copy or previous backup'
-    live_rows=mapper_records(pyc_file,class_name,fields)
-    stock_rows=mapper_records(pyc_file,class_name,fields,archive=stock)
-    sm={str(r.get('uid')):r for r in stock_rows}
-    out=[]
-    for row in live_rows:
-        uid=str(row.get('uid')); base=sm.get(uid)
-        if not base: continue
-        for field in fields:
-            cur=row.get(field); old=base.get(field)
-            if cur is None or old is None: continue
-            if class_name in ('AIRACINGTRACKCONFIG_c','AIRACINGGLOBALCONFIG_c'):
-                allowed=AI_EDITABLE_BY_CLASS.get(class_name,set())
-                if field not in allowed or not _direct_scalar(cur):
-                    continue
-            if not _num_eq(cur,old) and str(cur)!=str(old):
-                out.append(dict(uid=uid,field=field,value=cur,stock=old))
-    return out,label
-
-def _pack_scr_changes():
-    stock,stock_cdf,label=_scr_stock_source()
-    if not stock: return [],'no clean original game copy or previous backup'
-    live=_scr_numeric_inventory()
-    base=_scr_numeric_inventory(archive_override=stock,archive_id='0',cdf_override=stock_cdf)
-    bm={_scr_row_ident(r):r for r in base}
-    out=[]
-    for row in live:
-        b=bm.get(_scr_row_ident(row))
-        if not b or row['value']==b['value']: continue
-        out.append(dict(arc=str(row['arc']),name=row['name'],key=row['key'],
-                        occurrence=int(row['occurrence']),value=row['value'],stock=b['value'],
-                        track=row['track'],role=row['role'],context=row['context']))
-    return out,label
-
-def _pack_collect_ui_text(z):
-    """Store exact modified TEXT table indexes, not complete copyrighted tables."""
-    try:rows,_files,scan_errors=_ui_text_scan()
-    except Exception as ex:return [],[f'UI text: {ex}']
-    meta=[]
-    for r in rows:
-        if not r.get('modified'):continue
-        meta.append(dict(file=r['file'],index=int(r['index']),text=r['current'],
-                         stock=r.get('stock'),category=r.get('category'),screen=r.get('screen'),
-                         format_tokens=r.get('tokens') or []))
-    if meta:z.writestr('ui_text/strings.json',_pack_json_bytes(meta))
-    return meta,[f'UI text scan: {x}' for x in scan_errors]
 
 
-def _pack_collect_ui(z):
-    try: rows=_ui_index()
-    except Exception: return [],[]
-    _g,reg=registry(); states=_ui_modified_states(rows,reg)
-    meta=[]; errors=[]; index=0
-    for row in rows:
-        ident=(str(row['archive']),row['container'],row['entry'])
-        if not states.get(ident): continue
-        try:
-            arc,e,_,_=_ui_load_entry(row['archive'],row['container'],row['entry'],row.get('w'),row.get('h'))
-            raw=bytes(arc[e['payload_abs']:e['payload_abs']+e['payload_size']])
-            member=f'ui/raw/{index:05d}.bin'; z.writestr(member,raw)
-            a=_confirmed_for(row)
-            meta.append(dict(archive=str(row['archive']),container=row['container'],entry=row['entry'],
-                             w=e['w'],h=e['h'],fmt=e['fmt'],payload_size=e['payload_size'],
-                             family=row.get('family',''),label=(a.get('label') if a else None),
-                             safety=_ui_safety(row,a),file=member,sha256=_hl.sha256(raw).hexdigest()))
-            index+=1
-        except Exception as ex:
-            errors.append(f"UI {row.get('container')}/{row.get('entry')}: {ex}")
-    if meta: z.writestr('ui/assets.json',_pack_json_bytes(meta))
-    return meta,errors
-
-def _pack_collect_audio(z):
-    _g,reg=registry(); meta=[]; errors=[]; index=0
-    for arcid,v in sorted(reg.items()):
-        if not os.path.exists(v.get('bak','')): continue
-        try: entries=parse_cdfiles(v['cdf'])
-        except Exception: continue
-        for _off,_sz,name in entries:
-            if not name.upper().endswith(('.FSB','.SND')): continue
-            try:
-                vv,boff,c,flat,kind=_read_container(arcid,name)
-                backup=_audio_backup_container(vv,boff,len(c))
-                if backup is None: continue
-                for idx,s in enumerate(flat):
-                    if not _audio_sample_modified(c,backup,s): continue
-                    raw=bytes(c[s['rel']:s['rel']+s['len']])
-                    member=f'audio/raw/{index:05d}.bin';z.writestr(member,raw)
-                    meta.append(dict(archive=str(arcid),bank=name,index=idx,name=s['name'],
-                                     length=s['len'],mode=s['mode'],file=member,
-                                     sha256=_hl.sha256(raw).hexdigest()))
-                    index+=1
-            except Exception as ex:
-                errors.append(f'Audio {name}: {ex}')
-    if meta: z.writestr('audio/assets.json',_pack_json_bytes(meta))
-    return meta,errors
-
-def _pack_collect_menus(z):
-    meta=[];errors=[]
-    for key in _menu_containers():
-        try:
-            _g,reg=registry()
-            arcid,off,size,live=menu_container(reg,key,live=True)
-            a=need(reg,arcid)
-            if not os.path.exists(a['bak']): continue
-            _,_,_,bak=menu_container(reg,key,live=False)
-            ent,_=C.parse_multi_arc(live,known_dims=(128,64) if key=='numbers' else None)
-            for e in ent:
-                if e['w']<=0: continue
-                pa,ps=e['payload_abs'],e['payload_size']
-                if live[pa:pa+ps]==bak[pa:pa+ps]: continue
-                img=C.multi_read_png(live,e);b=io.BytesIO();img.save(b,'PNG')
-                member=f'menus/{key}/{e["name"]}.png';z.writestr(member,b.getvalue())
-                meta.append(dict(key=key,name=e['name'],w=e['w'],h=e['h'],file=member))
-        except Exception as ex:
-            errors.append(f'Menu {key}: {ex}')
-    if meta: z.writestr('menus/assets.json',_pack_json_bytes(meta))
-    return meta,errors
-
-def _pack_export_v2_bytes():
-    import zipfile,datetime
-    _g,reg=registry();buf=io.BytesIO();errors=[]
-    counts={k:0 for k in PACK_CATEGORIES};sources={}
-    with zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED) as z:
-        # Schemes are staged source art and are safe to package without archives.
-        scheme_names=[]
-        if os.path.isdir(SCHEMES):
-            for fn in sorted(os.listdir(SCHEMES)):
-                fp=os.path.join(SCHEMES,fn)
-                if not os.path.isfile(fp): continue
-                member='schemes/'+os.path.basename(fn);z.write(fp,member);scheme_names.append(member)
-        counts['schemes']=sum(1 for n in scheme_names if n.endswith('.png') and '.layer.' not in n and '.thumb.' not in n)
-
-        cfg=load_cfg();names=dict(renames=cfg.get('renames',{}),
-            handles={k:str(v).rstrip('_ ') for k,v in (cfg.get('handles',{}) or {}).items()})
-        z.writestr('names.json',_pack_json_bytes(names));counts['names']=len(names['renames'])+len(names['handles'])
-
-        ratings=[]
-        try:
-            ratings=[dict(profile_id=d['profile_id'],stats=d['stats']) for d in read_stats(reg)]
-            z.writestr('ratings.json',_pack_json_bytes(ratings));counts['ratings']=sum(len(r['stats']) for r in ratings)
-        except Exception as ex: errors.append('Ratings: '+str(ex))
-
-        menus,errs=_pack_collect_menus(z);errors+=errs;counts['menus']=len(menus)
-        ui,errs=_pack_collect_ui(z);errors+=errs;counts['ui']=len(ui)
-        ui_text,errs=_pack_collect_ui_text(z);errors+=errs;counts['ui_text']=len(ui_text)
-        audio,errs=_pack_collect_audio(z);errors+=errs;counts['audio']=len(audio)
-
-        try:
-            race,label=_pack_pyc_changes(DBFILE,'RACEDATA_c',['RaceLaps']);sources['gameplay_stock']=label
-            z.writestr('gameplay/race.json',_pack_json_bytes(race));counts['race']=len(race)
-            # v0.9.26: package the complete fixed-36 slot definition. Target
-            # calendar records remain local to the receiving installation;
-            # each slot carries the selected existing event and its lap count.
-            live_schedule,_=_schedule_read('live'); stock_schedule=None; schedule_source=None
-            for _src in ('baseline','backup'):
-                try: stock_schedule,_=_schedule_read(_src); schedule_source=_src; break
-                except Exception: pass
-            if stock_schedule:
-                stock_by_event={(int(r['event_uid']),str(r['event'])):r for r in stock_schedule if r.get('event_uid') is not None}
-                stock_by_order={int(r['order']):r for r in stock_schedule}
-                slots=[];schedule_diff=0
-                for row in sorted(live_schedule,key=lambda r:int(r['order'])):
-                    order=int(row['order']);base=stock_by_order.get(order,{})
-                    ident=(int(row['event_uid']),str(row['event']))
-                    source=stock_by_event.get(ident)
-                    slots.append(dict(slot=order,target_uid=int(row['uid']),
-                                      source_uid=(int(source['uid']) if source else None),
-                                      event_uid=int(row['event_uid']),event_name=str(row['event']),
-                                      laps=int(row['laps']),track=str(row.get('track',''))))
-                    if (row.get('event_uid')!=base.get('event_uid') or str(row.get('event'))!=str(base.get('event')) or int(row.get('laps',0))!=int(base.get('laps',0))):
-                        schedule_diff+=1
-                if schedule_diff:
-                    z.writestr('gameplay/schedule.json',_pack_json_bytes(dict(
-                        format='nascar15-modding-app-custom-schedule',version=2,slots=slots)))
-                    counts['race']+=schedule_diff; sources['schedule_stock']=schedule_source
-        except Exception as ex: errors.append('Race settings / schedule: '+str(ex));race=[]
-        try:
-            tr,label=_pack_pyc_changes(AICFG,'AIRACINGTRACKCONFIG_c',AI_TRACK_FIELDS);sources['ai_track_stock']=label
-            z.writestr('gameplay/ai_track.json',_pack_json_bytes(tr));counts['ai_track']=len(tr)
-        except Exception as ex: errors.append('Track AI: '+str(ex));tr=[]
-        try:
-            gl,label=_pack_pyc_changes(AICFG,'AIRACINGGLOBALCONFIG_c',AI_GLOBAL_FIELDS);sources['ai_global_stock']=label
-            z.writestr('gameplay/ai_global.json',_pack_json_bytes(gl));counts['ai_global']=len(gl)
-        except Exception as ex: errors.append('Global AI: '+str(ex));gl=[]
-        try:
-            scr,label=_pack_scr_changes();sources['scr_stock']=label
-            z.writestr('gameplay/scr.json',_pack_json_bytes(scr));counts['scr']=len(scr)
-        except Exception as ex: errors.append('Track physics: '+str(ex));scr=[]
-
-        presets=cfg.get('custom_ai_presets',[]);pitlog=cfg.get('pit_strategy_test_log',[])
-        z.writestr('presets/custom.json',_pack_json_bytes(presets));counts['presets']=len(presets)
-        z.writestr('presets/pit_test_log.json',_pack_json_bytes(pitlog));counts['pit_log']=len(pitlog)
-
-        manifest=dict(format=PACK_FORMAT,version=PACK_VERSION,app_name=APP_NAME,app_version=APP_VERSION,
-                      minimum_app_version='0.9.26',created=datetime.datetime.now().isoformat(),
-                      counts=counts,categories=list(PACK_CATEGORIES),sources=sources,
-                      warnings=errors,
-                      note='Paint schemes are saved in the app after import and can be installed from Paint Schemes. Graphics, audio, and text changes are checked before installation.')
-        z.writestr('manifest.json',_pack_json_bytes(manifest))
-        z.writestr('README.txt',
-            'NASCAR 15 Modding App mod pack v2.\n'
-            'Preview this file in NASCAR 15 Modding App v0.9.26 or newer before importing.\n')
-    buf.seek(0);return buf,counts,errors
 
 @app.route('/api/pack/v2/export')
 def pack_v2_export():
     try:
-        buf,_counts,_errors=_pack_export_v2_bytes()
-        return send_file(buf,mimetype='application/zip',as_attachment=True,
-                         download_name='nascar15_complete_mod_pack.gridpack')
+        payload, _report = _shared_season_pack_editor().export_bytes()
+        return send_file(
+            io.BytesIO(payload), mimetype='application/zip', as_attachment=True,
+            download_name='nascar_shared_season_pack.gridpack',
+        )
     except Exception as ex:
-        return jsonify(dict(ok=False,error=str(ex))),400
-
-def _pack_inspect_zip(z):
-    infos=z.infolist()
-    if len(infos)>20000: raise ValueError('pack contains too many files')
-    total=sum(i.file_size for i in infos)
-    if total>2*1024*1024*1024: raise ValueError('uncompressed pack is larger than 2 GB')
-    for i in infos: _pack_safe_member(i.filename)
-    manifest=_pack_read_json(z,'manifest.json',{}) or {}
-    legacy=manifest.get('format')=='gridpack' and int(manifest.get('version',1))==1
-    if legacy:
-        names=_pack_read_json(z,'names.json',{}) or {}
-        ratings=_pack_read_json(z,'stats.json',[]) or []
-        counts=dict(
-            schemes=sum(1 for n in z.namelist() if n.startswith('schemes/') and n.lower().endswith('.png') and '.layer.' not in n.lower() and '.thumb.' not in n.lower()),
-            names=len(names.get('renames') or {})+len(names.get('handles') or {}),
-            ratings=sum(len(x.get('stats') or {}) for x in ratings if isinstance(x,dict)),
-            menus=sum(1 for n in z.namelist() if n.startswith('menus/') and n.lower().endswith('.png')))
-        return dict(manifest=manifest,legacy=True,compatible=True,counts=counts,
-                    categories=['schemes','names','ratings','menus'],warnings=[
-                        'Older pack format detected. Supported categories will be converted to the current format before import.',
-                        'Older packs do not contain newer gameplay, full graphics, audio, text, or preset categories.'])
-    if manifest.get('format') not in PACK_FORMAT_ALIASES or int(manifest.get('version',0))!=PACK_VERSION:
-        raise ValueError('not a supported NASCAR 15 Modding App pack')
-    minimum=manifest.get('minimum_app_version','0')
-    compatible=_version_tuple(APP_VERSION)>=_version_tuple(minimum)
-    counts={str(k):int(v or 0) for k,v in (manifest.get('counts') or {}).items()}
-    cats=[c for c in manifest.get('categories',PACK_CATEGORIES) if c in PACK_CATEGORIES]
-    return dict(manifest=manifest,legacy=False,compatible=compatible,counts=counts,
-                categories=cats,warnings=list(manifest.get('warnings') or []))
-
-def _pack_schedule_desired_from_manifest(schedule):
-    """Normalize v2 custom slots (and legacy v1 order packs) to live targets."""
-    schedule=schedule or {}
-    current,_=_schedule_read('live')
-    targets={int(r['order']):r for r in current}
-    slots=schedule.get('slots') or []
-    if slots:
-        if not isinstance(slots,list) or len(slots)!=36:
-            raise ValueError('Schedule: custom pack must contain exactly 36 slots')
-        by_slot={int(x.get('slot',i+1)):x for i,x in enumerate(slots)}
-        if sorted(by_slot)!=list(range(1,37)):
-            raise ValueError('Schedule: slot numbers must be exactly 1 through 36')
-        desired=[]
-        for i in range(1,37):
-            item=by_slot[i];target=targets[i]
-            desired.append(dict(slot=i,target_uid=int(target['uid']),
-                                source_uid=(None if item.get('source_uid') is None else int(item.get('source_uid'))),
-                                event_uid=int(item['event_uid']),event_name=str(item['event_name']),
-                                laps=int(item['laps'])))
-        return _schedule_desired(dict(slots=desired))
-    order=schedule.get('order') or []
-    if not order:return []
-    if len(order)!=36 or len(set(int(x) for x in order))!=36:
-        raise ValueError('Schedule: legacy pack order is not 36 unique UIDs')
-    catalog=[]
-    for source in ('backup','baseline','live'):
-        try:catalog.extend(_schedule_read(source,verify_hash=False)[0])
-        except Exception:pass
-    by_uid={int(r['uid']):r for r in catalog}
-    desired=[]
-    for i,uid in enumerate(order,1):
-        source=by_uid.get(int(uid))
-        if not source:raise ValueError(f'Schedule: legacy source UID {uid} was not found')
-        target=targets[i]
-        desired.append(dict(slot=i,target_uid=int(target['uid']),source_uid=int(uid),
-                            event_uid=int(source['event_uid']),event_name=str(source['event']),
-                            laps=int(source['laps'])))
-    return _schedule_desired(dict(slots=desired))
+        return jsonify(dict(ok=False, error=str(ex))), 400
 
 
-def _pack_schedule_difference(desired):
-    if not desired:return (0,0)
-    current,_=_schedule_read('live');by_order={int(r['order']):r for r in current}
-    diff=0
-    for item in desired:
-        row=by_order[int(item['slot'])]
-        if (int(row.get('event_uid'))!=int(item['event_uid']) or str(row.get('event'))!=str(item['event_name']) or int(row.get('laps'))!=int(item['laps'])):
-            diff+=1
-    return diff,len(desired)-diff
 
 
-def _pack_difference_summary(z,info):
-    """Best-effort current-vs-pack comparison used by the import preview."""
-    counts=info.get('counts',{});out={}
-    def put(cat,different,same=0,unavailable=None):
-        out[cat]=dict(items=int(counts.get(cat,different+same) or 0),different=int(different),
-                      same=int(same),unavailable=unavailable)
-    # Staged source files.
-    diff=same=0
-    for name in z.namelist():
-        n=_pack_safe_member(name)
-        if not n.startswith('schemes/') or n.endswith('/'):continue
-        local=os.path.join(SCHEMES,os.path.basename(n));raw=z.read(name)
-        if os.path.exists(local) and open(local,'rb').read()==raw:same+=1
-        else:diff+=1
-    put('schemes',diff,same)
-    cfg=load_cfg()
-    try:
-        data=_pack_read_json(z,'names.json',{}) or {};diff=same=0
-        for key,curmap in (('renames',cfg.get('renames',{})),('handles',cfg.get('handles',{}))):
-            for old,new in (data.get(key) or {}).items():
-                if str(curmap.get(old,old))==str(new):same+=1
-                else:diff+=1
-        put('names',diff,same)
-    except Exception as ex:put('names',counts.get('names',0),0,str(ex))
-    try:
-        _g,reg=registry();current={str(x['profile_id']):x['stats'] for x in read_stats(reg)};diff=same=0
-        for row in _pack_read_json(z,'ratings.json',[]) or []:
-            cur=current.get(str(row.get('profile_id')),{})
-            for field,value in (row.get('stats') or {}).items():
-                if str(cur.get(field))==str(value):same+=1
-                else:diff+=1
-        put('ratings',diff,same)
-    except Exception as ex:put('ratings',counts.get('ratings',0),0,str(ex))
-    try:
-        _g,reg=registry();diff=same=0
-        for item in _pack_read_json(z,'menus/assets.json',[]) or []:
-            arcid,off,size,arc=menu_container(reg,item['key']);entries,_=C.parse_multi_arc(arc,known_dims=(128,64) if item['key']=='numbers' else None)
-            e=next((x for x in entries if x['name']==item['name']),None)
-            if not e:diff+=1;continue
-            a=C.multi_read_png(arc,e).convert('RGBA');b=Image.open(io.BytesIO(z.read(_pack_safe_member(item['file'])))).convert('RGBA').resize(a.size)
-            if a.tobytes()==b.tobytes():same+=1
-            else:diff+=1
-        put('menus',diff,same)
-    except Exception as ex:put('menus',counts.get('menus',0),0,str(ex))
-    try:
-        diff=same=0
-        for item in _pack_read_json(z,'ui/assets.json',[]) or []:
-            raw=z.read(_pack_safe_member(item['file']));arc,e,_,_=_ui_load_entry(item['archive'],item['container'],item['entry'],item.get('w'),item.get('h'))
-            cur=bytes(arc[e['payload_abs']:e['payload_abs']+e['payload_size']])
-            if cur==raw:same+=1
-            else:diff+=1
-        put('ui',diff,same)
-    except Exception as ex:put('ui',counts.get('ui',0),0,str(ex))
-    try:
-        current={(r['file'],int(r['index'])):r['current'] for r in _ui_text_scan()[0]};diff=same=0
-        for item in _pack_read_json(z,'ui_text/strings.json',[]) or []:
-            if current.get((item.get('file'),int(item.get('index',-1))))==str(item.get('text','')):same+=1
-            else:diff+=1
-        put('ui_text',diff,same)
-    except Exception as ex:put('ui_text',counts.get('ui_text',0),0,str(ex))
-    try:
-        diff=same=0
-        for item in _pack_read_json(z,'audio/assets.json',[]) or []:
-            _v,_boff,c,flat,_kind=_read_container(str(item['archive']),item['bank']);idx=int(item['index']);sample=flat[idx]
-            cur=bytes(c[sample['rel']:sample['rel']+sample['len']]);raw=z.read(_pack_safe_member(item['file']))
-            if cur==raw:same+=1
-            else:diff+=1
-        put('audio',diff,same)
-    except Exception as ex:put('audio',counts.get('audio',0),0,str(ex))
-    # Mapper-backed categories: one live scan per class.
-    for cat,file_name,class_name,fields,path in (
-        ('race',DBFILE,'RACEDATA_c',['RaceLaps'],'gameplay/race.json'),
-        ('ai_track',AICFG,'AIRACINGTRACKCONFIG_c',AI_TRACK_FIELDS,'gameplay/ai_track.json'),
-        ('ai_global',AICFG,'AIRACINGGLOBALCONFIG_c',AI_GLOBAL_FIELDS,'gameplay/ai_global.json')):
-        try:
-            rows=mapper_records(file_name,class_name,fields);by={str(r.get('uid')):r for r in rows};diff=same=0
-            for c in _pack_read_json(z,path,[]) or []:
-                cur=by.get(str(c.get('uid')),{}).get(c.get('field'))
-                if _num_eq(cur,c.get('value')) or str(cur)==str(c.get('value')):same+=1
-                else:diff+=1
-            put(cat,diff,same)
-        except Exception as ex:put(cat,counts.get(cat,0),0,str(ex))
-    # A race category can also carry the complete fixed-36 custom schedule.
-    try:
-        sched=_pack_read_json(z,'gameplay/schedule.json',{}) or {}
-        desired=_pack_schedule_desired_from_manifest(sched) if sched else []
-        if desired:
-            diff,same=_pack_schedule_difference(desired)
-            prev=out.get('race',dict(items=0,different=0,same=0,unavailable=None))
-            out['race']=dict(items=max(int(counts.get('race',0) or 0),int(prev.get('items',0))+len(desired)),
-                             different=int(prev.get('different',0))+diff,
-                             same=int(prev.get('same',0))+same,unavailable=prev.get('unavailable'))
-    except Exception as ex:
-        prev=out.get('race',dict(items=int(counts.get('race',0) or 0),different=0,same=0,unavailable=None));prev['unavailable']='Schedule comparison: '+str(ex);out['race']=prev
-    try:
-        live={_scr_row_ident(r):r['value'] for r in _scr_numeric_inventory()};diff=same=0
-        for c in _pack_read_json(z,'gameplay/scr.json',[]) or []:
-            ident=(str(c.get('arc','0')),c.get('name'),c.get('key'),int(c.get('occurrence',0)))
-            if live.get(ident)==str(c.get('value')):same+=1
-            else:diff+=1
-        put('scr',diff,same)
-    except Exception as ex:put('scr',counts.get('scr',0),0,str(ex))
-    try:
-        existing={(p.get('kind'),p.get('name')):p for p in cfg.get('custom_ai_presets',[])};diff=same=0
-        for p in _pack_read_json(z,'presets/custom.json',[]) or []:
-            if existing.get((p.get('kind'),p.get('name')))==p:same+=1
-            else:diff+=1
-        put('presets',diff,same)
-    except Exception as ex:put('presets',counts.get('presets',0),0,str(ex))
-    try:
-        ids={str(x.get('id')) for x in cfg.get('pit_strategy_test_log',[])};diff=same=0
-        for x in _pack_read_json(z,'presets/pit_test_log.json',[]) or []:
-            if str(x.get('id')) in ids:same+=1
-            else:diff+=1
-        put('pit_log',diff,same)
-    except Exception as ex:put('pit_log',counts.get('pit_log',0),0,str(ex))
-    return out
 
-@app.route('/api/pack/v2/preview',methods=['POST'])
+@app.route('/api/pack/v2/preview', methods=['POST'])
 def pack_v2_preview():
-    import zipfile
-    f=request.files.get('file')
-    if not f:return jsonify(dict(ok=False,error='no pack selected')),400
+    upload = request.files.get('file')
+    if not upload:
+        return jsonify(dict(ok=False, error='no pack selected')), 400
     try:
-        with zipfile.ZipFile(f.stream) as z:
-            info=_pack_inspect_zip(z)
-            differences={} if info.get('legacy') else _pack_difference_summary(z,info)
-            migration_note=('Older pack detected. The app will convert its names, ratings, saved paints, and menu graphics to the current format before importing.' if info.get('legacy') else '')
-        return jsonify(dict(ok=True,app_version=APP_VERSION,differences=differences,migration_note=migration_note,**info))
-    except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
-
-def _pack_apply_ui_raw(z,items):
-    done=0;errors=[]
-    for item in items or []:
-        try:
-            member=_pack_safe_member(item['file']);raw=z.read(member)
-            if _hl.sha256(raw).hexdigest()!=str(item.get('sha256','')): raise ValueError('payload hash mismatch')
-            arc,e,off,size=_ui_load_entry(item['archive'],item['container'],item['entry'],item.get('w'),item.get('h'))
-            for k in ('w','h','fmt','payload_size'):
-                if str(e[k])!=str(item[k]): raise ValueError(f'{k} mismatch ({e[k]} vs {item[k]})')
-            if len(raw)!=e['payload_size']: raise ValueError('payload length mismatch')
-            old=bytes(arc[e['payload_abs']:e['payload_abs']+e['payload_size']])
-            if old==raw: continue
-            new=bytearray(arc);new[e['payload_abs']:e['payload_abs']+e['payload_size']]=raw;new=bytes(new)
-            err=_ui_only_payload_changed(arc,new,e['payload_abs'],e['payload_size'])
-            if err: raise ValueError(err)
-            C.multi_read_png(new,e)  # decode before install
-            _ui_install(item['archive'],off,size,new)
-            chk,ce,_,_=_ui_load_entry(item['archive'],item['container'],item['entry'],item.get('w'),item.get('h'))
-            if chk[ce['payload_abs']:ce['payload_abs']+ce['payload_size']]!=raw:
-                # surgical rollback
-                rollback=bytearray(chk);rollback[ce['payload_abs']:ce['payload_abs']+ce['payload_size']]=old
-                _ui_install(item['archive'],off,size,bytes(rollback));raise ValueError('readback failed; rolled back')
-            _UI_THUMB_CACHE.pop((str(item['archive']),item['container'],item['entry']),None);done+=1
-        except Exception as ex: errors.append(f"{item.get('container')}/{item.get('entry')}: {ex}")
-    return done,errors
-
-def _pack_apply_audio_raw(z,items):
-    done=0;errors=[]
-    for item in items or []:
-        try:
-            raw=z.read(_pack_safe_member(item['file']))
-            if _hl.sha256(raw).hexdigest()!=str(item.get('sha256','')): raise ValueError('payload hash mismatch')
-            v,boff,c,flat,kind=_read_container(str(item['archive']),item['bank'])
-            idx=int(item['index'])
-            if not (0<=idx<len(flat)): raise ValueError('sample index no longer exists')
-            s=flat[idx]
-            if s['name']!=item['name'] or int(s['len'])!=int(item['length']) or int(s['mode'])!=int(item['mode']):
-                raise ValueError('sample identity/spec mismatch')
-            if len(raw)!=s['len']: raise ValueError('sample slot length mismatch')
-            abs_off=boff+s['rel'];old=bytes(c[s['rel']:s['rel']+s['len']])
-            if old==raw: continue
-            ensure_backup(v['ar'],v['bak'])
-            with open(v['ar'],'r+b') as fh:
-                fh.seek(abs_off);fh.write(raw);fh.flush();os.fsync(fh.fileno())
-            try:
-                vv,b2,c2,flat2,k2=_read_container(str(item['archive']),item['bank'])
-                s2=flat2[idx]
-                if c2[s2['rel']:s2['rel']+s2['len']]!=raw: raise ValueError('readback mismatch')
-            except Exception:
-                with open(v['ar'],'r+b') as fh:
-                    fh.seek(abs_off);fh.write(old);fh.flush();os.fsync(fh.fileno())
-                raise ValueError('container validation failed; rolled back')
-            done+=1
-        except Exception as ex: errors.append(f"{item.get('bank')}/{item.get('name')}: {ex}")
-    return done,errors
-
-def _pack_apply_menus(z,items):
-    done=0;errors=[];_g,reg=registry()
-    for item in items or []:
-        try:
-            key=item['key'];name=item['name'];arcid,off,size,arc=menu_container(reg,key)
-            entries,_=C.parse_multi_arc(arc,known_dims=(128,64) if key=='numbers' else None)
-            e=next((x for x in entries if x['name']==name),None)
-            if not e: raise ValueError('entry missing')
-            img=Image.open(io.BytesIO(z.read(_pack_safe_member(item['file']))))
-            img,_=prepare_import_image(img,(e['w'],e['h']),'fit',preserve_alpha=True)
-            current=C.multi_read_png(arc,e).convert('RGBA')
-            if current.tobytes()==img.convert('RGBA').tobytes(): continue
-            a=need(reg,arcid);ensure_backup(a['ar'],a['bak'])
-            new=C.multi_write_png_validated(arc,e,img,encode_fn=encode_any,
-                                             known_dims=(128,64) if key=='numbers' else None)
-            with open(a['ar'],'r+b') as fh:
-                fh.seek(off);fh.write(new);fh.flush();os.fsync(fh.fileno())
-            done+=1
-        except Exception as ex: errors.append(f"{item.get('key')}/{item.get('name')}: {ex}")
-    if done:_clear_ui_thumb_cache()
-    return done,errors
-
-def _pack_ai_change_batches(changes,limit=100):
-    """Keep each mapper batch below its hard limit and avoid mixing UIDs."""
-    grouped={}
-    for c in changes or []:
-        grouped.setdefault(str(c.get('uid')),[]).append(c)
-    out=[]
-    for uid,rows in grouped.items():
-        for i in range(0,len(rows),limit): out.append(rows[i:i+limit])
-    return out
-
-def _pack_apply_gameplay(z,selected):
-    """Preflight all selected gameplay sections, then apply with ARCHIVE0 rollback."""
-    selected=set(selected);results={};errors=[]
-    race=_pack_read_json(z,'gameplay/race.json',[]) if 'race' in selected else []
-    schedule=_pack_read_json(z,'gameplay/schedule.json',{}) if 'race' in selected else {}
-    try:schedule_desired=_pack_schedule_desired_from_manifest(schedule) if schedule else []
-    except Exception as ex:return {},['Schedule: '+str(ex)]
-    track=_pack_read_json(z,'gameplay/ai_track.json',[]) if 'ai_track' in selected else []
-    glob=_pack_read_json(z,'gameplay/ai_global.json',[]) if 'ai_global' in selected else []
-    scr=_pack_read_json(z,'gameplay/scr.json',[]) if 'scr' in selected else []
-    # Re-imports are idempotent: remove fields that already match live values.
-    try:
-        if race:
-            rows=mapper_records(DBFILE,'RACEDATA_c',['RaceLaps']);by={str(r.get('uid')):r for r in rows}
-            race=[c for c in race if not (_num_eq(by.get(str(c.get('uid')),{}).get('RaceLaps'),c.get('value')) or str(by.get(str(c.get('uid')),{}).get('RaceLaps'))==str(c.get('value')))]
-        if schedule_desired:
-            diff,_same=_pack_schedule_difference(schedule_desired)
-            if not diff:schedule_desired=[]
-        if track:
-            rows=mapper_records(AICFG,'AIRACINGTRACKCONFIG_c',AI_TRACK_FIELDS);by={str(r.get('uid')):r for r in rows}
-            track=[c for c in track if not (_num_eq(by.get(str(c.get('uid')),{}).get(c.get('field')),c.get('value')) or str(by.get(str(c.get('uid')),{}).get(c.get('field')))==str(c.get('value')))]
-        if glob:
-            rows=mapper_records(AICFG,'AIRACINGGLOBALCONFIG_c',AI_GLOBAL_FIELDS);by={str(r.get('uid')):r for r in rows}
-            glob=[c for c in glob if not (_num_eq(by.get(str(c.get('uid')),{}).get(c.get('field')),c.get('value')) or str(by.get(str(c.get('uid')),{}).get(c.get('field')))==str(c.get('value')))]
-        if scr:
-            live={_scr_row_ident(r):r['value'] for r in _scr_numeric_inventory()}
-            scr=[c for c in scr if live.get((str(c.get('arc','0')),c.get('name'),c.get('key'),int(c.get('occurrence',0))))!=str(c.get('value'))]
+        return jsonify(_shared_season_pack_editor().inspect_bytes(upload.read()))
     except Exception as ex:
-        return {},['Gameplay comparison failed: '+str(ex)]
-    # Full preflight before writing anything.
-    if schedule_desired:
-        try:_schedule_patch(schedule_desired,True)
-        except Exception as ex:errors.append('Schedule: '+str(ex))
-    for c in race:
-        r=mapper_set_value(DBFILE,'RACEDATA_c',c['uid'],'RaceLaps',c['value'],dry_run=True)
-        if not r.get('ok'):errors.append(f"Race UID {c.get('uid')}: {r.get('error')}")
-    if track:
-        for batch in _pack_ai_change_batches(track):
-            r=mapper_set_values_batch(AICFG,'AIRACINGTRACKCONFIG_c',batch,dry_run=True)
-            if not r.get('ok'):errors.append('Track AI: '+str(r.get('error')));break
-    if glob:
-        for batch in _pack_ai_change_batches(glob):
-            r=mapper_set_values_batch(AICFG,'AIRACINGGLOBALCONFIG_c',batch,dry_run=True)
-            if not r.get('ok'):errors.append('Global AI: '+str(r.get('error')));break
-    if scr:
-        groups={}
-        for c in scr:groups.setdefault(str(c.get('arc','0')),[]).append(c)
-        for arcid,changes in groups.items():
-            r=scr_key_batch(changes,dry_run=True)
-            if not r.get('ok'):errors.append(f'ARCHIVE{arcid} track physics: '+str(r.get('error')))
-    if errors:return results,errors
+        return jsonify(dict(ok=False, error=str(ex))), 400
 
-    _g,reg=registry();snapshots={}
-    affected_archives={'0'} if (race or schedule_desired or track or glob) else set()
-    affected_archives.update(str(c.get('arc','0')) for c in scr)
-    for arcid in affected_archives:
-        if arcid not in reg: continue
-        live_path=reg[arcid]['ar'];cdf_path=reg[arcid]['cdf']
-        snap=os.path.join(_tf.gettempdir(),f'n15mod_pack_gameplay_{os.getpid()}_{arcid}.AR')
-        shutil.copyfile(live_path,snap);snapshots[arcid]=(snap,live_path,cdf_path,open(cdf_path,'rb').read())
-    try:
-        schedule_count=0
-        if schedule_desired:
-            r=_schedule_patch(schedule_desired,False)
-            if not r.get('ok'): raise RuntimeError('Schedule: '+str(r.get('error')))
-            schedule_count=int(r.get('change_count',0))
-        for c in race:
-            r=mapper_set_value(DBFILE,'RACEDATA_c',c['uid'],'RaceLaps',c['value'])
-            if not r.get('ok'):raise RuntimeError(f"Race UID {c.get('uid')}: {r.get('error')}")
-        results['race']=len(race)+schedule_count
-        if track:
-            for batch in _pack_ai_change_batches(track):
-                r=mapper_set_values_batch(AICFG,'AIRACINGTRACKCONFIG_c',batch)
-                if not r.get('ok'):raise RuntimeError('Track AI: '+str(r.get('error')))
-        results['ai_track']=len(track)
-        if glob:
-            for batch in _pack_ai_change_batches(glob):
-                r=mapper_set_values_batch(AICFG,'AIRACINGGLOBALCONFIG_c',batch)
-                if not r.get('ok'):raise RuntimeError('Global AI: '+str(r.get('error')))
-        results['ai_global']=len(glob)
-        if scr:
-            n=0
-            groups={}
-            for c in scr:groups.setdefault(str(c.get('arc','0')),[]).append(c)
-            for arcid,changes in groups.items():
-                r=scr_key_batch(changes,dry_run=False)
-                if not r.get('ok'):raise RuntimeError(f'ARCHIVE{arcid} track physics: '+str(r.get('error')))
-                n+=len(changes)
-            results['scr']=n
-        return results,[]
-    except Exception as ex:
-        # Previously the first failing restore aborted the loop, leaving the
-        # remaining archives modified with no rollback and no warning.
-        rollback_errors=[]
-        for snap,live_path,cdf_path,cdf_raw in snapshots.values():
-            try:
-                if os.path.exists(snap):shutil.copyfile(snap,live_path)
-                atomic_write_bytes(cdf_path,cdf_raw,'.pack_rollback.tmp')
-            except Exception as rb:
-                rollback_errors.append(f'{os.path.basename(live_path)}: {rb}')
-        if rollback_errors:
-            raise RollbackFailed(ex,'; '.join(rollback_errors))
-        return {},['Gameplay import rolled back: '+str(ex)]
-    finally:
-        for snap,_live_path,_cdf_path,_cdf_raw in snapshots.values():
-            try:
-                if os.path.exists(snap):os.remove(snap)
-            except OSError:pass
 
-@app.route('/api/pack/v2/import',methods=['POST'])
+
+
+
+
+
+@app.route('/api/pack/v2/import', methods=['POST'])
 def pack_v2_import():
-    import zipfile
-    f=request.files.get('file')
-    if not f:return jsonify(dict(ok=False,error='no pack selected')),400
-    try:selected=json.loads(request.form.get('categories','[]'))
-    except Exception:selected=[]
+    upload = request.files.get('file')
+    if not upload:
+        return jsonify(dict(ok=False, error='no pack selected')), 400
     try:
-        with zipfile.ZipFile(f.stream) as z:
-            info=_pack_inspect_zip(z)
-            if info['legacy']:
-                selected=[c for c in (selected or info['categories']) if c in info['categories']]
-                applied,errors,migrations=_pack_apply_legacy_v1(z,selected)
-                return jsonify(dict(ok=True,applied=applied,errors=errors,migrations=migrations,
-                    migrated_from=dict(format='gridpack',version=1,app_version=info.get('manifest',{}).get('app_version')),
-                    note=('Older Mod Pack converted to the current format before import. '
-                          'Saved paints can be installed from Paint Schemes.'
-                          +((' Converted: '+'; '.join(migrations[:12])+('.' if migrations else '')) if migrations else ''))))
-            if not info['compatible']:
-                return jsonify(dict(ok=False,error='This pack requires NASCAR 15 Modding App '+str(info['manifest'].get('minimum_app_version'))+' or newer.')),400
-            selected=[c for c in (selected or info['categories']) if c in info['categories']]
-            _g,reg=registry();applied={k:0 for k in PACK_CATEGORIES};errors=[]
-            if 'schemes' in selected:
-                for n in z.namelist():
-                    n2=_pack_safe_member(n)
-                    if not n2.startswith('schemes/') or n2.endswith('/'):continue
-                    base=os.path.basename(n2)
-                    if not base:continue
-                    raw=z.read(n)
-                    if len(raw)>100*1024*1024:errors.append(base+': too large');continue
-                    target=os.path.join(SCHEMES,base)
-                    if os.path.exists(target) and open(target,'rb').read()==raw: continue
-                    open(target,'wb').write(raw)
-                    if base.endswith('.png') and '.layer.' not in base and '.thumb.' not in base:applied['schemes']+=1
-            if 'names' in selected:
-                data=_pack_read_json(z,'names.json',{}) or {};cfg=load_cfg()
-                for old,new in (data.get('renames') or {}).items():
-                    if str(cfg.get('renames',{}).get(old,old))==str(new): continue
-                    try:patch_name_exp(reg,old,new);cfg.setdefault('renames',{})[old]=new;applied['names']+=1
-                    except Exception as ex:errors.append(f'Rename {old}: {ex}')
-                for old,new in (data.get('handles') or {}).items():
-                    if str(cfg.get('handles',{}).get(old,old))==str(new): continue
-                    try:_n,actual=patch_handle(reg,old,new);cfg.setdefault('handles',{})[old]=actual;applied['names']+=1
-                    except Exception as ex:errors.append(f'Handle {old}: {ex}')
-                save_cfg(cfg)
-            if 'ratings' in selected:
-                ratings=_pack_read_json(z,'ratings.json',[]) or []
-                try: current_ratings={str(x['profile_id']):x['stats'] for x in read_stats(reg)}
-                except Exception: current_ratings={}
-                for row in ratings:
-                    for st,v in (row.get('stats') or {}).items():
-                        if str(current_ratings.get(str(row.get('profile_id')),{}).get(st))==str(v): continue
-                        try:write_stat(reg,row['profile_id'],st,float(v),experimental=True);applied['ratings']+=1
-                        except Exception as ex:errors.append(f"Rating {row.get('profile_id')}/{st}: {ex}")
-            if 'menus' in selected:
-                n,e=_pack_apply_menus(z,_pack_read_json(z,'menus/assets.json',[]) or []);applied['menus']=n;errors+=e
-            if 'ui' in selected:
-                n,e=_pack_apply_ui_raw(z,_pack_read_json(z,'ui/assets.json',[]) or []);applied['ui']=n;errors+=e
-            if 'ui_text' in selected:
-                text_rows=_pack_read_json(z,'ui_text/strings.json',[]) or []
-                try:
-                    current={(r['file'],int(r['index'])):r['current'] for r in _ui_text_scan()[0]}
-                    changes=[dict(file=x['file'],index=int(x['index']),new=str(x.get('text',''))) for x in text_rows
-                             if current.get((x.get('file'),int(x.get('index',-1))))!=str(x.get('text',''))]
-                    if changes:
-                        result=_ui_text_batch_apply_internal(changes,False,'Season Pack UI Text')
-                        applied['ui_text']=int(result.get('changes',0))
-                except Exception as ex:errors.append('UI text: '+str(ex))
-            if 'audio' in selected:
-                n,e=_pack_apply_audio_raw(z,_pack_read_json(z,'audio/assets.json',[]) or []);applied['audio']=n;errors+=e
-            gameplay,e=_pack_apply_gameplay(z,[c for c in selected if c in ('race','ai_track','ai_global','scr')]);errors+=e
-            for k,v in gameplay.items():applied[k]=v
-            cfg=load_cfg()
-            if 'presets' in selected:
-                presets=_pack_read_json(z,'presets/custom.json',[]) or []
-                merged={(x.get('kind'),x.get('name')):x for x in cfg.get('custom_ai_presets',[])}
-                before=dict(merged)
-                for x in presets[:200]: merged[(x.get('kind'),x.get('name'))]=x
-                cfg['custom_ai_presets']=list(merged.values())[-200:]
-                applied['presets']=sum(1 for k,v in merged.items() if before.get(k)!=v)
-            if 'pit_log' in selected:
-                log=_pack_read_json(z,'presets/pit_test_log.json',[]) or []
-                existing={str(x.get('id')):x for x in cfg.get('pit_strategy_test_log',[])};before=set(existing)
-                for x in log[:1000]: existing[str(x.get('id'))]=x
-                cfg['pit_strategy_test_log']=list(existing.values())[-1000:]
-                applied['pit_log']=len(set(existing)-before)
-            save_cfg(cfg);_clear_ui_thumb_cache()
-            return jsonify(dict(ok=not errors,partial=bool(errors),applied=applied,errors=errors,
-                                selected=selected,note='Paint schemes were saved; use Install All Saved Paints on the Paint Schemes page to write them to the game.')),(207 if errors else 200)
-    except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
+        try:
+            selected = json.loads(request.form.get('categories', '[]'))
+        except (TypeError, ValueError):
+            selected = []
+        return jsonify(_shared_season_pack_editor().import_bytes(
+            upload.read(), selected or None,
+        ))
+    except Exception as ex:
+        return jsonify(dict(ok=False, error=str(ex))), 400
+
 
 # ---- reusable AI preset library + pit-strategy observation log ----
 @app.route('/api/presets')
 def presets_list():
-    return jsonify(dict(ok=True,presets=load_cfg().get('custom_ai_presets',[])))
+    return jsonify(dict(ok=True,presets=_shared_user_library().presets()))
+
 
 @app.route('/api/presets/save',methods=['POST'])
 def presets_save():
-    q=request.get_json(force=True);name=str(q.get('name','')).strip()[:80]
-    kind=str(q.get('kind','track'))
-    changes=q.get('changes') or []
-    if not name:return jsonify(dict(ok=False,error='preset name is required')),400
-    if kind not in ('track','global','pit'):return jsonify(dict(ok=False,error='bad preset kind')),400
-    clean=[]
-    for c in changes[:100]:
-        field=str(c.get('field',''))
-        if not field:continue
-        clean.append(dict(field=field,value=c.get('value')))
-    if not clean:return jsonify(dict(ok=False,error='preset has no fields')),400
-    cfg=load_cfg();rows=cfg.setdefault('custom_ai_presets',[])
-    item=dict(id=_hl.sha1((kind+'|'+name).encode()).hexdigest()[:12],name=name,kind=kind,
-              note=str(q.get('note',''))[:500],changes=clean)
-    rows=[r for r in rows if r.get('id')!=item['id'] and not (r.get('kind')==kind and r.get('name')==name)]
-    rows.append(item);cfg['custom_ai_presets']=rows[-200:];save_cfg(cfg)
-    return jsonify(dict(ok=True,preset=item,count=len(cfg['custom_ai_presets'])))
+    try:return jsonify(dict(ok=True,**_shared_user_library().save_preset(request.get_json(force=True))))
+    except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
+
 
 @app.route('/api/presets/delete',methods=['POST'])
 def presets_delete():
-    q=request.get_json(force=True);pid=str(q.get('id',''));cfg=load_cfg();rows=cfg.get('custom_ai_presets',[])
-    new=[r for r in rows if str(r.get('id'))!=pid];cfg['custom_ai_presets']=new;save_cfg(cfg)
-    return jsonify(dict(ok=True,deleted=len(rows)-len(new)))
+    try:
+        q=request.get_json(force=True)
+        return jsonify(dict(ok=True,**_shared_user_library().delete_preset(q.get('id'))))
+    except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
+
 
 @app.route('/api/presets/export')
 def presets_export():
-    b=io.BytesIO(_pack_json_bytes(dict(format='nascar15-ai-presets',version=1,
-                                        presets=load_cfg().get('custom_ai_presets',[]))))
-    return send_file(b,mimetype='application/json',as_attachment=True,download_name='nascar15_ai_presets.json')
+    payload=_shared_user_library().export_presets_bytes()
+    return send_file(io.BytesIO(payload),mimetype='application/json',as_attachment=True,
+                     download_name='nascar_ai_presets.json')
+
 
 @app.route('/api/presets/import',methods=['POST'])
 def presets_import():
-    f=request.files.get('file')
-    if not f:return jsonify(dict(ok=False,error='no file')),400
-    try:
-        obj=json.load(f.stream);rows=obj.get('presets',obj if isinstance(obj,list) else [])
-        if not isinstance(rows,list):raise ValueError('preset file has no preset list')
-        cfg=load_cfg();existing=cfg.get('custom_ai_presets',[]);by={(r.get('kind'),r.get('name')):r for r in existing}
-        for r in rows[:200]:
-            if r.get('kind') in ('track','global','pit') and r.get('name') and isinstance(r.get('changes'),list):
-                by[(r.get('kind'),r.get('name'))]=r
-        cfg['custom_ai_presets']=list(by.values())[-200:];save_cfg(cfg)
-        return jsonify(dict(ok=True,count=len(cfg['custom_ai_presets'])))
+    upload=request.files.get('file')
+    if not upload:return jsonify(dict(ok=False,error='no file')),400
+    try:return jsonify(dict(ok=True,**_shared_user_library().import_presets_bytes(upload.read())))
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
+
 
 @app.route('/api/pitlog',methods=['GET','POST','DELETE'])
 def pit_log_api():
-    import datetime
-    cfg=load_cfg();rows=cfg.setdefault('pit_strategy_test_log',[])
-    if request.method=='GET':return jsonify(dict(ok=True,rows=rows))
-    q=request.get_json(force=True)
-    if request.method=='DELETE':
-        ident=str(q.get('id',''));new=[r for r in rows if str(r.get('id'))!=ident]
-        cfg['pit_strategy_test_log']=new;save_cfg(cfg);return jsonify(dict(ok=True,deleted=len(rows)-len(new)))
-    note=str(q.get('note','')).strip()[:2000]
-    if not note:return jsonify(dict(ok=False,error='enter an observation')),400
-    item=dict(id=_hl.sha1((datetime.datetime.now().isoformat()+note).encode()).hexdigest()[:12],
-              created=datetime.datetime.now().isoformat(timespec='seconds'),track=str(q.get('track',''))[:80],
-              preset=str(q.get('preset',''))[:80],result=str(q.get('result','untested'))[:40],note=note)
-    rows.append(item);cfg['pit_strategy_test_log']=rows[-1000:];save_cfg(cfg)
-    return jsonify(dict(ok=True,item=item,count=len(cfg['pit_strategy_test_log'])))
+    library=_shared_user_library()
+    if request.method=='GET':return jsonify(dict(ok=True,rows=library.pit_entries()))
+    try:
+        q=request.get_json(force=True)
+        result=(library.delete_pit_entry(q.get('id')) if request.method=='DELETE'
+                else library.add_pit_entry(q))
+        return jsonify(dict(ok=True,**result))
+    except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
 
 
 # ==================== v0.9.23 REPOINT / CUSTOM CONTAINERS ====================
@@ -12574,14 +7363,6 @@ def _rp_sha256_range(path, offset, size):
     return h.hexdigest()
 
 
-def _rp_game_running():
-    if os.name!='nt':return False
-    try:
-        out=subprocess.check_output(['tasklist','/FI','IMAGENAME eq NASCAR15.exe'],text=True,errors='ignore')
-        return 'NASCAR15.exe' in out
-    except Exception:return False
-
-
 def _rp_load_history():
     try:
         x=json.load(open(_RP_HISTORY,'r',encoding='utf-8'))
@@ -12590,9 +7371,7 @@ def _rp_load_history():
 
 
 def _rp_save_history(rows):
-    tmp=_RP_HISTORY+'.tmp'
-    with open(tmp,'w',encoding='utf-8') as f:json.dump(rows[-2000:],f,indent=2)
-    os.replace(tmp,_RP_HISTORY)
+    atomic_write_json(_RP_HISTORY, rows[-2000:], indent=2)
 
 
 def _rp_add_history(item):
@@ -12624,31 +7403,15 @@ def _rp_magic_name(raw):
 def _rp_index_rows(cdf_path):
     """Parse cdfiles and retain byte positions for size/offset repointing."""
     raw=bytearray(open(cdf_path,'rb').read())
-    if len(raw)<48 or struct.unpack_from('<I',raw,0)[0]!=0x436C6966:
-        raise ValueError('not a valid cdfiles index')
-    hdr=struct.unpack_from('<12I',raw,0);count=hdr[8];string_size=hdr[10]
-    if count<=0 or string_size<=0 or string_size>len(raw):raise ValueError('invalid cdfiles header')
-    base=len(raw)-string_size
-    def name_at(off):
-        if off>=string_size:return ''
-        p=base+off;e=raw.find(b'\0',p)
-        return raw[p:e].decode('ascii','replace') if e>=p else ''
-    choices=[]
-    for start,layout,ni,si,oi in ((0x40,'A',1,2,5),(0x50,'B',3,4,7)):
-        rows=[];valid=0;pos=start
-        for i in range(count):
-            if pos+32>base:break
-            f=struct.unpack_from('<8I',raw,pos);name=name_at(f[ni])
-            if name and all(32<=ord(c)<127 for c in name):valid+=1
-            rows.append(dict(index=i,name=name,offset=int(f[oi]),size=int(f[si]),record_pos=pos,
-                             size_pos=pos+si*4,offset_pos=pos+oi*4,layout=layout))
-            pos+=32
-        score=valid*1000+len({r['name'] for r in rows if r['name']})*100+sum(r['size']>0 for r in rows)*10-abs(len(rows)-count)
-        choices.append((score,raw,rows,layout))
-    _,raw,rows,layout=max(choices,key=lambda x:x[0])
-    good=[r for r in rows if r['name']]
-    if len(good)<max(1,int(count*.8)):raise ValueError('could not parse cdfiles layout')
-    return raw,good,layout
+    entries=_read_cdf_entries(cdf_path)
+    if not entries:raise ValueError('cdfiles index contains no payload entries')
+    rows=[]
+    for entry in entries:
+        size_field,offset_field=(2,5) if entry.layout=='A' else (4,7)
+        rows.append(dict(index=entry.index,name=entry.name,offset=entry.archive_offset,size=entry.size,
+                         record_pos=entry.record_offset,size_pos=entry.record_offset+size_field*4,
+                         offset_pos=entry.record_offset+offset_field*4,layout=entry.layout))
+    return raw,rows,entries[0].layout
 
 
 def _rp_find_row(rows,name):
@@ -12707,7 +7470,7 @@ def _rp_plan(arcid,v,row,path,allow_magic=False):
 
 def _rp_install_one(arcid,v,row,path,source_name=None,allow_magic=False,history=True):
     """Append + repoint transaction. On failure, truncate and restore the exact live cdf bytes."""
-    if _rp_game_running():raise ValueError('NASCAR15.exe is running; close the game first')
+    if is_process_running('NASCAR15.exe'):raise ValueError('NASCAR15.exe is running; close the game first')
     plan=_rp_plan(arcid,v,row,path,allow_magic)
     _rp_backup_pair(v)
     old_archive_size=os.path.getsize(v['ar']);old_cdf=open(v['cdf'],'rb').read()
@@ -12782,42 +7545,35 @@ def repoint_status():
 @app.route('/api/repoint/entries',methods=['POST'])
 def repoint_entries():
     try:
-        q=request.get_json(silent=True) or {};g,reg=registry()
-        if not g:raise ValueError('game folder not selected')
+        q=request.get_json(silent=True) or {};editor=_shared_resource_editor()
         arc=str(q.get('archive','all'));cat=str(q.get('category','all'));text=str(q.get('q','')).lower()
         page=max(0,int(q.get('page',0)));per=max(1,min(500,int(q.get('per',200))))
         rows=[];categories=set()
-        for arcid,v in reg.items():
+        archive_rows=editor.archives()
+        for archive in archive_rows:
+            arcid=archive['key']
             if arc!='all' and str(arcid)!=arc:continue
-            _,rr,_=_rp_index_rows(v['cdf'])
-            for r in rr:
-                pub=_rp_public_entry(arcid,r);categories.add(pub['category'])
+            for pub in editor.resources(arcid):
+                categories.add(pub['category'])
                 if cat!='all' and pub['category']!=cat:continue
                 if text and text not in (pub['name']+' '+pub['category']+' ARCHIVE'+str(arcid)).lower():continue
                 rows.append(pub)
         rows.sort(key=lambda x:(int(x['archive']),x['category'],x['name']))
         return jsonify(dict(ok=True,total=len(rows),page=page,per=per,rows=rows[page*per:(page+1)*per],
-                            archives=sorted(reg.keys(),key=int),categories=sorted(categories)))
+                            archives=sorted((row['key'] for row in archive_rows),key=int),categories=sorted(categories)))
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
 
 
 @app.route('/api/repoint/inspect',methods=['POST'])
 def repoint_inspect():
     try:
-        q=request.get_json(force=True);g,reg=registry();arcid=str(q.get('archive'));v=need(reg,arcid)
-        _,rows,layout=_rp_index_rows(v['cdf']);row=_rp_find_row(rows,q.get('entry'))
-        with open(v['ar'],'rb') as f:f.seek(row['offset']);head=f.read(16)
-        stock=None;cb=backup_path(v['cdf'])
-        if os.path.exists(v['bak']) and os.path.exists(cb):
-            try:
-                _,br,_=_rp_index_rows(cb);sr=_rp_find_row(br,row['name'])
-                with open(v['bak'],'rb') as f:f.seek(sr['offset']);shead=f.read(16)
-                stock=dict(offset=sr['offset'],size=sr['size'],magic=_rp_magic_name(shead))
-            except Exception:stock=None
-        return jsonify(dict(ok=True,entry=_rp_public_entry(arcid,row),layout=layout,magic=_rp_magic_name(head),
-                            archive_size=os.path.getsize(v['ar']),stock=stock,
-                            export_current=f'/api/repoint/export?archive={arcid}&entry='+__import__('urllib.parse').parse.quote(row['name']),
-                            export_stock=f'/api/repoint/export?stock=1&archive={arcid}&entry='+__import__('urllib.parse').parse.quote(row['name'])))
+        q=request.get_json(force=True);arcid=str(q.get('archive'));editor=_shared_resource_editor()
+        item=editor.inspect(q.get('entry'),arcid);pair=editor.installation.archive_pairs[arcid]
+        public={key:item[key] for key in ('archive','name','offset','size','category')}
+        return jsonify(dict(ok=True,entry=public,layout=item['layout'],magic=item['magic'],
+                            archive_size=pair.archive.stat().st_size,stock=item['stock'],
+                            export_current=f'/api/repoint/export?archive={arcid}&entry='+__import__('urllib.parse').parse.quote(item['name']),
+                            export_stock=f'/api/repoint/export?stock=1&archive={arcid}&entry='+__import__('urllib.parse').parse.quote(item['name'])))
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
 
 
@@ -12828,10 +7584,11 @@ def repoint_preview():
         up=request.files.get('file')
         if not up:raise ValueError('choose a replacement file')
         arcid=str(request.form.get('archive'));entry=request.form.get('entry');allow=request.form.get('allow_magic')=='1'
-        g,reg=registry();v=need(reg,arcid);_,rows,_=_rp_index_rows(v['cdf']);row=_rp_find_row(rows,entry)
         fd,tmp=tempfile.mkstemp(prefix='n15mod_repoint_',suffix=os.path.splitext(up.filename or '')[1]);os.close(fd);up.save(tmp)
-        plan=_rp_plan(arcid,v,row,tmp,allow);plan['source_name']=up.filename or os.path.basename(tmp)
-        plan['filename_match']=(os.path.basename(up.filename or '').casefold()==os.path.basename(row['name']).casefold())
+        editor=_shared_resource_editor();payload=Path(tmp).read_bytes();plan=editor.plan(entry,arcid,payload)
+        if plan['warnings'] and not allow:raise ValueError(plan['warnings'][0]+'; enable advanced magic override only when this is intentional')
+        plan['source_name']=up.filename or os.path.basename(tmp)
+        plan['filename_match']=(os.path.basename(up.filename or '').casefold()==os.path.basename(plan['entry']).casefold())
         return jsonify(dict(ok=True,plan=plan))
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
     finally:
@@ -12847,9 +7604,19 @@ def repoint_install():
         up=request.files.get('file')
         if not up:raise ValueError('choose a replacement file')
         arcid=str(request.form.get('archive'));entry=request.form.get('entry');allow=request.form.get('allow_magic')=='1'
-        g,reg=registry();v=need(reg,arcid);_,rows,_=_rp_index_rows(v['cdf']);row=_rp_find_row(rows,entry)
         fd,tmp=tempfile.mkstemp(prefix='n15mod_repoint_',suffix=os.path.splitext(up.filename or '')[1]);os.close(fd);up.save(tmp)
-        with _RP_LOCK:r=_rp_install_one(arcid,v,row,tmp,up.filename or os.path.basename(tmp),allow)
+        editor=_shared_resource_editor();payload=Path(tmp).read_bytes();plan=editor.plan(entry,arcid,payload)
+        if plan['warnings'] and not allow:raise ValueError(plan['warnings'][0]+'; enable advanced magic override only when this is intentional')
+        with _RP_LOCK:r=editor.replace(entry,arcid,payload)
+        history=dict(timestamp=datetime.datetime.now().isoformat(timespec='seconds'),archive=arcid,
+                     entry=plan['entry'],old_offset=plan['old_offset'],old_size=plan['old_size'],
+                     new_offset=r.get('offset',plan['new_offset']),new_size=plan['new_size'],growth=plan['growth'],
+                     sha256=plan['sha256'],source_name=up.filename or os.path.basename(tmp),
+                     category=plan['category'],verified=True)
+        history_warning=None
+        try:_rp_add_history(history)
+        except Exception as ex:history_warning='install verified, but history could not be saved: '+str(ex)
+        r=dict(ok=True,verified=True,plan=plan,history=history,history_warning=history_warning,write=r)
         return jsonify(r)
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
     finally:
@@ -12863,17 +7630,15 @@ def repoint_export():
     tmp=None
     try:
         arcid=str(request.args.get('archive'));entry=request.args.get('entry');stock=request.args.get('stock')=='1'
-        g,reg=registry();v=need(reg,arcid)
-        cdf=backup_path(v['cdf']) if stock else v['cdf'];ar=v['bak'] if stock else v['ar']
-        if not os.path.exists(cdf) or not os.path.exists(ar):raise ValueError('stock backup is not available' if stock else 'live files missing')
-        _,rows,_=_rp_index_rows(cdf);row=_rp_find_row(rows,entry)
-        fd,tmp=tempfile.mkstemp(prefix='n15mod_export_');os.close(fd);_rp_extract_entry(v,row,tmp,ar)
+        editor=_shared_resource_editor();found_key,found_entry=editor.installation.find_entry(entry,arcid)
+        fd,tmp=tempfile.mkstemp(prefix='n15mod_export_');os.close(fd)
+        editor.export(found_entry.name,found_key,tmp,pristine=stock)
         @after_this_request
         def _cleanup_export(response):
             try:os.remove(tmp)
             except OSError:pass
             return response
-        return send_file(tmp,as_attachment=True,download_name=row['name'],mimetype='application/octet-stream',max_age=0)
+        return send_file(tmp,as_attachment=True,download_name=found_entry.name,mimetype='application/octet-stream',max_age=0)
     except Exception as ex:
         if tmp:
             try:os.remove(tmp)
@@ -12883,22 +7648,12 @@ def repoint_export():
 
 @app.route('/api/repoint/restore_entry',methods=['POST'])
 def repoint_restore_entry():
-    tmp=None
     try:
-        q=request.get_json(force=True);arcid=str(q.get('archive'));entry=q.get('entry');g,reg=registry();v=need(reg,arcid)
-        bc=backup_path(v['cdf'])
-        if not os.path.exists(v['bak']) or not os.path.exists(bc):raise ValueError('the original backup pair is unavailable')
-        _,live_rows,_=_rp_index_rows(v['cdf']);live=_rp_find_row(live_rows,entry)
-        _,stock_rows,_=_rp_index_rows(bc);stock=_rp_find_row(stock_rows,entry)
-        fd,tmp=tempfile.mkstemp(prefix='n15mod_stock_',suffix=os.path.splitext(stock['name'])[1]);os.close(fd)
-        _rp_extract_entry(v,stock,tmp,v['bak'])
-        with _RP_LOCK:r=_rp_install_one(arcid,v,live,tmp,'Stock backup: '+stock['name'],False)
-        r['restored_stock_size']=stock['size'];return jsonify(r)
+        q=request.get_json(force=True);arcid=str(q.get('archive'));entry=q.get('entry')
+        editor=_shared_resource_editor();stock_size=len(editor.read(entry,arcid,pristine=True))
+        with _RP_LOCK:r=editor.restore(entry,arcid)
+        r.update(ok=True,restored_stock_size=stock_size);return jsonify(r)
     except Exception as ex:return jsonify(dict(ok=False,error=str(ex))),400
-    finally:
-        if tmp:
-            try:os.remove(tmp)
-            except OSError:pass
 
 
 def _rp_package_members(zip_path,reg):
@@ -13080,11 +7835,10 @@ _PYC_AUDIT_PRIORITY=[
 def _pyc_audit_mapper():
     path=component_path(MAPPER_NAME)
     if not os.path.exists(path):raise RuntimeError(MAPPER_NAME+' is missing')
-    import importlib.util as _iu
     key=(os.path.realpath(path),os.path.getmtime(path))
     cached=_PYC_AUDIT_CACHE.get('mapper')
     if cached and cached[0]==key:return cached[1]
-    spec=_iu.spec_from_file_location('n15_pyc_audit_mapper',path);mod=_iu.module_from_spec(spec);sys.modules[spec.name]=mod;spec.loader.exec_module(mod)
+    mod = _load_module_from_path(path, 'n15_pyc_audit_mapper')
     _PYC_AUDIT_CACHE['mapper']=(key,mod);return mod
 
 def _pyc_ascii(raw,minimum=4):
@@ -13137,7 +7891,7 @@ def _pyc_audit_scan(force=False):
                     rec['handled']='library';rec['handled_detail']='runtime/library PYC; no data editor expected'
                 rec['priority']=upper in _PYC_AUDIT_PRIORITY
                 if upper==DBFILE.upper():
-                    try:rec['schedule_slots']=len(schedule_mod().map_schedule(raw,mapper)[0])
+                    try:rec['schedule_slots']=len(_shared_schedule_editor().inspect_payload(raw))
                     except Exception as ex:rec['schedule_error']=str(ex)
                 # Record/schema totals are useful for generated DB files, but avoid
                 # the expensive constructor mapping on every runtime helper.
@@ -13188,60 +7942,7 @@ def pyc_audit_export():
 
 # ---- self-check / support report ----
 def _support_checks():
-    checks=[]
-    def add(name,status,detail,technical=False):
-        checks.append(dict(name=name,status=status,detail=str(detail),technical=bool(technical)))
-    add('Application','pass',f'{APP_NAME} v{APP_VERSION} {APP_RELEASE_LABEL}')
-    add('Custom race schedules','pass' if all(os.path.exists(component_path(x)) for x in (SCHEDULE_HELPER_NAME,SCHEDULE_LINK_HELPER_NAME)) else 'fail',
-        'Season order, repeated races, and race lengths are available.' if all(os.path.exists(component_path(x)) for x in (SCHEDULE_HELPER_NAME,SCHEDULE_LINK_HELPER_NAME)) else 'Required schedule tools are missing.')
-    add('Advanced file support','pass','Large replacement files can be installed with backup and verification.',True)
-    add('Physics editing support','pass','Track-specific physics files support fixed and expanded values.',True)
-    add('Game-data research tools','pass','Read-only audit and candidate discovery are available.',True)
-    for fn in (MAPPER_NAME,PATCHER_NAME,REPOINT_NAME,SCHEDULE_HELPER_NAME,SCHEDULE_LINK_HELPER_NAME,'containers.py','ui_assets.csv','nascar15_team_assets_v1.py','nascar15_thumbnail_native_v25.py','nascar15_thumbnail_import_probe_v1.py'):
-        p=(os.path.join(APP_DIR,fn) if fn=='containers.py' else component_path(fn));add('Required component: '+fn,'pass' if os.path.exists(p) else 'fail','Ready' if os.path.exists(p) else 'Missing from the application folder',True)
-    add('Graphics discovery','pass' if os.path.exists(TEXTURE_DISCOVERY_TOOL) else 'fail','Graphics scanner ready' if os.path.exists(TEXTURE_DISCOVERY_TOOL) else 'Graphics scanner missing')
-    add('Graphics discovery cache','pass' if os.path.exists(_discovered_texture_csv()) else 'warn','Additional graphics already indexed' if os.path.exists(_discovered_texture_csv()) else 'Use Scan All Game Graphics to build this list',True)
-    profile_data=[('drivers.json',_game_data_path('drivers.json')),
-                  ('ai profiles',_game_data_path('ai_profiles_nascar14.csv') if ACTIVE_GAME=='nascar14' else _game_data_path('ai_profiles.csv'))]
-    if active_game_profile().get('graphics_mode')=='packaged': profile_data.append(('ui_asset_map_v2.csv',_game_data_path('ui_asset_map_v2.csv')))
-    for label,p in profile_data:
-        add('Data component: '+label,'pass' if os.path.exists(p) else 'fail','Ready' if os.path.exists(p) else 'Missing',True)
-    try:
-        links=load_driver_links();profiles=load_profiles();pids={int(r['profile_id']) for r in profiles}
-        missing=[x for x in links if int(x['profile_id']) not in pids]
-        add('Driver and rating database','pass' if not missing else 'fail',f'{len(links)} drivers and {len(profiles)} rating profiles are available.' if not missing else f'{len(missing)} driver links are missing.')
-    except Exception as ex:add('Driver and rating database','fail',ex)
-    try:
-        p=ui_csv_path();rows=_ui_index() if p else []
-        add('Graphics catalog','pass' if rows else 'fail',f'{len(rows)} graphics are indexed.' if rows else 'No graphics catalog was found.')
-        add('Graphics catalog details','pass' if rows else 'fail',f'{sum(1 for r in rows if r.get("decoded"))} editable previews; {sum(1 for r in rows if not r.get("decoded"))} research-only files.',True)
-    except Exception as ex:add('Graphics catalog','fail',ex)
-    try:
-        text_files=_ui_text_quick_status()
-        add('Game Text','pass' if text_files else 'warn',f'{len(text_files)} language tables are available.' if text_files else 'No text tables were found.')
-    except Exception as ex:add('Game Text','warn',ex)
-    g,reg=registry()
-    game_label=active_game_name()+' folder'
-    if not g:add(game_label,'warn','The selected game folder is not selected or could not be detected.')
-    else:
-        add(game_label,'pass',g)
-        required=set(active_game_profile().get('required_archives') or ())
-        add('Game data files','pass' if required.issubset(reg) else 'fail',f'{len(reg)} game-data groups found; required '+', '.join(sorted(required))+'.',True)
-        nb=sum(1 for v in reg.values() if os.path.exists(v['bak']))
-        add('Game backups','pass' if nb==len(reg) else 'warn',f'{nb}/{len(reg)} game-data groups are protected.')
-        rpairs=sum(1 for v in reg.values() if os.path.exists(v['bak']) and os.path.exists(backup_path(v['cdf'])))
-        add('Advanced backup pairs','pass' if rpairs==len(reg) else 'warn',f'{rpairs}/{len(reg)} paired backups are ready.',True)
-        try:
-            statuses={k:_baseline_public_status(k,v) for k,v in stock_baselines().items()}
-            good=sum(1 for v in statuses.values() if v.get('ok'))
-            add('Clean stock reference','pass' if good else 'warn',f'{good} clean reference group(s) verified.' if good else 'Optional: choose a clean stock copy on Home for better comparisons.')
-        except Exception as ex:add('Clean stock reference','warn',ex)
-    add('Image conversion','pass' if texconv_path() else 'warn','Ready' if texconv_path() else 'External image converter not found; built-in fallback remains available.')
-    add('Audio conversion','pass' if ffmpeg_path() else 'warn','Ready' if ffmpeg_path() else 'Audio preview and replacement may be limited until the converter is bundled or installed.')
-    try:add('Saved paints','pass',f'{sum(1 for n in os.listdir(SCHEMES) if n.endswith(".png"))} paint image(s) saved.')
-    except Exception as ex:add('Saved paints','warn',ex)
-    fail=sum(1 for c in checks if c['status']=='fail');warn=sum(1 for c in checks if c['status']=='warn')
-    return checks,dict(pass_count=len(checks)-fail-warn,warn_count=warn,fail_count=fail,total=len(checks))
+    return _shared_support_reporter().checks()
 
 @app.route('/api/support/check')
 def support_check():
@@ -13249,964 +7950,44 @@ def support_check():
 
 @app.route('/api/support/report')
 def support_report():
-    import datetime
-    checks,summary=_support_checks();lines=[f'{APP_NAME} v{APP_VERSION} support report',
-        f'Created: {datetime.datetime.now().isoformat(timespec="seconds")}',
-        f'Result: {summary["pass_count"]} pass, {summary["warn_count"]} warning, {summary["fail_count"]} fail','']
-    lines += [f'[{c["status"].upper()}] {c["name"]}: {c["detail"]}' for c in checks]
-    b=io.BytesIO(('\n'.join(lines)+'\n').encode('utf-8'))
+    b=io.BytesIO(_shared_support_reporter().report_bytes())
     return send_file(b,mimetype='text/plain',as_attachment=True,download_name=f'nascar15_modding_app_v{APP_VERSION}_support.txt')
 
 
-# ==================== v0.9.31.3 FAILURE-FOCUSED WHOLE MOD REPAIR ====================
-_FULL_REPAIR_LOCK = threading.RLock()
-FULL_REPAIR_REPORT = os.path.join(USER_DIR, 'last_whole_mod_repair.json')
 
 
-def _full_repair_json(result):
-    """Normalize a Flask view return into a plain dictionary."""
-    status = 200
-    if isinstance(result, tuple):
-        result, status = result[0], int(result[1]) if len(result) > 1 else 200
-    if hasattr(result, 'get_json'):
-        data = result.get_json(silent=True)
-    elif isinstance(result, dict):
-        data = result
-    else:
-        data = None
-    if not isinstance(data, dict):
-        raise RuntimeError(f'repair step returned an unreadable response (HTTP {status})')
-    if status >= 400 or not data.get('ok', False):
-        raise RuntimeError(str(data.get('error') or f'repair step failed (HTTP {status})'))
-    return data
 
 
-def _full_repair_active_state():
-    mod = extra_scheme_mod()
-    state = mod.load_state(EXTRA_SCHEME_STATE)
-    active = [x for x in state.get('schemes', [])
-              if not x.get('superseded_by') and x.get('uid') is not None]
-    return mod, state, active
-
-
-def _full_repair_snapshot(reg, active):
-    """Rollback metadata for append/repoint work plus every custom paint slot.
-
-    Older state files can point at the wrong SD/HD names. Snapshot every indexed
-    CUSTOM livery entry instead of trusting saved names so a state-rebind repair
-    still has complete same-process rollback coverage.
-    """
-    snap = {'groups': {}, 'states': {}, 'regions': []}
-    for key in ('0', '1', '2'):
-        v = need(reg, key)
-        snap['groups'][key] = {
-            'archive': v['ar'], 'size': os.path.getsize(v['ar']),
-            'cdf': v['cdf'], 'cdf_bytes': open(v['cdf'], 'rb').read(),
-        }
-    for path in (CONFIG, EXTRA_SCHEME_STATE, TEAM_MANAGER_STATE):
-        snap['states'][path] = {
-            'exists': os.path.exists(path),
-            'bytes': open(path, 'rb').read() if os.path.exists(path) else None,
-        }
-    mod = extra_scheme_mod()
-    cdf2 = mod.v06.parse_cdf_v6(open(need(reg, '2')['cdf'], 'rb').read())
-    archive2 = need(reg, '2')['ar']
-    wanted = set()
-    for item in active:
-        for field in ('sd_entry', 'hd_entry'):
-            name = str(item.get(field) or '')
-            if name:
-                wanted.add(name.casefold())
-    for rec in cdf2.files:
-        try:
-            name = str(cdf2.basename(rec))
-        except Exception:
-            continue
-        upper = name.upper()
-        if upper.startswith(('LIVERY_CUSTOM_', 'HDLIVERY_CUSTOM_')):
-            wanted.add(name.casefold())
-    seen = set()
-    with open(archive2, 'rb') as fh:
-        for rec in cdf2.files:
-            try:
-                name = str(cdf2.basename(rec))
-            except Exception:
-                continue
-            if name.casefold() not in wanted:
-                continue
-            key = (int(rec.data_offset), int(rec.data_size))
-            if key in seen:
-                continue
-            seen.add(key)
-            fh.seek(key[0]); raw = fh.read(key[1])
-            if len(raw) != key[1]:
-                raise ValueError(f'short rollback read for {name}')
-            snap['regions'].append({
-                'archive': archive2, 'offset': key[0],
-                'bytes': raw, 'name': name,
-            })
-    return snap
-
-
-def _full_repair_restore(snap):
-    errors = []
-    for item in (snap or {}).get('regions', []):
-        try:
-            with open(item['archive'], 'r+b') as fh:
-                fh.seek(int(item['offset'])); fh.write(item['bytes'])
-                fh.flush(); os.fsync(fh.fileno())
-        except Exception as ex:
-            errors.append(f"region {item.get('name')}: {ex}")
-    for key, item in (snap or {}).get('groups', {}).items():
-        try:
-            with open(item['archive'], 'r+b') as fh:
-                fh.truncate(int(item['size'])); fh.flush(); os.fsync(fh.fileno())
-            _extra_atomic_bytes(item['cdf'], item['cdf_bytes'])
-        except Exception as ex:
-            errors.append(f'archive group {key}: {ex}')
-    for path, item in (snap or {}).get('states', {}).items():
-        try:
-            if item.get('exists'):
-                _extra_atomic_bytes(path, item.get('bytes') or b'')
-            elif os.path.exists(path):
-                os.remove(path)
-        except Exception as ex:
-            errors.append(f'state {os.path.basename(path)}: {ex}')
-    try:
-        _SCHEDULE_SOURCE_CACHE.clear(); _SCHEDULE_CACHE.clear(); _clear_ui_thumb_cache()
-    except Exception:
-        pass
-    return errors
-
-
-def _full_repair_driver_plan(g, active):
-    mod = extra_scheme_mod()
-    team_state = _team_state_load()
-    team_catalog = _team_friendly_catalog()
-    extra_catalog = mod.catalog(g, EXTRA_SCHEME_STATE)
-    extra_by_driver = {int(d['uid']): d for d in extra_catalog.get('drivers', [])}
-    originals = _team_original_team_map()
-    active_by_driver = collections.defaultdict(list)
-    for item in active:
-        active_by_driver[int(item.get('driver_uid', -1))].append(item)
-    affected_driver_uids = set(active_by_driver)
-    moved_cfg = {int(x) for x in team_state.get('driver_teams', {})}
-    assets = team_assets_mod()
-    for driver in team_catalog.get('drivers', []):
-        cfg_uid = int(driver['config_uid'])
-        driver_uid = int(driver['driver_uid'])
-        team_uid = int(driver['team_uid'])
-        try:
-            names = set(assets.team_container_resource_names(g, team_uid))
-        except Exception:
-            names = set()
-        mandatory = {f'DRIVERPAINT_{driver_uid}_25041',
-                     f'DRIVER_{driver_uid}_3DNUM_25041'}
-        if cfg_uid in moved_cfg or not mandatory.issubset(names):
-            affected_driver_uids.add(driver_uid)
-    drivers = []
-    for driver in team_catalog.get('drivers', []):
-        driver_uid = int(driver['driver_uid'])
-        if driver_uid not in affected_driver_uids:
-            continue
-        cfg_uid = int(driver['config_uid'])
-        team_uid = int(driver['team_uid'])
-        source_uid = int(team_state.get('driver_source_teams', {}).get(
-            str(cfg_uid), originals.get(cfg_uid, team_uid)))
-        live_driver = extra_by_driver.get(driver_uid, {})
-        stock_liveries = sorted({
-            int(x['uid']) for x in live_driver.get('schemes', [])
-            if x.get('uid') is not None and not x.get('managed')
-        })
-        # A database-backed livery is not automatically a Paint Select resource.
-        # Several valid stock/DLC liveries have no PAINTSCHEME_<UID> entry in
-        # their original native team bank. They remain valid for AI/runtime
-        # selection, but requiring a same-named front-end thumbnail creates an
-        # impossible false failure and rolls back an otherwise healthy rebuild.
-        try:
-            source_resource_names = set(
-                assets.pristine_team_container_resource_names(g, source_uid))
-        except Exception:
-            source_resource_names = set()
-        frontend_liveries = sorted(
-            uid for uid in stock_liveries
-            if f'PAINTSCHEME_{uid}' in source_resource_names)
-        database_only_liveries = sorted(set(stock_liveries) - set(frontend_liveries))
-        drivers.append({
-            'config_uid': cfg_uid, 'driver_uid': driver_uid,
-            'driver': driver.get('car_label') or driver.get('label'),
-            'team_uid': team_uid, 'team': driver.get('team_label'),
-            'source_team_uid': source_uid,
-            'stock_livery_uids': stock_liveries,
-            'frontend_livery_uids': frontend_liveries,
-            'database_only_livery_uids': database_only_liveries,
-            'created_livery_uids': sorted(
-                int(x['uid']) for x in active_by_driver.get(driver_uid, [])),
-        })
-    return drivers
-
-
-def _full_repair_failure_scan():
-    """Inspect only structures that can break app-created paint loading.
-
-    Stock-vs-live differences are not errors. The scan follows actual runtime
-    references from saved state to DB records, CDF rows, paint wrappers, current
-    team banks, driver art, PAINTSCHEME identity chains, and AI assignments.
-    """
-    g, reg = _extra_game_and_registry()
-    mod, state, active = _full_repair_active_state()
-    assets = team_assets_mod()
-    thumbs = extra_thumbnail_mod()
-    issues = []
-
-    def add(code, subsystem, severity, detail, *, repairable=True,
-            team_uid=None, driver_uid=None, uid=None, action=None):
-        issues.append({
-            'code': str(code), 'subsystem': str(subsystem),
-            'severity': str(severity), 'detail': str(detail),
-            'fatal_possible': severity == 'fail',
-            'repairable': bool(repairable), 'action': action,
-            'team_uid': team_uid, 'driver_uid': driver_uid, 'uid': uid,
-        })
-
-    # 1) Saved-state ↔ live DB ↔ canonical asset identity.
-    db_audit = mod.inspect_managed_database(g, EXTRA_SCHEME_STATE)
-    state_codes = {
-        'state_script_uid_mismatch', 'state_script_driver_mismatch',
-        'state_live_script_mismatch', 'state_live_driver_mismatch',
-        'state_asset_name_mismatch',
-    }
-    for row in db_audit.get('issues', []):
-        code = row.get('code')
-        action = ('rebind_state' if code in state_codes else
-                  'repair_database' if code == 'live_livery_missing' else
-                  'rebuild_paint_assets' if code == 'canonical_assets_missing' else None)
-        add(code, 'Created-paint identity',
-            'fail' if row.get('fatal_possible', True) else 'warn', row.get('detail'),
-            repairable=bool(row.get('repairable', True)), uid=row.get('uid'),
-            action=action)
-
-    missing_sources = []
-    missing_thumbnails = []
-    for item in active:
-        uid = int(item['uid'])
-        source = os.path.join(EXTRA_SCHEME_IMAGES,
-                              os.path.basename(str(item.get('source_png') or '')))
-        if not item.get('source_png') or not os.path.exists(source):
-            missing_sources.append(uid)
-            add('paint_source_missing', 'Created-paint assets', 'fail',
-                f'UID {uid} has no saved paint PNG, so its native SD/HD files cannot be reconstructed.',
-                repairable=False, uid=uid)
-        thumb = os.path.join(EXTRA_SCHEME_IMAGES,
-                             os.path.basename(str(item.get('thumbnail_source_png') or '')))
-        if not item.get('thumbnail_source_png') or not os.path.exists(thumb):
-            missing_thumbnails.append(uid)
-            add('thumbnail_source_missing', 'Paint Select thumbnail', 'warn',
-                f'UID {uid} has no saved custom thumbnail PNG; repair will use a native clone.',
-                repairable=True, uid=uid, action='rebuild_team_bank')
-
-    # 2) Indexed SD/HD wrappers and CDF bounds.
-    try:
-        cdf2 = mod.v06.parse_cdf_v6(open(need(reg, '2')['cdf'], 'rb').read())
-        arc2 = need(reg, '2')['ar']; arc2_size = os.path.getsize(arc2)
-        audit_by_uid = {int(x['uid']): x for x in db_audit.get('rows', [])}
-        with open(arc2, 'rb') as fh:
-            for item in active:
-                uid = int(item['uid']); row = audit_by_uid.get(uid, {})
-                names = ((row.get('canonical_sd_entry') or item.get('sd_entry'), 'sd'),
-                         (row.get('canonical_hd_entry') or item.get('hd_entry'), 'hd'))
-                for name, kind in names:
-                    if not name:
-                        continue
-                    try:
-                        _idx, rec = mod.v06.find_v6_file(cdf2, str(name))
-                    except Exception:
-                        # Already reported as canonical_assets_missing by DB audit.
-                        continue
-                    off, size = int(rec.data_offset), int(rec.data_size)
-                    expected = _NATIVE_SD_ENTRY_SIZE if kind == 'sd' else _NATIVE_HD_ENTRY_SIZE
-                    if off < 0 or size <= 0 or off + size > arc2_size:
-                        add('paint_cdf_out_of_bounds', 'Created-paint assets', 'fail',
-                            f'{name} maps outside ARCHIVE2.AR (offset {off}, size {size}, archive {arc2_size}).',
-                            uid=uid, action='rebuild_paint_assets')
-                        continue
-                    if size != expected:
-                        add('paint_wrapper_size_invalid', 'Created-paint assets', 'fail',
-                            f'{name} is {size} bytes; native {kind.upper()} wrapper must be {expected}.',
-                            uid=uid, action='rebuild_paint_assets')
-                        continue
-                    fh.seek(off); raw = fh.read(size)
-                    try:
-                        (_native_sd_validate_wrapper(raw) if kind == 'sd'
-                         else _native_hd_validate_wrapper(raw))
-                    except Exception as ex:
-                        add('paint_wrapper_structure_invalid', 'Created-paint assets', 'fail',
-                            f'{name} failed native wrapper validation: {ex}',
-                            uid=uid, action='rebuild_paint_assets')
-    except Exception as ex:
-        add('archive2_index_unreadable', 'Created-paint assets', 'fail', ex,
-            repairable=False)
-
-    # 3) Current team-bank structure and every required runtime resource.
-    drivers = _full_repair_driver_plan(g, active)
-    teams = collections.defaultdict(list)
-    for driver in drivers:
-        teams[int(driver['team_uid'])].append(driver)
-    team_state = _team_state_load()
-    repair_versions = team_state.get('team_bank_repair_version', {})
-    try:
-        _game, archive1, cdf1 = assets.game_paths(g)
-        _ver, rows1 = assets.v10.parse_cdf_rows(cdf1)
-        arc1_size = archive1.stat().st_size
-        pristine = assets._pristine_td(g)
-        pristine_names = {row.name.casefold() for row, _raw, _parsed in pristine}
-        for team_uid, members in sorted(teams.items()):
-            container = f'2DRIVERSELECTTD_{team_uid}.ARC'
-            matches = [x for x in rows1 if x.name.casefold() == container.casefold()]
-            if len(matches) != 1:
-                add('team_container_index_count', 'Driver Select bank', 'fail',
-                    f'{container} has {len(matches)} CDF mapping(s); exactly one is required.',
-                    team_uid=team_uid, action='rebuild_team_bank')
-                continue
-            row = matches[0]
-            if int(row.offset) < 0 or int(row.size) <= 0 or int(row.offset) + int(row.size) > arc1_size:
-                add('team_container_out_of_bounds', 'Driver Select bank', 'fail',
-                    f'{container} maps outside ARCHIVE1.AR.',
-                    team_uid=team_uid, action='rebuild_team_bank')
-                continue
-            try:
-                raw = assets.v10.read_entry(archive1, row)
-                parsed = assets.v10.parse_multi_arc(raw)
-                entry_names = [e.name for e in parsed.entries]
-                if len(entry_names) != len(set(entry_names)):
-                    add('duplicate_team_resource_name', 'Driver Select bank', 'fail',
-                        f'{container} contains duplicate resource names.',
-                        team_uid=team_uid, action='rebuild_team_bank')
-                footer_start, _footer, _order = thumbs._footer_bounds(raw, parsed)
-                thumbs._validate_directory_header(raw, parsed, footer_start)
-            except Exception as ex:
-                add('team_container_structure_invalid', 'Driver Select bank', 'fail',
-                    f'{container} failed native table/directory/footer parsing: {ex}',
-                    team_uid=team_uid, action='rebuild_team_bank')
-                continue
-
-            # Validate every paint resource in the shared bank, not only
-            # app-created thumbnails. One broken stock/support alias can fatal
-            # the entire team before the selected scheme is reached.
-            for entry in parsed.entries:
-                if not str(entry.name).startswith('PAINTSCHEME_'):
-                    continue
-                try:
-                    fields = struct.unpack('<8I', entry.table_record)
-                    if int(fields[6]) != int(entry.name_ref):
-                        raise ValueError('public name reference is not self-consistent')
-                    identity = assets._identity_name(parsed, entry)
-                    if identity is None or not str(identity).startswith('PAINTSCHEME_'):
-                        raise ValueError('identity reference does not resolve to PAINTSCHEME')
-                    root_name = assets._paint_identity_root(parsed, entry.name)
-                    root = assets.v10.entry_by_name(parsed, root_name)
-                    if not assets._is_native_paint_identity(parsed, root):
-                        raise ValueError('identity chain does not reach a self-identifying root')
-                    thumbs._entry_resource_bytes(raw, parsed, entry, footer_start)  # structural guard
-                    canonical_entries, _ = C.parse_multi_arc(raw)
-                    canonical = next((e for e in canonical_entries if e['name'] == entry.name), None)
-                    if canonical is None:
-                        raise ValueError('resource is missing from the native physical texture table')
-                    if (int(canonical['w']) != 256 or int(canonical['h']) != 256
-                            or str(canonical['fmt']) != 'DXT5'
-                            or int(canonical['payload_size']) < int(canonical['needed'])):
-                        raise ValueError(
-                            f"unexpected texture layout {canonical['w']}x{canonical['h']} "
-                            f"{canonical['fmt']} payload={canonical['payload_size']}")
-                    C.multi_read_png(raw, canonical)
-                except Exception as ex:
-                    add('team_thumbnail_dependency_invalid', 'Driver Select bank', 'fail',
-                        f'{container}: {entry.name} has invalid native identity/texture wiring ({ex}).',
-                        team_uid=team_uid, action='rebuild_team_bank')
-
-            for member in members:
-                driver_uid = int(member['driver_uid'])
-                for kind, name in (
-                    ('tile', f'DRIVERPAINT_{driver_uid}_25041'),
-                    ('number', f'DRIVER_{driver_uid}_3DNUM_25041')):
-                    ok, reason = assets._driver_art_entry_valid(raw, parsed, name, container)
-                    if not ok:
-                        add('driver_art_invalid', 'Driver Select bank', 'fail',
-                            f'{container}: {name} is missing or invalid ({reason}).',
-                            team_uid=team_uid, driver_uid=driver_uid,
-                            action='rebuild_team_bank')
-                for uid in member.get('frontend_livery_uids', []):
-                    name = f'PAINTSCHEME_{int(uid)}'
-                    if name not in entry_names:
-                        add('runtime_thumbnail_missing_from_current_team', 'Driver Select bank', 'fail',
-                            f'{container} is missing runtime-visible {name} for driver {driver_uid}.',
-                            team_uid=team_uid, driver_uid=driver_uid, uid=int(uid),
-                            action='rebuild_team_bank')
-                for uid in member.get('created_livery_uids', []):
-                    try:
-                        info = thumbs.inspect_thumbnail_identity(
-                            g, int(uid), target_container_name=container)
-                    except Exception as ex:
-                        info = {'same_bank_valid': False, 'structural_error': str(ex)}
-                    if not info.get('exists'):
-                        add('created_thumbnail_missing', 'Paint Select thumbnail', 'fail',
-                            f'{container} is missing PAINTSCHEME_{uid}.',
-                            team_uid=team_uid, driver_uid=driver_uid, uid=int(uid),
-                            action='rebuild_team_bank')
-                    elif not info.get('structural_valid'):
-                        add('created_thumbnail_structure_invalid', 'Paint Select thumbnail', 'fail',
-                            f'PAINTSCHEME_{uid} has invalid native DXT5/container structure: '
-                            f'{info.get("structural_error") or "unknown structure error"}.',
-                            team_uid=team_uid, driver_uid=driver_uid, uid=int(uid),
-                            action='rebuild_team_bank')
-                    elif not info.get('same_bank_valid'):
-                        add('created_thumbnail_identity_invalid', 'Paint Select thumbnail', 'fail',
-                            f'PAINTSCHEME_{uid} resolves to {info.get("identity_name") or "no identity"} '
-                            f'instead of a self-identifying same-bank PAINTSCHEME anchor.',
-                            team_uid=team_uid, driver_uid=driver_uid, uid=int(uid),
-                            action='rebuild_team_bank')
-
-            status = assets.team_asset_status(g, team_uid)
-            if not status.get('logo_ready'):
-                add('team_logo_missing', 'Team Select', 'warn',
-                    f'Team UID {team_uid} has no Team Select logo resource.',
-                    team_uid=team_uid, action='repair_team_logo')
-
-            # A legacy bank can be fully parseable while still carrying copied
-            # experimental dependencies. One deep pristine rebuild is required
-            # before we call a moved/custom team game-safe.
-            moved_team = any(str(d['config_uid']) in team_state.get('driver_teams', {})
-                             for d in members)
-            managed_team = any(d.get('created_livery_uids') for d in members)
-            if (moved_team or managed_team) and int(repair_versions.get(str(team_uid), 0) or 0) < 3:
-                add('legacy_team_bank_provenance', 'Driver Select bank', 'warn',
-                    f'{container} predates runtime-visible thumbnail mapping; '
-                    'a pristine-source rebuild is recommended once.',
-                    team_uid=team_uid, action='rebuild_team_bank')
-
-            # Ensure each original source bank exists in the pristine backup.
-            for member in members:
-                source_name = f"2DRIVERSELECTTD_{int(member['source_team_uid'])}.ARC"
-                if source_name.casefold() not in pristine_names:
-                    add('pristine_source_team_missing', 'Repair source', 'fail',
-                        f'Pristine source bank {source_name} is unavailable for '
-                        f'driver {member["driver_uid"]}.', repairable=False,
-                        team_uid=team_uid, driver_uid=int(member['driver_uid']))
-    except Exception as ex:
-        add('archive1_team_index_unreadable', 'Driver Select bank', 'fail', ex,
-            repairable=False)
-
-    # 4) Assignment wiring. An assignment to a missing/mismatched livery can
-    # fatal on race initialization even when menus load.
-    active_uid_driver = {int(x['uid']): int(x.get('driver_uid', -1)) for x in active}
-    assignments = mod.assignments(EXTRA_SCHEME_STATE)
-    assignment_count = 0
-    for event_key, mapping in assignments.items():
-        for driver_uid, livery_uid in (mapping or {}).items():
-            assignment_count += 1
-            driver_uid = int(driver_uid); livery_uid = int(livery_uid)
-            if livery_uid in active_uid_driver and active_uid_driver[livery_uid] != driver_uid:
-                add('ai_assignment_driver_mismatch', 'AI Paint Schedule', 'fail',
-                    f'{event_key}: driver {driver_uid} is assigned UID {livery_uid}, '
-                    f'which belongs to driver {active_uid_driver[livery_uid]}.',
-                    driver_uid=driver_uid, uid=livery_uid,
-                    action='repair_ai_assignments')
-    try:
-        unsafe = _extra_unsafe_assigned_thumbnail_uids()
-        if unsafe:
-            add('ai_assignment_unsafe_thumbnail', 'AI Paint Schedule', 'fail',
-                'Assigned created thumbnail(s) are unsafe: ' + ', '.join(map(str, unsafe)),
-                action='repair_ai_assignments')
-    except Exception as ex:
-        add('ai_assignment_check_failed', 'AI Paint Schedule', 'fail', ex,
-            action='repair_ai_assignments')
-
-    affected_teams = sorted(teams)
-    release_blockers = []
-    for item in active:
-        guard = _stable_paint_creation_guard(int(item.get('driver_uid', -1)))
-        if not guard.get('locked'):
-            continue
-        release_blockers.append({
-            'code': 'moved_custom_created_paint',
-            'uid': int(item.get('uid', -1)),
-            'driver_uid': int(item.get('driver_uid', -1)),
-            'team_uid': guard.get('team_uid'),
-            'detail': (guard.get('reason') or
-                       'This created paint belongs to a moved/custom-team driver.'),
-        })
-    # Public V1 does not let the global repair path rewrite a reserve-team bank,
-    # even when that team currently contains only native schemes.  Recovery is a
-    # normal Move Driver operation back to an authored team, which has its own
-    # transaction and readback checks.
-    for driver in drivers:
-        team_uid = int(driver.get('team_uid', -1))
-        if not _public_custom_team_locked(team_uid):
-            continue
-        release_blockers.append({
-            'code': 'public_custom_team_live',
-            'uid': -1,
-            'driver_uid': int(driver.get('driver_uid', -1)),
-            'team_uid': team_uid,
-            'detail': PUBLIC_CUSTOM_TEAM_MESSAGE,
-        })
-    fail_count = sum(x['severity'] == 'fail' for x in issues)
-    warn_count = sum(x['severity'] == 'warn' for x in issues)
-    unrepairable = [x for x in issues if x['severity'] == 'fail' and not x.get('repairable')]
-    return {
-        'ok': True, 'game': g,
-        'active_created_schemes': len(active),
-        'drivers': drivers,
-        'affected_teams': affected_teams,
-        'affected_driver_count': len(drivers),
-        'ai_assignment_count': assignment_count,
-        'missing_paint_sources': missing_sources,
-        'missing_thumbnail_sources': missing_thumbnails,
-        'backups': {
-            key: bool(os.path.exists(need(reg, key)['bak']) and
-                      os.path.exists(backup_path(need(reg, key)['cdf'])))
-            for key in ('0', '1', '2')
-        },
-        'issues': issues,
-        'fail_count': fail_count,
-        'warn_count': warn_count,
-        'unrepairable_count': len(unrepairable),
-        'repairable': not unrepairable,
-        'release_blockers': release_blockers,
-        'release_repair_locked': bool(release_blockers),
-        'database_audit': db_audit,
-        'note': ('This scan follows live runtime references. Normal differences from stock '
-                 'are ignored; only missing, mismatched, out-of-bounds, structurally invalid, '
-                 'or unverified app-managed dependencies are reported. Full Repair is disabled '
-                 'only when an app-created paint is attached to a spare/custom-team driver, '
-                 'because added-slot rebuilding for those teams has not passed the release stability gate.'),
-    }
-
-
-def _full_repair_plan_data():
-    return _full_repair_failure_scan()
-
-
-def _full_repair_rebuild_paint_assets(g, reg, active, target_uids=None):
-    """Recreate canonical SD/HD assets from saved PNGs without touching DB."""
-    mod = extra_scheme_mod()
-    proven = mod.proven_extra_donor(g)
-    pair = mod.donor_asset_pair(g, proven['script_name'])
-    arc2 = need(reg, '2')['ar']
-    cdf2_path = need(reg, '2')['cdf']
-    cdf2 = mod.v06.parse_cdf_v6(open(cdf2_path, 'rb').read())
-    results = []
-    wanted = None if target_uids is None else {int(x) for x in target_uids}
-    for item in active:
-        if wanted is not None and int(item.get('uid', -1)) not in wanted:
-            continue
-        uid = int(item['uid'])
-        source = os.path.join(EXTRA_SCHEME_IMAGES,
-                              os.path.basename(str(item.get('source_png') or '')))
-        if not os.path.exists(source):
-            raise ValueError(f'saved paint source is missing for UID {uid}')
-        image = Image.open(source).convert('RGB')
-        if image.size != (2048, 1024):
-            image = image.resize((2048, 1024),
-                                 Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS)
-        sd_wrapper, sd_levels, sd_changed = _native_sd_patch_wrapper(pair['sd'], image, None)
-        hd_wrapper, hd_levels, hd_changed = _native_hd_patch_wrapper(pair['hd'], image)
-        script = str(item.get('script_name') or '')
-        sd_name = f'LIVERY_{script}.ARC'; hd_name = f'HDLIVERY_{script}.ARC'
-        found = {}
-        for name in (sd_name, hd_name):
-            try:
-                _idx, rec = mod.v06.find_v6_file(cdf2, name)
-                found[name] = rec
-            except Exception:
-                pass
-        if not found:
-            old_size = os.path.getsize(arc2)
-            sd_off = mod.v06.align(old_size, mod.ALIGN2)
-            hd_off = mod.v06.align(sd_off + len(sd_wrapper), mod.ALIGN2)
-            rebuilt_cdf, _meta = mod.v06.clone_asset_entries(
-                cdf2,
-                f"LIVERY_{proven['script_name']}.ARC",
-                f"HDLIVERY_{proven['script_name']}.ARC",
-                sd_name, hd_name, sd_off, hd_off)
-            mod._append(Path(arc2), sd_off, bytes(sd_wrapper), mod.ALIGN2)
-            mod._append(Path(arc2), hd_off, bytes(hd_wrapper), mod.ALIGN2)
-            mod._atomic(Path(cdf2_path), rebuilt_cdf)
-            cdf2 = mod.v06.parse_cdf_v6(rebuilt_cdf)
-            mode = 'appended_and_repointed'
-        elif len(found) == 2:
-            rows = ((sd_name, found[sd_name], bytes(sd_wrapper)),
-                    (hd_name, found[hd_name], bytes(hd_wrapper)))
-            with open(arc2, 'r+b') as fh:
-                for name, rec, payload in rows:
-                    if int(rec.data_size) != len(payload):
-                        raise ValueError(f'{name} size no longer matches native wrapper size')
-                    fh.seek(int(rec.data_offset)); fh.write(payload)
-                fh.flush(); os.fsync(fh.fileno())
-                for name, rec, payload in rows:
-                    fh.seek(int(rec.data_offset))
-                    if fh.read(len(payload)) != payload:
-                        raise ValueError(f'{name} readback mismatch')
-            mode = 'rewritten_in_place'
-        else:
-            raise ValueError(f'UID {uid} has only one of its canonical SD/HD CDF entries; '
-                             'automatic repair refused to create a split pair')
-        item['sd_entry'] = sd_name; item['hd_entry'] = hd_name
-        item['native_runtime_layout_version'] = 1
-        item['native_runtime_repaired'] = int(time.time())
-        results.append({'uid': uid, 'mode': mode, 'sd_entry': sd_name,
-                        'hd_entry': hd_name, 'sd_changed_bytes': sd_changed,
-                        'hd_changed_bytes': hd_changed,
-                        'sd_levels': sd_levels, 'hd_levels': hd_levels})
-    # The objects above came from the loaded state used by the caller. Reload and
-    # write canonical fields explicitly to avoid relying on object identity.
-    state = mod.load_state(EXTRA_SCHEME_STATE)
-    by_uid = {int(x['uid']): x for x in active}
-    for row in state.get('schemes', []):
-        uid = int(row.get('uid', -1))
-        if uid in by_uid and not row.get('superseded_by'):
-            src = by_uid[uid]
-            for key in ('driver_uid', 'script_name', 'sd_entry', 'hd_entry',
-                        'native_runtime_layout_version', 'native_runtime_repaired'):
-                row[key] = src.get(key)
-    mod.save_state(EXTRA_SCHEME_STATE, state)
-    return results
-
-
-def _full_repair_verify_tabs(g, reg):
-    checks = []
-    def add(tab, status, detail):
-        checks.append({'tab': tab, 'status': status, 'detail': str(detail)})
-    try:
-        drivers, teams = roster(reg)
-        add('Drivers & Teams', 'pass', f'{len(drivers)} drivers and {len(teams)} team names parsed.')
-    except Exception as ex:
-        add('Drivers & Teams', 'fail', ex)
-    try:
-        stats = read_stats(reg)
-        add('Ratings', 'pass', f'{len(stats)} driver rating rows parsed.')
-    except Exception as ex:
-        add('Ratings', 'fail', ex)
-    try:
-        rows, meta = _schedule_read('live', use_cache=False)
-        add('Race Settings', 'pass', f'{len(rows)} schedule slots parsed from {meta.get("label", "live")} data.')
-    except Exception as ex:
-        add('Race Settings', 'fail', ex)
-    try:
-        text_files = _ui_text_quick_status()
-        add('Game Text', 'pass' if text_files else 'warn', f'{len(text_files)} text tables parsed.')
-    except Exception as ex:
-        add('Game Text', 'warn', ex)
-    try:
-        rows = _ui_index() if ui_csv_path() else []
-        add('Graphics', 'pass' if rows else 'warn', f'{len(rows)} indexed graphics available.')
-    except Exception as ex:
-        add('Graphics', 'warn', ex)
-    try:
-        banks = []
-        for arcid, info in reg.items():
-            try:
-                banks.extend(n for _o, _sz, n in parse_cdfiles(info['cdf'])
-                             if n.upper().endswith(('.FSB', '.SND')))
-            except Exception:
-                continue
-        add('Audio', 'pass' if banks else 'warn', f'{len(banks)} indexed audio bank(s) found.')
-    except Exception as ex:
-        add('Audio', 'warn', ex)
-    try:
-        ai_state = _extra_state_public().get('ai', {})
-        add('AI & Physics', 'pass', 'AI paint state parsed; track physics files were preserved.' +
-            (f' Last AI install source: {ai_state.get("source")}.' if ai_state else ''))
-    except Exception as ex:
-        add('AI & Physics', 'warn', ex)
-    return checks
 
 
 @app.route('/api/full_repair/check')
 def full_repair_check_api():
     try:
-        return jsonify(_full_repair_failure_scan())
+        return jsonify(_shared_full_repair_editor().check())
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 400
 
 
 @app.route('/api/full_repair/apply', methods=['POST'])
 def full_repair_apply_api():
-    snapshot = None
-    stage = 'preflight'
-    report = {'ok': False, 'version': APP_VERSION,
-              'started': datetime.datetime.now().isoformat(timespec='seconds'),
-              'steps': []}
     try:
-        stage = 'checking whether NASCAR 15 is closed'
-        if _extra_game_running():
-            raise RuntimeError('NASCAR15.exe is running. Close the game before repairing the installation')
-        with _FULL_REPAIR_LOCK, _EXTRA_CREATE_LOCK, _TEAM_MANAGER_LOCK:
-            stage = 'loading the live game registry'
-            g, reg = _extra_game_and_registry()
-            mod, state, active = _full_repair_active_state()
-            stage = 'rescanning live failure causes'
-            scan = _full_repair_failure_scan()
-            report['scan_before'] = scan
-            report['plan'] = scan
-            protected_created = list(scan.get('release_blockers') or [])
-            if protected_created:
-                details = ', '.join(
-                    ((f"paint UID {x['uid']} / " if int(x.get('uid', -1)) >= 0 else '') +
-                     f"driver {x['driver_uid']} / team {x['team_uid']}")
-                    for x in protected_created[:12])
-                raise ValueError(
-                    'Full Repair is unavailable while a custom-team driver has an added paint slot (' + details +
-                    '). Remove that created slot, move the driver back to an authored team, or restore a known-good game backup. '
-                    'The global repair path will not rebuild added-slot state inside a custom-team bank.')
-            unrepairable = [x for x in scan.get('issues', [])
-                            if x.get('severity') == 'fail' and not x.get('repairable')]
-            if unrepairable:
-                raise ValueError('Unrepairable failure cause(s): ' +
-                                 '; '.join(x.get('detail', '') for x in unrepairable))
-            stage = 'creating rollback coverage'
-            _extra_backups(reg, ('0', '1', '2'))
-            snapshot = _full_repair_snapshot(reg, active)
-
-            # Correct saved identity swaps first. This repairs the map the rest
-            # of the recovery pass follows without replacing any game DB bytes.
-            stage = 'repairing created-paint identity state'
-            state_result = mod.repair_managed_state_from_live(g, EXTRA_SCHEME_STATE)
-            report['steps'].append({
-                'name': 'Created-paint identity map',
-                'status': 'repaired' if state_result.get('changed') else 'skipped',
-                'detail': (f"Rebound {state_result.get('changed', 0)} saved scheme row(s) "
-                           'to their authoritative live UID, driver, ScriptName, and asset names.'
-                           if state_result.get('changed') else
-                           'Saved scheme identities already match the live database.'),
-                'result': state_result,
-            })
-
-            stage = 'repairing missing live livery records'
-            db_result = mod.repair_missing_managed_database_from_live_base(
-                g, EXTRA_SCHEME_STATE, donor_uid=int(mod.PROVEN_EXTRA_DONOR_UID))
-            report['steps'].append({
-                'name': 'Live created-livery records',
-                'status': 'repaired' if db_result.get('changed') else 'skipped',
-                'detail': (f"Added {db_result.get('added', 0)} missing LIVERIE_c record(s) "
-                           'to the current live DB while preserving every existing record.'
-                           if db_result.get('changed') else
-                           'All created LIVERIE_c records were already present and coherent.'),
-                'result': db_result,
-            })
-
-            # Re-read canonicalized state, then reconstruct only paint pairs
-            # whose CDF/wrapper/identity scan failed or whose saved state was
-            # rebound to a different live identity.
-            mod, state, active = _full_repair_active_state()
-            changed_state_uids = {int(x['uid']) for x in state_result.get('changes', [])}
-            paint_issue_uids = {int(x['uid']) for x in scan.get('issues', [])
-                                if x.get('uid') is not None and
-                                x.get('action') == 'rebuild_paint_assets'}
-            paint_targets = changed_state_uids | paint_issue_uids
-            stage = 'rebuilding failed SD/HD paint assets'
-            paint_assets = (_full_repair_rebuild_paint_assets(
-                g, reg, active, paint_targets) if paint_targets else [])
-            report['steps'].append({
-                'name': 'Native SD/HD created paints',
-                'status': 'repaired' if paint_assets else 'skipped',
-                'detail': (f'Rebuilt {len(paint_assets)} failed canonical native paint pair(s) from saved PNGs.'
-                           if paint_assets else
-                           'Every indexed native SD/HD paint wrapper already passed the failure scan.'),
-                'result': paint_assets,
-            })
-
-            # Saved DB team links remain live; reapply only if a prior DB-add
-            # operation changed the indexed PYC revision.
-            stage = 'reapplying saved team and manufacturer links'
-            team_links = _team_reapply_saved_links()
-            report['steps'].append({
-                'name': 'Driver/team and manufacturer links',
-                'status': 'repaired' if team_links.get('changed') else 'skipped',
-                'detail': ('Reapplied saved team/manufacturer links.' if team_links.get('changed')
-                           else 'Saved team/manufacturer links already matched live data.'),
-                'result': team_links,
-            })
-
-            stage = 'building the current driver/team recovery plan'
-            drivers = _full_repair_driver_plan(g, active)
-            all_teams = collections.defaultdict(list)
-            driver_team_map = {}
-            for driver in drivers:
-                team_uid = int(driver['team_uid'])
-                driver_team_map[int(driver['driver_uid'])] = team_uid
-                all_teams[team_uid].append({
-                    'driver_uid': int(driver['driver_uid']),
-                    'source_team_uid': int(driver['source_team_uid']),
-                    'livery_uids': list(driver.get('frontend_livery_uids', [])),
-                    'config_uid': int(driver['config_uid']),
-                })
-            team_targets = {int(x['team_uid']) for x in scan.get('issues', [])
-                            if x.get('team_uid') is not None and
-                            x.get('action') == 'rebuild_team_bank'}
-            for change in state_result.get('changes', []):
-                after_driver = int((change.get('after') or {}).get('driver_uid', -1))
-                if after_driver in driver_team_map:
-                    team_targets.add(driver_team_map[after_driver])
-            team_state = _team_state_load()
-            created_by_driver = collections.defaultdict(list)
-            for item in active:
-                created_by_driver[int(item.get('driver_uid', -1))].append(int(item['uid']))
-            assets = team_assets_mod()
-            team_reports = []
-            thumb_reports = []
-            stage = 'rebuilding affected Driver Select banks'
-            for team_uid in sorted(team_targets):
-                members = all_teams.get(team_uid, [])
-                if not members:
-                    raise ValueError(f'Team {team_uid} was flagged but no current driver plan could be built')
-                donor_uid = int(team_state.get('team_logo_donors', {}).get(
-                    str(team_uid), members[0]['source_team_uid']))
-                member_reports = []
-                for member in members:
-                    report = assets.ensure_driver_assets(
-                        g, int(team_uid), int(member['source_team_uid']),
-                        int(member['driver_uid']),
-                        list(member.get('livery_uids') or []))
-                    report['transfer_strategy'] = 'public_v1_direct_revision'
-                    member_reports.append(report)
-                clean = {
-                    'ok': True,
-                    'destination_team_uid': int(team_uid),
-                    'strategy': 'public_v1_sequential_team_repair',
-                    'member_reports': member_reports,
-                    'missing_optional_resources': list(dict.fromkeys(
-                        name for report in member_reports
-                        for name in (report.get('missing_optional_resources') or []))),
-                    'readback_verified': all(
-                        bool(report.get('readback_verified', True))
-                        for report in member_reports),
-                }
-                team_reports.append(clean)
-                for member in members:
-                    if created_by_driver.get(int(member['driver_uid'])):
-                        thumb_reports.extend(_team_rebuild_created_thumbnails(
-                            g, int(member['driver_uid']), int(team_uid)))
-                status = assets.team_asset_status(g, int(team_uid))
-                if not status.get('logo_ready'):
-                    assets.ensure_team_logo(g, int(team_uid), donor_uid)
-            # Logo-only warnings do not need a full TD-bank rebuild.
-            logo_targets = {int(x['team_uid']) for x in scan.get('issues', [])
-                            if x.get('team_uid') is not None and
-                            x.get('action') == 'repair_team_logo'} - team_targets
-            for team_uid in sorted(logo_targets):
-                members = all_teams.get(team_uid, [])
-                if not members:
-                    continue
-                donor_uid = int(team_state.get('team_logo_donors', {}).get(
-                    str(team_uid), members[0]['source_team_uid']))
-                assets.ensure_team_logo(g, int(team_uid), donor_uid)
-            if team_targets:
-                team_state = _team_state_load()
-                versions = team_state.setdefault('team_bank_repair_version', {})
-                for team_uid in team_targets:
-                    versions[str(team_uid)] = 3
-                team_state['last_failure_focused_repair'] = datetime.datetime.now().isoformat(timespec='seconds')
-                _team_state_save(team_state)
-            report['steps'].append({
-                'name': 'Driver Select and Paint Select banks',
-                'status': 'repaired' if team_reports or logo_targets else 'skipped',
-                'detail': ((f'Rebuilt {len(team_reports)} failed team bank(s) from a pristine base and validated '
-                            f'source resources, recreated {len(thumb_reports)} custom thumbnail(s), and '
-                            f'restored {len(logo_targets)} logo-only target(s).')
-                           if team_reports or logo_targets else
-                           'Every current-team bank, driver-art resource, thumbnail chain, and team logo passed.'),
-                'teams': team_reports, 'thumbnails': thumb_reports,
-            })
-
-            stage = 'reapplying AI paint assignments'
-            assignments = mod.assignments(EXTRA_SCHEME_STATE)
-            assignment_count = sum(len(x or {}) for x in assignments.values())
-            ai_issue = any(x.get('action') == 'repair_ai_assignments'
-                           for x in scan.get('issues', []))
-            repaired_runtime_dependency = bool(paint_assets or team_reports or state_result.get('changed') or db_result.get('changed'))
-            if assignment_count and (ai_issue or repaired_runtime_dependency):
-                unsafe = _extra_unsafe_assigned_thumbnail_uids()
-                if unsafe:
-                    raise ValueError('thumbnail verification still blocks AI assignments for UID(s): ' +
-                                     ', '.join(map(str, unsafe)))
-                ba, bc = _extra_ai_backup_paths(reg)
-                ai = mod.apply_ai(g, EXTRA_SCHEME_STATE,
-                                  backup_archive=ba, backup_cdf=bc)
-                report['steps'].append({
-                    'name': 'AI Paint Schedule', 'status': 'repaired',
-                    'detail': f'Reapplied {assignment_count} saved race assignment(s).',
-                    'result': ai,
-                })
-            else:
-                report['steps'].append({
-                    'name': 'AI Paint Schedule', 'status': 'skipped',
-                    'detail': ('No saved AI paint assignments exist.' if not assignment_count else
-                               'Saved AI assignments passed and no repaired dependency required reinstalling EVENTINIT.'),
-                })
-
-            try:
-                _SCHEDULE_SOURCE_CACHE.clear(); _SCHEDULE_CACHE.clear(); _clear_ui_thumb_cache()
-            except Exception:
-                pass
-            stage = 'running final failure scan'
-            final_scan = _full_repair_failure_scan()
-            report['scan_after'] = final_scan
-            remaining_fails = [x for x in final_scan.get('issues', [])
-                               if x.get('severity') == 'fail']
-            if remaining_fails:
-                raise RuntimeError('post-repair fatal-cause scan still fails: ' +
-                                   '; '.join(x.get('detail', '') for x in remaining_fails))
-            stage = 'running Paint System Check'
-            paint = _full_repair_json(paint_system_check_api())
-            critical = [x for x in paint.get('checks', []) if x.get('status') == 'fail']
-            if critical:
-                raise RuntimeError('post-repair Paint System Check still fails: ' +
-                                   '; '.join(f"{x.get('name')}: {x.get('detail')}" for x in critical))
-            stage = 'verifying every app tab'
-            tab_checks = _full_repair_verify_tabs(g, reg)
-            hard_tab_fail = [x for x in tab_checks if x.get('status') == 'fail']
-            if hard_tab_fail:
-                raise RuntimeError('post-repair tab verification failed: ' +
-                                   '; '.join(f"{x['tab']}: {x['detail']}" for x in hard_tab_fail))
-            report['paint_system'] = paint
-            report['tab_checks'] = tab_checks
-            report['ok'] = True
-            report['finished'] = datetime.datetime.now().isoformat(timespec='seconds')
-            report['summary'] = (f'Failure-focused repair completed. The scan found '
-                                 f'{scan.get("fail_count", 0)} fatal candidate(s) and '
-                                 f'{scan.get("warn_count", 0)} warning(s); all repairable '
-                                 'fatal candidates are clear after repair.')
-            _extra_atomic_bytes(FULL_REPAIR_REPORT,
-                                json.dumps(report, indent=2).encode('utf-8'))
-            return jsonify(report)
+        return jsonify(_shared_full_repair_editor().apply())
     except Exception as ex:
-        rollback = _full_repair_restore(snapshot) if snapshot else []
-        report['failed_stage'] = stage
-        report['error'] = f'Repair stopped during {stage}: {ex}'
-        report['rolled_back'] = bool(snapshot and not rollback)
-        report['rollback_errors'] = rollback
-        report['finished'] = datetime.datetime.now().isoformat(timespec='seconds')
-        try:
-            _extra_atomic_bytes(FULL_REPAIR_REPORT,
-                                json.dumps(report, indent=2).encode('utf-8'))
-        except Exception:
-            pass
-        detail = report['error']
-        if rollback:
-            detail += ' | Rollback warnings: ' + '; '.join(rollback)
-        return jsonify(dict(ok=False, error=detail,
-                            rolled_back=bool(snapshot and not rollback),
-                            report=report)), 400
+        return jsonify(dict(ok=False, error=str(ex))), 400
 
 
 @app.route('/api/full_repair/report')
 def full_repair_report_api():
-    if not os.path.exists(FULL_REPAIR_REPORT):
-        return jsonify(dict(ok=False, error='no whole-install repair has been run yet')), 404
-    return send_file(FULL_REPAIR_REPORT, mimetype='application/json',
-                     as_attachment=True,
-                     download_name=f'nascar15_whole_mod_repair_v{APP_VERSION}.json')
+    try:
+        payload = json.dumps(
+            _shared_full_repair_editor().report(), indent=2,
+        ).encode('utf-8')
+        return send_file(
+            io.BytesIO(payload), mimetype='application/json', as_attachment=True,
+            download_name=f'nascar15_whole_mod_repair_v{APP_VERSION}.json',
+        )
+    except Exception as ex:
+        return jsonify(dict(ok=False, error=str(ex))), 404
 
 # ==================== end v0.9.31.3 FAILURE-FOCUSED WHOLE MOD REPAIR ====================
 
@@ -14291,31 +8072,21 @@ def extra_scheme_mod():
     global _EXTRA_SCHEME_MOD
     if _EXTRA_SCHEME_MOD is not None:
         # Re-apply each call so a UID verdict takes effect without a restart.
-        return _extra_apply_uid_pool(_EXTRA_SCHEME_MOD)
-    path = component_path(EXTRA_SCHEME_HELPER)
-    if not os.path.exists(path):
-        raise RuntimeError(f'{EXTRA_SCHEME_HELPER} is missing from the internal tools folder')
-    spec = importlib.util.spec_from_file_location('n15_extra_scheme_manager', path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules['n15_extra_scheme_manager'] = mod
-    spec.loader.exec_module(mod)
-    _EXTRA_SCHEME_MOD = mod
-    return _extra_apply_uid_pool(mod)
+        return ManagedPaintEditor.apply_uid_pool(_EXTRA_SCHEME_MOD, os.path.join(USER_DIR, ManagedPaintEditor.UID_STATE_NAME))
+    _EXTRA_SCHEME_MOD = _load_internal_module(
+        EXTRA_SCHEME_HELPER, 'n15_extra_scheme_manager'
+    )
+    return ManagedPaintEditor.apply_uid_pool(_EXTRA_SCHEME_MOD, os.path.join(USER_DIR, ManagedPaintEditor.UID_STATE_NAME))
 
 
 def extra_thumbnail_mod():
     global _EXTRA_THUMBNAIL_MOD
     if _EXTRA_THUMBNAIL_MOD is not None:
         return _EXTRA_THUMBNAIL_MOD
-    path = component_path(EXTRA_THUMBNAIL_HELPER)
-    if not os.path.exists(path):
-        raise RuntimeError(f'{EXTRA_THUMBNAIL_HELPER} is missing from the internal tools folder')
-    spec = importlib.util.spec_from_file_location('n15_thumbnail_native_v25', path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules['n15_thumbnail_native_v25'] = mod
-    spec.loader.exec_module(mod)
-    _EXTRA_THUMBNAIL_MOD = mod
-    return mod
+    _EXTRA_THUMBNAIL_MOD = _load_internal_module(
+        EXTRA_THUMBNAIL_HELPER, 'n15_thumbnail_native_v25'
+    )
+    return _EXTRA_THUMBNAIL_MOD
 
 
 def extra_stock_thumbnail_mod():
@@ -14328,15 +8099,10 @@ def extra_stock_thumbnail_mod():
     global _EXTRA_STOCK_THUMBNAIL_MOD
     if _EXTRA_STOCK_THUMBNAIL_MOD is not None:
         return _EXTRA_STOCK_THUMBNAIL_MOD
-    path = component_path(EXTRA_STOCK_THUMBNAIL_HELPER)
-    if not os.path.exists(path):
-        raise RuntimeError(f'{EXTRA_STOCK_THUMBNAIL_HELPER} is missing from the internal tools folder')
-    spec = importlib.util.spec_from_file_location('n15_thumbnail_stock_legacy_v25', path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules['n15_thumbnail_stock_legacy_v25'] = mod
-    spec.loader.exec_module(mod)
-    _EXTRA_STOCK_THUMBNAIL_MOD = mod
-    return mod
+    _EXTRA_STOCK_THUMBNAIL_MOD = _load_internal_module(
+        EXTRA_STOCK_THUMBNAIL_HELPER, 'n15_thumbnail_stock_legacy_v25'
+    )
+    return _EXTRA_STOCK_THUMBNAIL_MOD
 
 
 def extra_legacy_scheme_mod():
@@ -14349,15 +8115,10 @@ def extra_legacy_scheme_mod():
     global _EXTRA_LEGACY_SCHEME_MOD
     if _EXTRA_LEGACY_SCHEME_MOD is not None:
         return _EXTRA_LEGACY_SCHEME_MOD
-    path = component_path(EXTRA_LEGACY_SCHEME_HELPER)
-    if not os.path.exists(path):
-        raise RuntimeError(f'{EXTRA_LEGACY_SCHEME_HELPER} is missing from the internal tools folder')
-    spec = importlib.util.spec_from_file_location('n15_extra_scheme_manager_legacy_v1', path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules['n15_extra_scheme_manager_legacy_v1'] = mod
-    spec.loader.exec_module(mod)
-    _EXTRA_LEGACY_SCHEME_MOD = mod
-    return mod
+    _EXTRA_LEGACY_SCHEME_MOD = _load_internal_module(
+        EXTRA_LEGACY_SCHEME_HELPER, 'n15_extra_scheme_manager_legacy_v1'
+    )
+    return _EXTRA_LEGACY_SCHEME_MOD
 
 
 def extra_legacy_thumbnail_mod():
@@ -14365,15 +8126,10 @@ def extra_legacy_thumbnail_mod():
     global _EXTRA_LEGACY_THUMBNAIL_MOD
     if _EXTRA_LEGACY_THUMBNAIL_MOD is not None:
         return _EXTRA_LEGACY_THUMBNAIL_MOD
-    path = component_path(EXTRA_LEGACY_THUMBNAIL_HELPER)
-    if not os.path.exists(path):
-        raise RuntimeError(f'{EXTRA_LEGACY_THUMBNAIL_HELPER} is missing from the internal tools folder')
-    spec = importlib.util.spec_from_file_location('n15_thumbnail_native_legacy_v25', path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules['n15_thumbnail_native_legacy_v25'] = mod
-    spec.loader.exec_module(mod)
-    _EXTRA_LEGACY_THUMBNAIL_MOD = mod
-    return mod
+    _EXTRA_LEGACY_THUMBNAIL_MOD = _load_internal_module(
+        EXTRA_LEGACY_THUMBNAIL_HELPER, 'n15_thumbnail_native_legacy_v25'
+    )
+    return _EXTRA_LEGACY_THUMBNAIL_MOD
 
 
 def extra_fixed_template_mod():
@@ -14381,15 +8137,10 @@ def extra_fixed_template_mod():
     global _EXTRA_FIXED_TEMPLATE_MOD
     if _EXTRA_FIXED_TEMPLATE_MOD is not None:
         return _EXTRA_FIXED_TEMPLATE_MOD
-    path = component_path(EXTRA_FIXED_TEMPLATE_HELPER)
-    if not os.path.exists(path):
-        raise RuntimeError(f'{EXTRA_FIXED_TEMPLATE_HELPER} is missing from the internal tools folder')
-    spec = importlib.util.spec_from_file_location('n15_fixed_template_stock_paint_v1', path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules['n15_fixed_template_stock_paint_v1'] = mod
-    spec.loader.exec_module(mod)
-    _EXTRA_FIXED_TEMPLATE_MOD = mod
-    return mod
+    _EXTRA_FIXED_TEMPLATE_MOD = _load_internal_module(
+        EXTRA_FIXED_TEMPLATE_HELPER, 'n15_fixed_template_stock_paint_v1'
+    )
+    return _EXTRA_FIXED_TEMPLATE_MOD
 
 
 def _legacy_stock_creation_guard(driver_uid):
@@ -14415,724 +8166,25 @@ def _legacy_stock_creation_guard(driver_uid):
             'experimental_moved_driver': moved}
 
 
-def _extra_atomic_bytes(path, data):
-    tmp = str(path) + '.extra_atomic.tmp'
-    with open(tmp, 'wb') as fh:
-        fh.write(data); fh.flush(); os.fsync(fh.fileno())
-    os.replace(tmp, path)
-
-
 def _extra_transaction_snapshot(reg, groups=('0','1','2'), inplace_thumbnail=None):
-    snap = {
-        'groups': {},
-        'state_exists': os.path.exists(EXTRA_SCHEME_STATE),
-        'state_bytes': open(EXTRA_SCHEME_STATE, 'rb').read() if os.path.exists(EXTRA_SCHEME_STATE) else None,
-        'image_files': set(os.listdir(EXTRA_SCHEME_IMAGES)) if os.path.isdir(EXTRA_SCHEME_IMAGES) else set(),
-        'image_overwrites': {},
-        'inplace_thumbnail': None,
-    }
-    for key in groups:
-        v = need(reg, key)
-        snap['groups'][key] = {
-            'archive': v['ar'], 'archive_size': os.path.getsize(v['ar']),
-            'cdf': v['cdf'], 'cdf_bytes': open(v['cdf'], 'rb').read(),
-        }
-    if inplace_thumbnail:
-        archive, row, raw, _entry = inplace_thumbnail
-        snap['inplace_thumbnail'] = {
-            'archive': str(archive), 'offset': int(row['offset']),
-            'size': int(row['size']), 'raw': bytes(raw),
-        }
-    return snap
+    return _shared_paint_transaction().snapshot(groups, inplace_thumbnail)
 
 
 def _extra_transaction_restore(snapshot):
-    errors = []
-    if not snapshot:
-        return errors
-    try:
-        item = snapshot.get('inplace_thumbnail')
-        if item:
-            with open(item['archive'], 'r+b') as fh:
-                fh.seek(item['offset']); fh.write(item['raw']); fh.flush(); os.fsync(fh.fileno())
-    except Exception as ex:
-        errors.append('thumbnail restore: ' + str(ex))
-    for key, item in snapshot.get('groups', {}).items():
-        try:
-            with open(item['archive'], 'r+b') as fh:
-                fh.truncate(int(item['archive_size'])); fh.flush(); os.fsync(fh.fileno())
-            _extra_atomic_bytes(item['cdf'], item['cdf_bytes'])
-        except Exception as ex:
-            errors.append(f'archive {key} restore: {ex}')
-    try:
-        if snapshot.get('state_exists'):
-            _extra_atomic_bytes(EXTRA_SCHEME_STATE, snapshot.get('state_bytes') or b'')
-        elif os.path.exists(EXTRA_SCHEME_STATE):
-            os.remove(EXTRA_SCHEME_STATE)
-    except Exception as ex:
-        errors.append('state restore: ' + str(ex))
-    try:
-        for name, raw in (snapshot.get('image_overwrites') or {}).items():
-            _extra_atomic_bytes(os.path.join(EXTRA_SCHEME_IMAGES, name), raw)
-        before = snapshot.get('image_files', set())
-        for name in os.listdir(EXTRA_SCHEME_IMAGES):
-            if name not in before:
-                path = os.path.join(EXTRA_SCHEME_IMAGES, name)
-                if os.path.isfile(path):
-                    os.remove(path)
-    except Exception as ex:
-        errors.append('source image cleanup: ' + str(ex))
-    return errors
+    return _shared_paint_transaction().restore(snapshot) if snapshot else []
 
 
 def _extra_clear_persisted_snapshot():
-    if os.path.isdir(EXTRA_SCHEME_ROLLBACK_DIR):
-        shutil.rmtree(EXTRA_SCHEME_ROLLBACK_DIR)
+    return _shared_paint_checkpoint().clear()
 
 
 def _extra_persist_snapshot(snapshot, label, operation=None):
-    """Persist the exact pre-write paint transaction for one-click undo.
-
-    Archives in these workflows are append/repoint operations, so their original
-    size plus exact CDF bytes is a complete rollback. The manifest is sealed
-    after a successful write with the exact post-write archive tails and CDF
-    hashes. Delete is then allowed only when that sealed state still matches.
-    """
-    if not snapshot:
-        raise ValueError('paint rollback snapshot is empty')
-    tmp = EXTRA_SCHEME_ROLLBACK_DIR + '.tmp'
-    if os.path.isdir(tmp):
-        shutil.rmtree(tmp)
-    os.makedirs(tmp, exist_ok=True)
-    groups = {}
-    for key, item in snapshot.get('groups', {}).items():
-        cdf_name = f'cdf_{key}.bin'
-        with open(os.path.join(tmp, cdf_name), 'wb') as fh:
-            fh.write(item['cdf_bytes'])
-        groups[str(key)] = {
-            'archive': str(item['archive']), 'archive_size': int(item['archive_size']),
-            'cdf': str(item['cdf']), 'cdf_backup': cdf_name,
-        }
-    state_name = None
-    if snapshot.get('state_exists'):
-        state_name = 'extra_schemes_state.bin'
-        with open(os.path.join(tmp, state_name), 'wb') as fh:
-            fh.write(snapshot.get('state_bytes') or b'')
-    images_dir = os.path.join(tmp, 'images')
-    os.makedirs(images_dir, exist_ok=True)
-    if os.path.isdir(EXTRA_SCHEME_IMAGES):
-        for name in os.listdir(EXTRA_SCHEME_IMAGES):
-            src = os.path.join(EXTRA_SCHEME_IMAGES, name)
-            if os.path.isfile(src):
-                shutil.copy2(src, os.path.join(images_dir, name))
-    inplace_meta = None
-    inplace = snapshot.get('inplace_thumbnail')
-    if inplace:
-        raw_name = 'inplace_thumbnail.bin'
-        with open(os.path.join(tmp, raw_name), 'wb') as fh:
-            fh.write(inplace['raw'])
-        inplace_meta = {
-            'archive': str(inplace['archive']), 'offset': int(inplace['offset']),
-            'size': int(inplace['size']), 'raw_backup': raw_name,
-        }
-    manifest = {
-        'format': 'nascar15-extra-scheme-rollback-v2', 'version': 2,
-        'mode': 'restore_pre',
-        'label': str(label or 'Last paint change'),
-        'created': time.strftime('%Y-%m-%d %H:%M:%S'),
-        'groups': groups, 'state_exists': bool(snapshot.get('state_exists')),
-        'state_backup': state_name, 'inplace_thumbnail': inplace_meta,
-        'operation': dict(operation or {}),
-        'post_state': None,
-    }
-    with open(os.path.join(tmp, 'manifest.json'), 'w', encoding='utf-8') as fh:
-        json.dump(manifest, fh, indent=2)
-    if os.path.isdir(EXTRA_SCHEME_ROLLBACK_DIR):
-        shutil.rmtree(EXTRA_SCHEME_ROLLBACK_DIR)
-    os.replace(tmp, EXTRA_SCHEME_ROLLBACK_DIR)
-    return manifest
-
-
-def _extra_sha256_bytes(data):
-    return hashlib.sha256(bytes(data)).hexdigest()
-
-
-def _extra_sha256_file(path, start=0, size=None):
-    h = hashlib.sha256()
-    with open(path, 'rb') as fh:
-        fh.seek(int(start))
-        left = None if size is None else int(size)
-        while True:
-            chunk = fh.read(1024 * 1024 if left is None else min(1024 * 1024, left))
-            if not chunk:
-                break
-            h.update(chunk)
-            if left is not None:
-                left -= len(chunk)
-                if left <= 0:
-                    break
-    return h.hexdigest()
-
-
-def _extra_image_fingerprint(folder):
-    out = {}
-    if os.path.isdir(folder):
-        for name in sorted(os.listdir(folder)):
-            path = os.path.join(folder, name)
-            if os.path.isfile(path):
-                out[name] = _extra_sha256_file(path)
-    return out
+    return _shared_paint_checkpoint().persist(snapshot, label, operation)
 
 
 def _extra_seal_persisted_snapshot(operation=None):
-    """Seal a successful append/repoint transaction for safe future deletion."""
-    path = os.path.join(EXTRA_SCHEME_ROLLBACK_DIR, 'manifest.json')
-    if not os.path.exists(path):
-        raise ValueError('paint rollback manifest vanished before it could be sealed')
-    manifest = json.load(open(path, 'r', encoding='utf-8'))
-    if manifest.get('format') != 'nascar15-extra-scheme-rollback-v2':
-        raise ValueError('paint rollback manifest is not the reversible v2 format')
-    post_groups = {}
-    for key, item in (manifest.get('groups') or {}).items():
-        archive = os.path.abspath(str(item['archive']))
-        cdf = os.path.abspath(str(item['cdf']))
-        pre_size = int(item['archive_size'])
-        post_size = os.path.getsize(archive)
-        if post_size < pre_size:
-            raise ValueError(f'ARCHIVE{key} shrank during paint creation')
-        post_groups[str(key)] = {
-            'archive_size': int(post_size),
-            'tail_size': int(post_size - pre_size),
-            'tail_sha256': _extra_sha256_file(archive, pre_size, post_size - pre_size),
-            'cdf_size': os.path.getsize(cdf),
-            'cdf_sha256': _extra_sha256_file(cdf),
-        }
-    state_exists = os.path.exists(EXTRA_SCHEME_STATE)
-    state_sha = _extra_sha256_file(EXTRA_SCHEME_STATE) if state_exists else None
-    manifest['post_state'] = {
-        'groups': post_groups,
-        'state_exists': bool(state_exists),
-        'state_sha256': state_sha,
-        'images': _extra_image_fingerprint(EXTRA_SCHEME_IMAGES),
-    }
-    if operation:
-        manifest['operation'] = dict(operation)
-    tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as fh:
-        json.dump(manifest, fh, indent=2)
-    os.replace(tmp, path)
-    return manifest
+    return _shared_paint_checkpoint().seal(operation)
 
-
-def _extra_verify_manifest_post_state(manifest):
-    post = manifest.get('post_state') or {}
-    if not post.get('groups'):
-        raise ValueError('this paint checkpoint predates exact delete support; restore a clean game and create the slot again with this release')
-    for key, expected in post['groups'].items():
-        item = (manifest.get('groups') or {}).get(str(key)) or {}
-        archive = os.path.abspath(str(item.get('archive') or ''))
-        cdf = os.path.abspath(str(item.get('cdf') or ''))
-        pre_size = int(item.get('archive_size', -1))
-        if not os.path.exists(archive) or not os.path.exists(cdf):
-            raise ValueError(f'ARCHIVE{key} checkpoint target is missing')
-        post_size = int(expected['archive_size'])
-        if os.path.getsize(archive) != post_size:
-            raise ValueError(f'ARCHIVE{key} changed after this slot was created; exact delete is blocked')
-        tail_size = int(expected['tail_size'])
-        if post_size - pre_size != tail_size:
-            raise ValueError(f'ARCHIVE{key} append geometry no longer matches the creation checkpoint')
-        if _extra_sha256_file(archive, pre_size, tail_size) != expected['tail_sha256']:
-            raise ValueError(f'ARCHIVE{key} appended bytes changed after this slot was created; exact delete is blocked')
-        if os.path.getsize(cdf) != int(expected['cdf_size']) or _extra_sha256_file(cdf) != expected['cdf_sha256']:
-            raise ValueError(f'cdfiles{key}.dat changed after this slot was created; exact delete is blocked')
-    state_exists = os.path.exists(EXTRA_SCHEME_STATE)
-    if bool(post.get('state_exists')) != bool(state_exists):
-        raise ValueError('the app-created paint state changed after this slot was created')
-    if state_exists and _extra_sha256_file(EXTRA_SCHEME_STATE) != post.get('state_sha256'):
-        raise ValueError('the app-created paint state changed after this slot was created')
-    if _extra_image_fingerprint(EXTRA_SCHEME_IMAGES) != (post.get('images') or {}):
-        raise ValueError('saved paint/thumbnail files changed after this slot was created')
-    return True
-
-
-def _extra_load_persisted_snapshot(reg=None):
-    path = os.path.join(EXTRA_SCHEME_ROLLBACK_DIR, 'manifest.json')
-    if not os.path.exists(path):
-        raise ValueError('there is no paint change to undo')
-    manifest = json.load(open(path, 'r', encoding='utf-8'))
-    if manifest.get('format') not in ('nascar15-extra-scheme-rollback-v1', 'nascar15-extra-scheme-rollback-v2'):
-        raise ValueError('the saved paint rollback manifest is not recognized')
-    groups = {}
-    for key, item in (manifest.get('groups') or {}).items():
-        key = str(key)
-        archive_path = os.path.abspath(str(item['archive']))
-        cdf_path = os.path.abspath(str(item['cdf']))
-        if reg is not None:
-            live = need(reg, key)
-            if (os.path.normcase(os.path.abspath(live['ar'])) != os.path.normcase(archive_path) or
-                    os.path.normcase(os.path.abspath(live['cdf'])) != os.path.normcase(cdf_path)):
-                raise ValueError('the saved paint undo belongs to a different NASCAR 15 installation')
-        if not os.path.exists(archive_path) or not os.path.exists(cdf_path):
-            raise ValueError(f'the saved paint undo target for ARCHIVE{key} no longer exists')
-        original_size = int(item['archive_size'])
-        if os.path.getsize(archive_path) < original_size:
-            raise ValueError(f'ARCHIVE{key} is smaller than the saved pre-change size; refusing an unsafe undo')
-        cdf_bytes = open(os.path.join(EXTRA_SCHEME_ROLLBACK_DIR, item['cdf_backup']), 'rb').read()
-        if len(cdf_bytes) < 64 or cdf_bytes[:4] != b'filC':
-            raise ValueError(f'the saved CDF backup for ARCHIVE{key} is invalid')
-        groups[key] = {
-            'archive': archive_path, 'archive_size': original_size,
-            'cdf': cdf_path, 'cdf_bytes': cdf_bytes,
-        }
-    state_bytes = None
-    if manifest.get('state_exists') and manifest.get('state_backup'):
-        state_bytes = open(os.path.join(EXTRA_SCHEME_ROLLBACK_DIR, manifest['state_backup']), 'rb').read()
-    image_dir = os.path.join(EXTRA_SCHEME_ROLLBACK_DIR, 'images')
-    image_overwrites = {}
-    image_files = set()
-    if os.path.isdir(image_dir):
-        for name in os.listdir(image_dir):
-            src = os.path.join(image_dir, name)
-            if os.path.isfile(src):
-                image_files.add(name)
-                image_overwrites[name] = open(src, 'rb').read()
-    inplace = None
-    im = manifest.get('inplace_thumbnail')
-    if im:
-        inplace = {
-            'archive': im['archive'], 'offset': int(im['offset']), 'size': int(im['size']),
-            'raw': open(os.path.join(EXTRA_SCHEME_ROLLBACK_DIR, im['raw_backup']), 'rb').read(),
-        }
-    return {
-        'groups': groups, 'state_exists': bool(manifest.get('state_exists')),
-        'state_bytes': state_bytes, 'image_files': image_files,
-        'image_overwrites': image_overwrites, 'inplace_thumbnail': inplace,
-    }, manifest
-
-
-def _extra_prepare_delete_redo(manifest, uid):
-    """Capture the exact post-create bytes before rolling the latest slot back."""
-    tmp = EXTRA_SCHEME_ROLLBACK_DIR + '.redo.tmp'
-    if os.path.isdir(tmp):
-        shutil.rmtree(tmp)
-    shutil.copytree(EXTRA_SCHEME_ROLLBACK_DIR, tmp)
-    redo_groups = {}
-    for key, item in (manifest.get('groups') or {}).items():
-        archive = os.path.abspath(str(item['archive']))
-        cdf = os.path.abspath(str(item['cdf']))
-        base_size = int(item['archive_size'])
-        current_size = os.path.getsize(archive)
-        tail_name = f'redo_tail_{key}.bin'
-        with open(archive, 'rb') as fh:
-            fh.seek(base_size)
-            tail = fh.read(current_size - base_size)
-        with open(os.path.join(tmp, tail_name), 'wb') as fh:
-            fh.write(tail)
-        cdf_name = f'redo_cdf_{key}.bin'
-        shutil.copy2(cdf, os.path.join(tmp, cdf_name))
-        redo_groups[str(key)] = {
-            'tail_backup': tail_name, 'tail_size': len(tail),
-            'cdf_backup': cdf_name,
-        }
-    redo_state = None
-    redo_state_exists = os.path.exists(EXTRA_SCHEME_STATE)
-    if redo_state_exists:
-        redo_state = 'redo_state.bin'
-        shutil.copy2(EXTRA_SCHEME_STATE, os.path.join(tmp, redo_state))
-    redo_images = os.path.join(tmp, 'redo_images')
-    os.makedirs(redo_images, exist_ok=True)
-    if os.path.isdir(EXTRA_SCHEME_IMAGES):
-        for name in os.listdir(EXTRA_SCHEME_IMAGES):
-            src = os.path.join(EXTRA_SCHEME_IMAGES, name)
-            if os.path.isfile(src):
-                shutil.copy2(src, os.path.join(redo_images, name))
-    manifest = dict(manifest)
-    manifest['mode'] = 'redo_post'
-    manifest['label'] = f'Undo deletion of paint slot UID {int(uid)}'
-    manifest['redo'] = {
-        'groups': redo_groups,
-        'state_exists': bool(redo_state_exists),
-        'state_backup': redo_state,
-        'images_dir': 'redo_images',
-    }
-    with open(os.path.join(tmp, 'manifest.json'), 'w', encoding='utf-8') as fh:
-        json.dump(manifest, fh, indent=2)
-    return tmp
-
-
-def _extra_verify_pre_state(snapshot):
-    for key, item in snapshot.get('groups', {}).items():
-        if os.path.getsize(item['archive']) != int(item['archive_size']):
-            raise ValueError(f'ARCHIVE{key} is not at the exact pre-create size; deleted-slot undo is blocked')
-        if open(item['cdf'], 'rb').read() != item['cdf_bytes']:
-            raise ValueError(f'cdfiles{key}.dat is not at the exact pre-create state; deleted-slot undo is blocked')
-    state_exists = os.path.exists(EXTRA_SCHEME_STATE)
-    if bool(snapshot.get('state_exists')) != bool(state_exists):
-        raise ValueError('the app-created paint state is not at the exact pre-create state')
-    if state_exists and open(EXTRA_SCHEME_STATE, 'rb').read() != (snapshot.get('state_bytes') or b''):
-        raise ValueError('the app-created paint state is not at the exact pre-create state')
-    current_images = set(os.listdir(EXTRA_SCHEME_IMAGES)) if os.path.isdir(EXTRA_SCHEME_IMAGES) else set()
-    if current_images != set(snapshot.get('image_files') or set()):
-        raise ValueError('saved paint/thumbnail files are not at the exact pre-create state')
-    for name, raw in (snapshot.get('image_overwrites') or {}).items():
-        path = os.path.join(EXTRA_SCHEME_IMAGES, name)
-        if not os.path.isfile(path) or open(path, 'rb').read() != raw:
-            raise ValueError('saved paint/thumbnail files are not at the exact pre-create state')
-    return True
-
-
-def _extra_reapply_deleted_slot(snapshot, manifest):
-    _extra_verify_pre_state(snapshot)
-    redo = manifest.get('redo') or {}
-    current = _extra_transaction_snapshot({k: {'ar': v['archive'], 'cdf': v['cdf']} for k, v in snapshot['groups'].items()}, tuple(snapshot['groups']))
-    try:
-        for key, item in snapshot['groups'].items():
-            r = (redo.get('groups') or {}).get(str(key)) or {}
-            tail = open(os.path.join(EXTRA_SCHEME_ROLLBACK_DIR, r['tail_backup']), 'rb').read()
-            if len(tail) != int(r['tail_size']):
-                raise ValueError(f'ARCHIVE{key} redo tail is incomplete')
-            with open(item['archive'], 'ab') as fh:
-                fh.write(tail); fh.flush(); os.fsync(fh.fileno())
-            cdf_bytes = open(os.path.join(EXTRA_SCHEME_ROLLBACK_DIR, r['cdf_backup']), 'rb').read()
-            _extra_atomic_bytes(item['cdf'], cdf_bytes)
-        if redo.get('state_exists'):
-            raw = open(os.path.join(EXTRA_SCHEME_ROLLBACK_DIR, redo['state_backup']), 'rb').read()
-            _extra_atomic_bytes(EXTRA_SCHEME_STATE, raw)
-        elif os.path.exists(EXTRA_SCHEME_STATE):
-            os.remove(EXTRA_SCHEME_STATE)
-        os.makedirs(EXTRA_SCHEME_IMAGES, exist_ok=True)
-        for name in list(os.listdir(EXTRA_SCHEME_IMAGES)):
-            path = os.path.join(EXTRA_SCHEME_IMAGES, name)
-            if os.path.isfile(path):
-                os.remove(path)
-        redo_images = os.path.join(EXTRA_SCHEME_ROLLBACK_DIR, redo.get('images_dir') or 'redo_images')
-        if os.path.isdir(redo_images):
-            for name in os.listdir(redo_images):
-                shutil.copy2(os.path.join(redo_images, name), os.path.join(EXTRA_SCHEME_IMAGES, name))
-        _extra_verify_manifest_post_state(manifest)
-    except Exception:
-        _extra_transaction_restore(current)
-        raise
-    manifest = dict(manifest)
-    manifest['mode'] = 'restore_pre'
-    uid = int((manifest.get('operation') or {}).get('uid', -1))
-    manifest['label'] = f'Delete paint slot UID {uid}' if uid >= 0 else 'Undo restored paint slot'
-    with open(os.path.join(EXTRA_SCHEME_ROLLBACK_DIR, 'manifest.json.tmp'), 'w', encoding='utf-8') as fh:
-        json.dump(manifest, fh, indent=2)
-    os.replace(os.path.join(EXTRA_SCHEME_ROLLBACK_DIR, 'manifest.json.tmp'),
-               os.path.join(EXTRA_SCHEME_ROLLBACK_DIR, 'manifest.json'))
-    return manifest
-
-def _extra_rollback_status():
-    path = os.path.join(EXTRA_SCHEME_ROLLBACK_DIR, 'manifest.json')
-    if not os.path.exists(path):
-        return {'available': False}
-    try:
-        obj = json.load(open(path, 'r', encoding='utf-8'))
-        return {'available': True, 'label': obj.get('label') or 'Last paint change',
-                'created': obj.get('created') or ''}
-    except Exception as ex:
-        return {'available': False, 'blocked_reason': str(ex)}
-
-
-def _extra_active_created_count(state, driver_uid):
-    return sum(1 for item in state.get('schemes', [])
-               if int(item.get('driver_uid', -1)) == int(driver_uid) and not item.get('superseded_by'))
-
-
-def _extra_reconcile_state_with_live_database(mod, game):
-    """Make the live database/assets authoritative for app-created slots.
-
-    v1.0.1 treated ``extra_schemes_v1.json`` as ownership truth.  A clean app
-    folder therefore hid slots that were still fully installed in the game.
-    The allocator did notice their occupied UIDs, but every repair/delete/limit
-    guard lost the relationship.  Rebuild the minimum safe state from verified
-    live records before any catalog or write operation.
-
-    Detection is intentionally conservative: verified allocation UIDs and the
-    app's compact pre-25600 ScriptName pattern qualify, and the live record must
-    have its canonical SD/HD pair in ARCHIVE2 at the proven wrapper sizes.
-    Ambiguous or incomplete records remain ordinary game liveries and are never
-    silently adopted. When possible, paint and menu-preview PNGs are recovered
-    from the live game so a fresh app folder needs no migration step.
-    """
-    state = mod.load_state(EXTRA_SCHEME_STATE)
-    ctx = mod.base.load_context(str(game))
-    live = {}
-    for record in mod.base.records_of(ctx, 'LIVERIE_c'):
-        uid = mod.base.pointer_int(ctx, record.uid)
-        if uid is None:
-            continue
-        try:
-            driver_uid = mod.base.field_uid(ctx, record, 'Driver')
-            script = str(mod.base.display(ctx, record.fields.get('ScriptName')) or '').strip()
-        except Exception:
-            continue
-        live[int(uid)] = {'record': record, 'driver_uid': driver_uid, 'script_name': script}
-    live_uids = set(live)
-
-    schemes = list(state.get('schemes', []))
-    active = []
-    stale = []
-    active_uids = set()
-    for item in schemes:
-        try:
-            uid = int(item.get('uid', -1))
-        except Exception:
-            uid = -1
-        if uid >= 0 and uid not in live_uids:
-            row = dict(item)
-            row['orphaned_at'] = int(time.time())
-            row['orphaned_reason'] = 'livery UID absent after game-file restore or rollback'
-            stale.append(row)
-        else:
-            active.append(item)
-            if uid >= 0 and not item.get('superseded_by'):
-                active_uids.add(uid)
-
-    # App-created UIDs are never occupied by the clean game.  Include any
-    # user-verified extension UIDs already merged into the helper pool.
-    safe_pool = {int(x) for x in getattr(mod, 'VERIFIED_SAFE_EXTRA_UIDS', ())}
-    discovered = []
-    scan_rejections = []
-    try:
-        _primary, by_name = mod._asset_index(Path(game))
-    except Exception:
-        by_name = {}
-    try:
-        live_team_links = _team_fast_driver_links()
-    except Exception:
-        live_team_links = {}
-    try:
-        live_registry = registry()[1]
-    except Exception:
-        live_registry = {}
-    now = int(time.time())
-    def looks_app_created(uid, script):
-        text = str(script or '').strip().upper()
-        if int(uid) in safe_pool:
-            return True
-        if int(uid) >= 25600:
-            return False
-        return bool(
-            re.match(r'^15_[0-9]+[A-Z]?_[A-Z0-9]+_EXTRA(?:_SLOT)?_[0-9]+$', text)
-            or re.match(r'^CUSTOM_[0-9]+_[0-9]+_', text)
-        )
-
-    recovered_thumbnail_uids=[]
-    def recover_live_thumbnail(item):
-        """Recover the current in-game Paint Select image for an adopted slot."""
-        try:
-            uid=int(item.get('uid',-1));driver_uid=int(item.get('driver_uid',-1))
-        except Exception:
-            return False
-        if uid<0 or uid not in live_uids:
-            return False
-        link=live_team_links.get(driver_uid)
-        if not link:
-            return False
-        target_container=f"2DRIVERSELECTTD_{int(link['team_uid'])}.ARC"
-        script=str(item.get('script_name') or live.get(uid,{}).get('script_name') or '').strip()
-        if not script:
-            return False
-        os.makedirs(EXTRA_SCHEME_IMAGES,exist_ok=True)
-        thumb_name=f"{uid}__{script}.thumbnail.png"
-        thumb_path=os.path.join(EXTRA_SCHEME_IMAGES,thumb_name)
-        existing_name=os.path.basename(str(item.get('thumbnail_source_png') or ''))
-        existing_path=os.path.join(EXTRA_SCHEME_IMAGES,existing_name) if existing_name else ''
-        needs_image=not existing_path or not os.path.isfile(existing_path)
-        needs_check=not bool(item.get('thumbnail_live_checked'))
-        if not needs_image and not needs_check:
-            return False
-        changed_local=False
-        try:
-            live_thumb=_extra_read_live_native_thumbnail_preview(game,uid,target_container)
-            if needs_image:
-                live_thumb.save(thumb_path,'PNG')
-                item['thumbnail_source_png']=thumb_name
-                changed_local=True
-            identity={}
-            try:
-                identity=extra_thumbnail_mod().inspect_thumbnail_identity(
-                    game,uid,target_container_name=target_container) or {}
-            except Exception:
-                identity={}
-            updates={
-                'thumbnail_live_checked':True,
-                'thumbnail_live_present':True,
-                'thumbnail_game_safe':bool(identity.get('same_bank_valid')),
-                'thumbnail_same_bank_identity':bool(identity.get('identity_self_identifying') and identity.get('public_name_resolved')),
-                'thumbnail_identity_name':identity.get('identity_name') or identity.get('identity_root_name'),
-                'preview_status':'detected_live_thumbnail',
-                'preview_container':target_container,
-                'preview_entry':f'PAINTSCHEME_{uid}',
-            }
-            for key,value in updates.items():
-                if item.get(key)!=value:
-                    item[key]=value;changed_local=True
-            if uid not in recovered_thumbnail_uids:
-                recovered_thumbnail_uids.append(uid)
-        except Exception as ex:
-            if item.get('thumbnail_live_checked') is not True:
-                item['thumbnail_live_checked']=True;changed_local=True
-            text=str(ex)
-            if item.get('thumbnail_live_error')!=text:
-                item['thumbnail_live_error']=text;changed_local=True
-        return changed_local
-
-    discoverable = {uid for uid in live_uids if looks_app_created(uid, live[uid].get('script_name'))}
-    for uid in sorted(discoverable - active_uids):
-        row = live[uid]
-        script = row.get('script_name') or ''
-        driver_uid = row.get('driver_uid')
-        if not script or driver_uid is None:
-            continue
-        # ApplyPatch-created liveries carry Driver/Package/World/Season links
-        # directly in their constructor. They intentionally do *not* have the
-        # stock generator's later post-assignment bytecode blocks. Requiring
-        # post_assignment_blocks(uid) therefore rejected the exact live records
-        # created by dev21-dev29 when a newer app started with an empty profile.
-        try:
-            pair, sd_size, hd_size, in_archive2 = mod._has_pair(by_name, script)
-        except Exception:
-            pair = in_archive2 = False
-            sd_size = hd_size = None
-
-        required_links = {}
-        for field in ('Driver', 'Package', 'World', 'Season'):
-            try:
-                required_links[field] = mod.base.field_uid(ctx, row['record'], field)
-            except Exception:
-                required_links[field] = None
-        complete_record = all(required_links.get(field) is not None
-                              for field in ('Driver', 'Package', 'World', 'Season'))
-
-        rejection = []
-        if not pair:
-            rejection.append('missing canonical SD/HD asset pair')
-        if pair and not in_archive2:
-            rejection.append('SD/HD pair is not fully indexed in ARCHIVE2')
-        if int(sd_size or 0) != 1458529:
-            rejection.append(f'unexpected SD wrapper size {int(sd_size or 0)}')
-        if int(hd_size or 0) != 5652833:
-            rejection.append(f'unexpected HD wrapper size {int(hd_size or 0)}')
-        if not complete_record:
-            missing = [field for field in ('Driver', 'Package', 'World', 'Season')
-                       if required_links.get(field) is None]
-            rejection.append('missing live database link(s): ' + ', '.join(missing))
-        if rejection:
-            scan_rejections.append({
-                'uid': int(uid),
-                'script_name': script,
-                'reasons': rejection,
-            })
-            continue
-        os.makedirs(EXTRA_SCHEME_IMAGES, exist_ok=True)
-        source_name = f"{uid}__{script}.png"
-        source_path = os.path.join(EXTRA_SCHEME_IMAGES, source_name)
-        thumb_name = f"{uid}__{script}.thumbnail.png"
-        thumb_path = os.path.join(EXTRA_SCHEME_IMAGES, thumb_name)
-        item = {
-            'uid': int(uid),
-            'driver_uid': int(driver_uid),
-            'donor_uid': int(getattr(mod, 'PROVEN_EXTRA_DONOR_UID', 25580)),
-            'donor_script_name': str(getattr(mod, 'PROVEN_EXTRA_DONOR_SCRIPT', '')),
-            'script_name': script,
-            'name': ('Additional Scheme' if re.search(r'(?:^|_)EXTRA(?:_|$)', script, re.I) else mod._friendly_livery_label(script, '', '')),
-            'sd_entry': f'LIVERY_{script}.ARC',
-            'hd_entry': f'HDLIVERY_{script}.ARC',
-            'source_png': source_name if os.path.exists(source_path) else '',
-            'thumbnail_source_png': thumb_name if os.path.exists(thumb_path) else '',
-            'created': now,
-            'preview_status': 'detected_from_live',
-            'thumbnail_game_safe': False,
-            'thumbnail_live_checked': False,
-            'native_runtime_layout_version': 1,
-            'structure_donor_uid': int(getattr(mod, 'PROVEN_EXTRA_DONOR_UID', 25580)),
-            'structure_donor_script_name': str(getattr(mod, 'PROVEN_EXTRA_DONOR_SCRIPT', '')),
-            'database_recipe': 'recovered_live_scan',
-            'discovered_from_live_files': True,
-            'discovered_at': now,
-        }
-        # Rebuild the convenience PNGs from the live archives. These files are
-        # not ownership truth; failure to decode one never blocks adoption.
-        if not item['source_png']:
-            try:
-                live_paint = _extra_read_live_paint_image(item, game, live_registry)
-                live_paint.save(source_path, 'PNG')
-                item['source_png'] = source_name
-            except Exception:
-                pass
-        recover_live_thumbnail(item)
-        active.append(item)
-        active_uids.add(uid)
-        discovered.append(uid)
-
-    thumbnail_recovery_changed=False
-    for item in active:
-        if recover_live_thumbnail(item):
-            thumbnail_recovery_changed=True
-
-    stale_uids = {int(x['uid']) for x in stale if x.get('uid') is not None}
-    changed = bool(stale or discovered or thumbnail_recovery_changed)
-    if stale:
-        old_orphans = list(state.get('orphaned_schemes', []))
-        by_uid = {}
-        for row in old_orphans + stale:
-            try:
-                by_uid[int(row.get('uid', -1))] = row
-            except Exception:
-                continue
-        state['orphaned_schemes'] = [by_uid[k] for k in sorted(by_uid)]
-
-    removed_assignments = 0
-    if stale_uids:
-        clean_assignments = {}
-        for event_key, rows in (state.get('assignments') or {}).items():
-            if not isinstance(rows, dict):
-                continue
-            clean_rows = {}
-            for driver_key, livery_uid in rows.items():
-                try:
-                    if int(livery_uid) in stale_uids:
-                        removed_assignments += 1
-                        continue
-                except Exception:
-                    pass
-                clean_rows[str(driver_key)] = livery_uid
-            if clean_rows:
-                clean_assignments[str(event_key)] = clean_rows
-        state['assignments'] = clean_assignments
-        finalizer = state.get('registry_finalizer')
-        if isinstance(finalizer, dict):
-            try:
-                if int(finalizer.get('newest_uid', -1)) in stale_uids:
-                    state.pop('registry_finalizer', None)
-            except Exception:
-                pass
-
-    state['schemes'] = active
-    state['last_live_state_reconciliation'] = {
-        'at': now,
-        'removed_uids': sorted(stale_uids),
-        'discovered_uids': sorted(discovered),
-        'assignment_rows_removed': int(removed_assignments),
-        'source_of_truth': 'live DB direct links + canonical ARCHIVE2 SD/HD pair',
-        'candidate_rejections': scan_rejections,
-        'recovered_thumbnail_uids': sorted(recovered_thumbnail_uids),
-    }
-    if changed or not os.path.exists(EXTRA_SCHEME_STATE):
-        mod.save_state(EXTRA_SCHEME_STATE, state)
-    return {
-        'changed': changed,
-        'removed_uids': sorted(stale_uids),
-        'discovered_uids': sorted(discovered),
-        'assignment_rows_removed': int(removed_assignments),
-        'quarantined_count': len(stale),
-        'discovered_count': len(discovered),
-        'recovered_thumbnail_uids': sorted(recovered_thumbnail_uids),
-        'candidate_rejections': scan_rejections,
-    }
 
 def _extra_thumbnail_replace_capability(game, driver, uid, target_container=None):
     """Read-only check for whether an added-scheme thumbnail can be safely rewritten.
@@ -15390,13 +8442,7 @@ def _extra_game_and_registry():
 
 
 def _extra_game_running():
-    if os.name != 'nt':
-        return False
-    try:
-        r = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq NASCAR15.exe'], capture_output=True, text=True, timeout=10)
-        return 'nascar15.exe' in (r.stdout or '').lower()
-    except Exception:
-        return False
+    return is_process_running('NASCAR15.exe')
 
 
 def _extra_backups(reg, groups=('0', '1', '2')):
@@ -15416,7 +8462,7 @@ def _extra_state_public():
         mod = extra_scheme_mod()
         try:
             game, _reg = _extra_game_and_registry()
-            _extra_reconcile_state_with_live_database(mod, game)
+            _shared_managed_paint_editor().reconcile_live_state()
         except Exception:
             # Read-only callers still receive the last valid state when no game
             # is selected; write routes perform their own hard preflight.
@@ -15538,108 +8584,10 @@ def _extra_recommended_donor(driver):
     return min(eligible, key=score) if eligible else None
 
 
-# ------------------------------------------------------------- extra UID pool
-# The real cap on app-created paint slots is not a settings value: it is the size
-# of VERIFIED_SAFE_EXTRA_UIDS in the scheme manager, which ships with 8 UIDs that
-# were each replayed successfully in game. Four more below 25600 are recorded as
-# verified-broken. Paint Select cannot see records at 25600 or above at all, so
-# that is a hard ceiling, not a tunable.
-#
-# Between the verified-good and verified-broken sets there are untested UIDs
-# below the ceiling. Only launching the game can decide whether one works, so
-# this keeps a persistent record of what you tried and feeds the passes back
-# into the allocator. Shipped defaults are never edited.
-EXTRA_UID_CANDIDATES = os.path.join(USER_DIR, 'extra_uid_candidates_v1.json')
-EXTRA_UID_CEILING = 25600
-EXTRA_UID_FLOOR = 25560
-
-
-def _extra_uid_store():
-    try:
-        with open(EXTRA_UID_CANDIDATES, encoding='utf-8') as fh:
-            obj = json.load(fh)
-        if not isinstance(obj, dict):
-            raise ValueError('not an object')
-    except Exception:
-        obj = {}
-    obj.setdefault('verified', [])
-    obj.setdefault('rejected', [])
-    obj.setdefault('notes', {})
-    return obj
-
-
-def _extra_uid_store_save(obj):
-    tmp = EXTRA_UID_CANDIDATES + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as fh:
-        json.dump(obj, fh, indent=2)
-    os.replace(tmp, EXTRA_UID_CANDIDATES)
-
-
-def _extra_uid_pool_state():
-    mod = extra_scheme_mod()
-    shipped = [int(x) for x in getattr(mod, 'VERIFIED_SAFE_EXTRA_UIDS', ())]
-    blocked = [int(x) for x in getattr(mod, 'VERIFIED_BLOCKED_EXTRA_UIDS', ())]
-    store = _extra_uid_store()
-    user_ok = [int(x) for x in store['verified']
-               if EXTRA_UID_FLOOR <= int(x) < EXTRA_UID_CEILING
-               and int(x) not in shipped and int(x) not in blocked]
-    user_no = [int(x) for x in store['rejected'] if int(x) not in shipped]
-    known = set(shipped) | set(blocked) | set(user_ok) | set(user_no)
-    untested = [u for u in range(EXTRA_UID_FLOOR, EXTRA_UID_CEILING) if u not in known]
-    return dict(shipped_safe=sorted(shipped), verified_broken=sorted(blocked),
-                user_verified=sorted(user_ok), user_rejected=sorted(user_no),
-                untested=untested, notes=store['notes'],
-                usable=sorted(set(shipped) | set(user_ok)),
-                ceiling=EXTRA_UID_CEILING)
-
-
-def _extra_apply_uid_pool(mod):
-    """Append user-verified UIDs to the module's pool for this process.
-
-    Shipped tuples stay first, so the proven UIDs are always allocated before
-    anything you added. Never lets a blocked or out-of-range UID in.
-    """
-    try:
-        shipped = tuple(int(x) for x in getattr(mod, 'VERIFIED_SAFE_EXTRA_UIDS', ()))
-        blocked = set(int(x) for x in getattr(mod, 'VERIFIED_BLOCKED_EXTRA_UIDS', ()))
-        store = _extra_uid_store()
-        extra = [int(x) for x in store.get('verified', [])
-                 if EXTRA_UID_FLOOR <= int(x) < EXTRA_UID_CEILING
-                 and int(x) not in shipped and int(x) not in blocked]
-        merged = shipped + tuple(sorted(set(extra)))
-        if merged != tuple(getattr(mod, 'VERIFIED_SAFE_EXTRA_UIDS', ())):
-            mod.VERIFIED_SAFE_EXTRA_UIDS = merged
-    except Exception:
-        pass
-    return mod
-
-
 @app.route('/api/extra_schemes/uid_pool')
 def extra_uid_pool():
     try:
-        st = _extra_uid_pool_state()
-        st['ok'] = True
-        st['capacity'] = len(st['usable'])
-        st['next_candidate'] = st['untested'][0] if st['untested'] else None
-        # Live figures when a game is available: the allocator skips any UID the
-        # livery database already occupies, so "remaining" is the honest number.
-        st['remaining_now'] = None
-        st['in_use_now'] = None
-        try:
-            mod = extra_scheme_mod()
-            cat = mod.catalog(registry()[0], EXTRA_SCHEME_STATE)
-            remaining = [int(x) for x in cat.get('verified_safe_uid_remaining') or []]
-            st['remaining_now'] = len(remaining)
-            st['in_use_now'] = len(st['usable']) - len(remaining)
-            st['created_limit_per_driver'] = int(cat.get('created_limit_per_driver') or 0)
-        except Exception:
-            pass
-        st['note'] = ('Only the game can decide whether a UID works. Create one scheme on a '
-                      'candidate, launch the game, and check Paint Select actually lists it. '
-                      'Record the result here so the allocator can use it next time. '
-                      'UIDs at %d or above are never usable: those records save to disk but '
-                      'stay invisible to the selector.' % EXTRA_UID_CEILING)
-        return jsonify(st)
+        return jsonify(_shared_managed_paints().uid_pool())
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 400
 
@@ -15648,40 +8596,11 @@ def extra_uid_pool():
 def extra_uid_verdict():
     q = request.get_json(silent=True) or {}
     try:
-        uid = int(q.get('uid'))
-    except Exception:
-        return jsonify(dict(ok=False, error='A numeric UID is required.')), 400
-    verdict = str(q.get('verdict') or '').strip().lower()
-    if verdict not in ('works', 'not_visible', 'broken', 'untested'):
-        return jsonify(dict(ok=False, error='verdict must be works, not_visible, broken or untested.')), 400
-    if not (EXTRA_UID_FLOOR <= uid < EXTRA_UID_CEILING):
-        return jsonify(dict(ok=False, error=f'UID {uid} is outside the testable range '
-                       f'{EXTRA_UID_FLOOR}-{EXTRA_UID_CEILING - 1}. Paint Select cannot see '
-                       f'{EXTRA_UID_CEILING}+ at all.')), 400
-    mod = extra_scheme_mod()
-    if uid in set(int(x) for x in getattr(mod, 'VERIFIED_BLOCKED_EXTRA_UIDS', ())):
-        return jsonify(dict(ok=False, error=f'UID {uid} is recorded as verified-broken and '
-                       'cannot be promoted.')), 400
-    if uid in set(int(x) for x in getattr(mod, 'VERIFIED_SAFE_EXTRA_UIDS', ())):
-        return jsonify(dict(ok=False, error=f'UID {uid} already ships as verified-safe.')), 400
-
-    store = _extra_uid_store()
-    store['verified'] = [int(x) for x in store['verified'] if int(x) != uid]
-    store['rejected'] = [int(x) for x in store['rejected'] if int(x) != uid]
-    note = str(q.get('note') or '').strip()[:400]
-    if verdict == 'works':
-        store['verified'].append(uid)
-    elif verdict in ('not_visible', 'broken'):
-        store['rejected'].append(uid)
-    if note:
-        store['notes'][str(uid)] = note
-    else:
-        store['notes'].pop(str(uid), None)
-    _extra_uid_store_save(store)
-    st = _extra_uid_pool_state()
-    return jsonify(dict(ok=True, uid=uid, verdict=verdict,
-                        capacity=len(st['usable']), usable=st['usable'],
-                        note=f'Recorded. Usable UID pool is now {len(st["usable"])}.'))
+        return jsonify(_shared_managed_paints().record_uid_verdict(
+            int(q.get('uid')), q.get('verdict'), q.get('note') or '',
+        ))
+    except Exception as ex:
+        return jsonify(dict(ok=False, error=str(ex))), 400
 
 
 @app.route('/api/extra_schemes/catalog')
@@ -15696,9 +8615,9 @@ def extra_schemes_catalog():
     try:
         g, _reg = _extra_game_and_registry()
         mod = extra_scheme_mod()
-        reconciliation = _extra_reconcile_state_with_live_database(mod, g)
-        out = _extra_friendly_catalog(mod.catalog(g, EXTRA_SCHEME_STATE))
-        out['live_reconciliation'] = reconciliation
+        shared_catalog = _shared_managed_paint_editor().catalog()
+        reconciliation = shared_catalog.get('live_reconciliation') or {}
+        out = _extra_friendly_catalog(shared_catalog)
         proven = mod.proven_extra_donor(g)
         state = mod.load_state(EXTRA_SCHEME_STATE)
         active = [x for x in state.get('schemes', []) if not x.get('superseded_by')]
@@ -15707,7 +8626,7 @@ def extra_schemes_catalog():
         out['proven_donor'] = proven
         out['helper'] = EXTRA_SCHEME_HELPER
         out['state_file'] = os.path.basename(EXTRA_SCHEME_STATE)
-        out['paint_rollback'] = _extra_rollback_status()
+        out['paint_rollback'] = _shared_managed_paint_editor().undo_status()
         counts = collections.Counter(
             int(x.get('driver_uid', -1)) for x in active if x.get('driver_uid') is not None
         )
@@ -15774,116 +8693,30 @@ def extra_schemes_catalog():
 # then created slots are still in the game but invisible here. These two routes
 # move that record across. They are reachable before a game is selected, because
 # importing into a fresh install is the whole point.
-APPDATA_FILES = (
-    'config.json', 'game_selector.json', 'extra_schemes_v1.json',
-    'team_manager_state.json', 'repoint_history.json',
-    'last_whole_mod_repair.json', 'extra_uid_candidates_v1.json',
-)
-APPDATA_DIRS = ('schemes', 'team_asset_rollback_v1', 'profiles')
-APPDATA_MANIFEST = 'nascar_app_data.json'
-APPDATA_VERSION = 2
+def _shared_appdata_manager():
+    return AppDataManager(USER_DIR, APP_VERSION)
 
 
-def _appdata_members():
-    """(archive_name, absolute_path) for every app-state file that exists."""
-    out = []
-    for name in APPDATA_FILES:
-        p = os.path.join(USER_DIR, name)
-        if os.path.isfile(p):
-            out.append((name, p))
-    for d in APPDATA_DIRS:
-        base = os.path.join(USER_DIR, d)
-        if not os.path.isdir(base):
-            continue
-        for root, _dirs, files in os.walk(base):
-            for f in files:
-                full = os.path.join(root, f)
-                rel = os.path.relpath(full, USER_DIR).replace(os.sep, '/')
-                out.append((rel, full))
-    return out
+def _shared_support_reporter():
+    installation = None
+    try:
+        installation = _shared_installation()
+    except Exception:
+        pass
+    return SupportReporter(installation, APP_DIR, USER_DIR, APP_VERSION, APP_RELEASE_LABEL)
 
 
 @app.route('/api/appdata/export')
 def appdata_export():
     """One zip holding this install's record of your work. No game files."""
     try:
-        members = _appdata_members()
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
-            z.writestr(APPDATA_MANIFEST, json.dumps(dict(
-                format='nascar_app_data', version=APPDATA_VERSION, app_version=APP_VERSION,
-                schema_versions={'config':2,'extra_schemes':1,'team_manager':1,'schemes':2},
-                created=datetime.datetime.now().isoformat(timespec='seconds'),
-                files=[m for m, _ in members]), indent=2))
-            for name, full in members:
-                try:
-                    z.write(full, name)
-                except OSError:
-                    pass
+        buf = io.BytesIO(_shared_appdata_manager().export_bytes())
         buf.seek(0)
         stamp = datetime.datetime.now().strftime('%Y%m%d')
         return send_file(buf, mimetype='application/zip', as_attachment=True,
                          download_name=f'nascar_app_data_{stamp}.zip')
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 400
-
-
-def _appdata_safe_name(name):
-    """Normalize a backup member to one of the app-owned data paths.
-
-    Older users often zipped the entire old app folder instead of using the
-    later Save My App Data button.  Accept one or more harmless leading folder
-    names, but only after reducing the path to a known file or known data
-    directory.  Traversal and absolute paths remain rejected.
-    """
-    n=str(name).replace('\\','/').strip('/')
-    if not n or n.endswith('/'):return None
-    parts=[x for x in n.split('/') if x]
-    if ':' in n or '..' in parts:return None
-    if parts[-1]==APPDATA_MANIFEST:return None
-    if parts[-1] in APPDATA_FILES:return parts[-1]
-    for i,part in enumerate(parts):
-        if part in APPDATA_DIRS and i+1<len(parts):
-            return '/'.join(parts[i:])
-    return None
-
-
-def _appdata_current_name(name):
-    """Translate app-data paths emitted by known older public builds."""
-    n=str(name).replace('\\','/')
-    head,base=os.path.split(n)
-    newbase=_legacy_pack_member_basename(base)
-    return (head+'/'+newbase).strip('/') if head else newbase
-
-
-def _appdata_replace_legacy_values(value,migrations):
-    """Recursively translate known old IDs inside JSON state files."""
-    if isinstance(value,dict):
-        out={}
-        for key,item in value.items():
-            newkey='Darrell Wallace Jr.' if str(key).casefold()=='mike wallace' else str(key)
-            if newkey!=str(key):migrations.append('config name key Mike Wallace → Darrell Wallace Jr.')
-            out[newkey]=_appdata_replace_legacy_values(item,migrations)
-        return out
-    if isinstance(value,list):return [_appdata_replace_legacy_values(x,migrations) for x in value]
-    if isinstance(value,str):
-        new=value
-        for old,current in LEGACY_PACK_MEMBER_RENAMES.items():new=new.replace(old,current)
-        if new!=value:migrations.append(f'{value} → {new}')
-        return new
-    return value
-
-
-def _appdata_migrate_bytes(name,raw,from_version,migrations):
-    """Convert one imported member to the current app-data schema."""
-    if not str(name).lower().endswith('.json'):return raw
-    try:value=json.loads(raw.decode('utf-8','replace'))
-    except Exception:return raw
-    value=_appdata_replace_legacy_values(value,migrations)
-    if name=='config.json' and isinstance(value,dict):
-        value.setdefault('renames',{});value.setdefault('handles',{})
-        value['app_data_schema_version']=APPDATA_VERSION
-    return json.dumps(value,indent=2,ensure_ascii=False).encode('utf-8')
 
 
 @app.route('/api/appdata/import', methods=['POST'])
@@ -15893,69 +8726,12 @@ def appdata_import():
     if not f:
         return jsonify(dict(ok=False, error='No file was uploaded.')), 400
     try:
-        blob = f.read()
-        with zipfile.ZipFile(io.BytesIO(blob)) as z:
-            try:
-                man=json.loads(z.read(APPDATA_MANIFEST).decode('utf-8','replace'))
-            except Exception:
-                # Pre-manifest builds and manually zipped old app folders are
-                # accepted only when they contain recognized app-owned paths.
-                man=dict(format='nascar_app_data',version=0,app_version='older/unversioned')
-            if man.get('format')!='nascar_app_data':
-                return jsonify(dict(ok=False,error='That zip is not an app-data backup.')),400
-            from_version=int(man.get('version',0) or 0)
-            if from_version>APPDATA_VERSION:
-                return jsonify(dict(ok=False,error=f'This app-data backup uses schema {from_version}; install a newer app version to restore it.')),400
-
-            wanted=[];migrations=[];seen_dest=set()
-            for info in z.infolist():
-                if info.is_dir():continue
-                safe=_appdata_safe_name(info.filename)
-                if safe:
-                    current=_appdata_current_name(safe)
-                    if current!=safe:migrations.append(f'{safe} → {current}')
-                    if current in seen_dest:continue
-                    seen_dest.add(current);wanted.append((info,current))
-            if not wanted:
-                return jsonify(dict(ok=False, error='The zip held no app data to restore.')), 400
-
-            # Keep whatever is here now, so a mistaken import is recoverable.
-            stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-            existing = _appdata_members()
-            replaced = 0
-            if existing:
-                keep = os.path.join(USER_DIR, f'app_data_replaced_{stamp}.zip')
-                with zipfile.ZipFile(keep, 'w', zipfile.ZIP_DEFLATED) as bz:
-                    for name, full in existing:
-                        try:
-                            bz.write(full, name)
-                        except OSError:
-                            pass
-                replaced = len(existing)
-
-            written = 0
-            for info, safe in wanted:
-                dest = os.path.join(USER_DIR, *safe.split('/'))
-                real = os.path.realpath(dest)
-                if not real.startswith(os.path.realpath(USER_DIR) + os.sep):
-                    continue
-                os.makedirs(os.path.dirname(real), exist_ok=True)
-                raw=z.read(info)
-                raw=_appdata_migrate_bytes(safe,raw,from_version,migrations)
-                with open(real,'wb') as out:out.write(raw)
-                written+=1
-
-        unique_migrations=[]
-        for item in migrations:
-            if item not in unique_migrations:unique_migrations.append(item)
-        converted=from_version<APPDATA_VERSION or bool(unique_migrations)
-        return jsonify(dict(ok=True,restored=written,previous_saved=replaced,
-            from_version=man.get('app_version'),from_schema=from_version,to_schema=APPDATA_VERSION,
-            converted=converted,migrations=unique_migrations[:50],
-            note=(f'Restored {written} file(s). '
-                  + (f'Converted older app data from schema {from_version} to {APPDATA_VERSION}. ' if converted else '')
-                  +'Restart the app so it reloads them.'
-                  + (f' Your previous data was kept in app_data_replaced_{stamp}.zip.' if replaced else ''))))
+        result = _shared_appdata_manager().import_bytes(f.read())
+        return jsonify(dict(ok=True, **result, note=(
+            f"Restored {result['restored']} file(s). Restart the app so it reloads them."
+            + (f" Your previous data was kept in {result['recovery_path']}."
+               if result['recovery_path'] else '')
+        )))
     except zipfile.BadZipFile:
         return jsonify(dict(ok=False, error='That file is not a readable zip.')), 400
     except Exception as ex:
@@ -15964,158 +8740,10 @@ def appdata_import():
 
 @app.route('/api/paint_system/check')
 def paint_system_check_api():
-    """Read-only end-to-end audit of the Paint tab and team-aware previews."""
     try:
-        g, _reg = _extra_game_and_registry()
-        mod = extra_scheme_mod()
-        thumb_mod = extra_thumbnail_mod()
-        assets = team_assets_mod()
-        catalog = mod.catalog(g, EXTRA_SCHEME_STATE)
-        state = mod.load_state(EXTRA_SCHEME_STATE)
-        active = [x for x in state.get('schemes', [])
-                  if not x.get('superseded_by') and x.get('uid') is not None]
-        team_catalog = _team_friendly_catalog()
-        team_by_driver = {int(d['driver_uid']): d for d in team_catalog.get('drivers', [])}
-        live_uids = {int(s['uid']) for d in catalog.get('drivers', [])
-                     for s in d.get('schemes', []) if s.get('uid') is not None}
-        locations = assets.resource_locations(g)
-        checks = []
-        rows = []
-
-        def add(name, status, detail):
-            checks.append({'name': name, 'status': status, 'detail': detail})
-
-        add('Paint backends', 'pass',
-            f"Extra schemes + native thumbnails loaded (thumbnail backend {getattr(thumb_mod, 'VERSION', 'unknown')}).")
-        blocked = set(getattr(mod, 'VERIFIED_BLOCKED_EXTRA_UIDS', (25575, 25576, 25577, 25596)))
-        unsafe = sorted(int(x['uid']) for x in active if int(x['uid']) in blocked)
-        add('Verified UID allocator', 'fail' if unsafe else 'pass',
-            ('Blocked active UIDs: ' + ', '.join(map(str, unsafe))) if unsafe
-            else 'All active app-created schemes use non-blocked UIDs.')
-
-        counts = collections.Counter(int(x.get('driver_uid', -1)) for x in active)
-        over = {uid: n for uid, n in counts.items() if n > EXTRA_SCHEME_LIMIT_PER_DRIVER}
-        add('11-created-scheme guard', 'fail' if over else 'pass',
-            ('Over limit: ' + ', '.join(f'{uid}={n}' for uid, n in over.items())) if over
-            else f'Every driver is at or below the proven {EXTRA_SCHEME_LIMIT_PER_DRIVER}-scheme limit.')
-
-        missing_db = []
-        missing_sources = []
-        legacy = []
-        missing_team = []
-        missing_art = []
-        missing_current_thumb = []
-        invalid_thumbnail_structures = []
-        invalid_thumbnail_identities = []
-        duplicates = []
-        for item in active:
-            uid = int(item['uid'])
-            driver_uid = int(item.get('driver_uid', -1))
-            driver = team_by_driver.get(driver_uid)
-            target_container = None
-            target_team_uid = None
-            if driver:
-                target_team_uid = int(driver['team_uid'])
-                target_container = f"2DRIVERSELECTTD_{target_team_uid}.ARC"
-            paint_source = os.path.join(EXTRA_SCHEME_IMAGES, os.path.basename(str(item.get('source_png') or '')))
-            thumb_source = os.path.join(EXTRA_SCHEME_IMAGES, os.path.basename(str(item.get('thumbnail_source_png') or '')))
-            source_ok = bool(item.get('source_png') and os.path.exists(paint_source))
-            if not source_ok:
-                try:
-                    _extra_read_live_paint_image(item, g, registry()[1]); source_ok = True
-                except Exception:
-                    pass
-            thumb_source_ok = bool(item.get('thumbnail_source_png') and os.path.exists(thumb_source))
-            if uid not in live_uids:
-                missing_db.append(uid)
-            if not source_ok or not thumb_source_ok:
-                missing_sources.append(uid)
-            if int(item.get('native_runtime_layout_version', 0)) < 1:
-                legacy.append(uid)
-            resource = f'PAINTSCHEME_{uid}'
-            locs = list(locations.get(resource, []))
-            current_thumb = bool(target_container and any(x.casefold() == target_container.casefold() for x in locs))
-            identity_info = (thumb_mod.inspect_thumbnail_identity(
-                g, uid, target_container_name=target_container)
-                if current_thumb and target_container else {'same_bank_valid': False})
-            structural_valid = bool(identity_info.get('structural_valid'))
-            same_bank_identity = bool(
-                identity_info.get('identity_self_identifying')
-                and identity_info.get('public_name_resolved'))
-            thumbnail_safe = bool(identity_info.get('same_bank_valid'))
-            if current_thumb and not structural_valid:
-                invalid_thumbnail_structures.append(uid)
-            if current_thumb and not same_bank_identity:
-                invalid_thumbnail_identities.append(uid)
-            if not driver:
-                missing_team.append(uid)
-            if not current_thumb:
-                missing_current_thumb.append(uid)
-            if len(locs) > 1:
-                duplicates.append(uid)
-            art_ok = False
-            if driver and target_team_uid is not None:
-                names = set(assets.team_container_resource_names(g, target_team_uid))
-                art_ok = (f'DRIVERPAINT_{driver_uid}_25041' in names and
-                          f'DRIVER_{driver_uid}_3DNUM_25041' in names)
-                if not art_ok:
-                    missing_art.append(driver_uid)
-            rows.append({
-                'uid': uid, 'name': item.get('name') or item.get('script_name'),
-                'driver_uid': driver_uid,
-                'driver': (driver or {}).get('car_label') or (driver or {}).get('label') or str(driver_uid),
-                'team_uid': target_team_uid, 'team': (driver or {}).get('team_label'),
-                'target_container': target_container,
-                'database_ready': uid in live_uids,
-                'paint_source_ready': source_ok,
-                'thumbnail_source_ready': thumb_source_ok,
-                'thumbnail_game_safe': thumbnail_safe,
-                'thumbnail_structural_valid': structural_valid,
-                'thumbnail_same_bank_identity': same_bank_identity,
-                'thumbnail_identity_name': identity_info.get('identity_name'),
-                'runtime_ready': int(item.get('native_runtime_layout_version', 0)) >= 1,
-                'current_team_thumbnail': current_thumb,
-                'thumbnail_locations': locs,
-                'driver_art_ready': art_ok,
-            })
-
-        add('Live livery records', 'fail' if missing_db else 'pass',
-            ('Missing from live LIVERIE catalog: ' + ', '.join(map(str, missing_db))) if missing_db
-            else f'All {len(active)} active created scheme record(s) are present in the live catalog.')
-        add('Saved paint + thumbnail sources', 'warn' if missing_sources else 'pass',
-            ('Saved source images missing for UID(s): ' + ', '.join(map(str, missing_sources))) if missing_sources
-            else 'Every created scheme still has its saved paint and thumbnail PNG.')
-        add('Native paint structure', 'fail' if legacy else 'pass',
-            ('Legacy runtime layout on UID(s): ' + ', '.join(map(str, legacy))) if legacy
-            else 'Every created scheme uses the proven native runtime layout.')
-        add('Current team links', 'fail' if missing_team else 'pass',
-            ('No current 2015 Cup team link for UID(s): ' + ', '.join(map(str, missing_team))) if missing_team
-            else 'Every created scheme resolves to its driver’s current team.')
-        add('Driver Select art', 'fail' if missing_art else 'pass',
-            ('Missing current-team tile/number art for driver UID(s): ' + ', '.join(map(str, sorted(set(missing_art))))) if missing_art
-            else 'Every created-scheme driver has both Driver Select art resources in the current team bank.')
-        add('Current-team thumbnails', 'fail' if missing_current_thumb else 'pass',
-            ('Thumbnail not installed in the current team bank for UID(s): ' + ', '.join(map(str, missing_current_thumb))) if missing_current_thumb
-            else 'Every created scheme has a native thumbnail in its driver’s current team bank.')
-        add('Native thumbnail structure', 'fail' if invalid_thumbnail_structures else 'pass',
-            ('Invalid 256×256 DXT5 container structure for UID(s): ' + ', '.join(map(str, invalid_thumbnail_structures))) if invalid_thumbnail_structures
-            else 'Every current-team thumbnail has a valid native 256×256 DXT5 resource and intact directory/footer layout.')
-        add('Same-bank thumbnail identities', 'fail' if invalid_thumbnail_identities else 'pass',
-            ('Thumbnail aliases lack a self-identifying PAINTSCHEME anchor in the current team bank for UID(s): ' + ', '.join(map(str, invalid_thumbnail_identities))) if invalid_thumbnail_identities
-            else 'Every current-team PAINTSCHEME alias resolves to a self-identifying native thumbnail in that same bank.')
-        add('Old-team thumbnail copies', 'warn' if duplicates else 'pass',
-            ('Extra copies remain in prior team banks for UID(s): ' + ', '.join(map(str, duplicates)) +
-             '. They are harmless; current-team routing is verified separately.') if duplicates
-            else 'No duplicate created-thumbnail resources were found.')
-
-        rank = {'pass': 0, 'warn': 1, 'fail': 2}
-        overall = max((x['status'] for x in checks), key=lambda x: rank[x], default='pass')
-        return jsonify(dict(ok=True, overall=overall, checks=checks, schemes=rows,
-                            active_count=len(active), checked_at=datetime.datetime.now().isoformat(timespec='seconds'),
-                            note='Read-only structural audit; no game files were changed.'))
+        return jsonify(_shared_full_repair_editor().paint_system_check())
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 400
-
 
 @app.route('/api/extra_schemes/create', methods=['POST'])
 def extra_schemes_create():
@@ -16128,189 +8756,30 @@ def extra_schemes_create():
     UIDs 25600+ and spare/custom teams are rejected. Transferred drivers on
     authored stock teams are enabled only in this guarded experimental branch.
     """
-    snapshot = None
-    rollback_errors = []
-    temp_thumb = None
-    with _EXTRA_CREATE_LOCK:
+    try:
+        paint_file = request.files.get('file')
+        thumbnail_file = request.files.get('thumbnail')
+        if not paint_file:
+            raise ValueError('choose a paint image')
+        if not thumbnail_file:
+            raise ValueError('choose a thumbnail image')
+        with _EXTRA_CREATE_LOCK, tempfile.TemporaryDirectory(prefix='nascar_paint_create_') as folder:
+            paint_path = os.path.join(folder, 'paint.png')
+            thumbnail_path = os.path.join(folder, 'thumbnail.png')
+            paint_file.save(paint_path)
+            thumbnail_file.save(thumbnail_path)
+            result = _shared_managed_paint_editor().create(
+                int(request.form.get('driver_uid')),
+                str(request.form.get('name') or ''), paint_path, thumbnail_path,
+                quality=str(request.form.get('quality') or 'auto'),
+            )
         try:
-            if _extra_game_running():
-                raise RuntimeError('NASCAR15.exe is running. Close the game before adding a paint scheme')
-            g, reg = _extra_game_and_registry()
-            f = request.files.get('file')
-            thumbnail_file = request.files.get('thumbnail')
-            if not f:
-                raise ValueError('choose a paint image')
-            if not thumbnail_file:
-                raise ValueError('choose a thumbnail image; every created slot requires a unique Paint Select preview')
-            driver_uid = int(request.form.get('driver_uid'))
-            display_name = str(request.form.get('name') or '').strip()
-            if not display_name:
-                raise ValueError('enter a name for the new scheme')
-            quality = str(request.form.get('quality') or 'auto')
-            thumbnail_bytes = thumbnail_file.read()
-
-            # Catalog badges and submit enforcement deliberately share one guard.
-            guard = _stable_paint_creation_guard(driver_uid)
-            if guard.get('locked'):
-                raise ValueError(guard.get('reason') or 'paint creation is locked for this driver')
-            team_uid = int(guard['team_uid'])
-            preview_container = f'2DRIVERSELECTTD_{team_uid}.ARC'
-
-            mod = extra_legacy_scheme_mod()
-            state_reconciliation = _extra_reconcile_state_with_live_database(mod, g)
-            catalog = mod.catalog(g, EXTRA_SCHEME_STATE)
-            driver = next((d for d in catalog['drivers'] if int(d['uid']) == driver_uid), None)
-            if not driver:
-                raise ValueError('selected driver was not found in the live database')
-            state_before = mod.load_state(EXTRA_SCHEME_STATE)
-            created_count = _extra_active_created_count(state_before, driver_uid)
-            if created_count >= EXTRA_SCHEME_LIMIT_PER_DRIVER:
-                raise ValueError(f'this driver already has the maximum {EXTRA_SCHEME_LIMIT_PER_DRIVER} app-created schemes')
-            proven = mod.proven_extra_donor(g)
-            donor_uid = int(proven['uid'])
-            donor_script = str(proven['script_name'])
-            identity = mod.suggest_identity(g, driver_uid, display_name, EXTRA_SCHEME_STATE, donor_uid=donor_uid)
-            if int(identity['uid']) >= 25600:
-                raise ValueError('paint creation refused an unenumerated 25600+ livery UID')
-            runtime_script = str(identity['script_name'])
-            runtime_sd_name = f"LIVERY_{runtime_script}.ARC"
-            runtime_hd_name = f"HDLIVERY_{runtime_script}.ARC"
-            # MAP_20260727_014553 measured the complete clean game: max
-            # ScriptName=31, max LIVERY CDF name=42, max HDLIVERY CDF name=44.
-            # The selector calls SetLiveryName immediately after a tile click,
-            # so identities outside that native envelope are rejected before
-            # any archive is changed.
-            if len(runtime_script) > 31 or len(runtime_sd_name) > 42 or len(runtime_hd_name) > 44:
-                raise ValueError(
-                    'Generated runtime livery identity exceeds the measured stock name envelope; '
-                    'nothing was changed.'
-                )
-
-            image, prep = _prepare_scheme_smart_image(f.stream, quality)
-            thumb_image, thumb_prep = _extra_prepare_thumbnail_source(thumbnail_bytes, quality)
-            pair = mod.donor_asset_pair(g, donor_script)
-            if pair['sd_size'] != _NATIVE_SD_ENTRY_SIZE or pair['hd_size'] != _NATIVE_HD_ENTRY_SIZE:
-                raise ValueError('the proven donor does not use the expected native SD/HD wrapper sizes')
-            sd_wrapper, sd_levels, sd_changed = _native_sd_patch_wrapper(pair['sd'], image, None)
-            hd_wrapper, hd_levels, hd_changed = _native_hd_patch_wrapper_public_v1(pair['hd'], image)
-
-            _extra_backups(reg, ('0', '1', '2'))
-            snapshot = _extra_transaction_snapshot(reg, ('0', '1', '2'))
-            _extra_persist_snapshot(snapshot, f"Create paint slot UID {identity['uid']} for {display_name}", operation={'type': 'create', 'uid': int(identity['uid']), 'driver_uid': int(driver_uid), 'script_name': str(identity['script_name'])})
-            source_name = f"{identity['uid']}__{identity['script_name']}.png"
-            thumb_source_name = f"{identity['uid']}__{identity['script_name']}.thumbnail.png"
-            source_path = os.path.join(EXTRA_SCHEME_IMAGES, source_name)
-            thumb_source_path = os.path.join(EXTRA_SCHEME_IMAGES, thumb_source_name)
-
-            result = mod.install_scheme(
-                g, EXTRA_SCHEME_STATE,
-                driver_uid=driver_uid, donor_uid=donor_uid,
-                new_uid=int(identity['uid']), script_name=str(identity['script_name']),
-                display_name=display_name, sd_payload=bytes(sd_wrapper),
-                hd_payload=bytes(hd_wrapper), source_png_name=source_name,
-            )
-            image.save(source_path, 'PNG')
-            thumb_image.save(thumb_source_path, 'PNG')
-
-            # Rebuild the team's Paint Select bank through the proven fixed-count
-            # v0.10 architecture.  The allocator selects a compatible pristine
-            # stock bank with enough driver-art and paint slots instead of
-            # hardcoding Brad/Joey's two-driver bank.
-            links = _team_fast_driver_links()
-            team_driver_uids = sorted(
-                int(uid) for uid, link in links.items()
-                if int(link.get('team_uid', -1)) == team_uid
-            )
-            after_catalog = mod.catalog(g, EXTRA_SCHEME_STATE)
-            required_livery_uids = sorted({
-                int(scheme['uid'])
-                for d in after_catalog.get('drivers', [])
-                if int(d.get('uid', -1)) in set(team_driver_uids)
-                for scheme in d.get('schemes', [])
-                if scheme.get('uid') is not None and not scheme.get('superseded')
-            })
-            preview = extra_fixed_template_mod().install_fixed_template_thumbnail(
-                g,
-                target_container=preview_container,
-                team_driver_uids=team_driver_uids,
-                livery_uids=required_livery_uids,
-                new_uid=int(identity['uid']),
-                image_path=thumb_source_path,
-            )
-            # The historical rc8/rc10 helper resolves texconv.exe relative to
-            # its own module. In the reorganized app that module lives under
-            # internal_tools, so a missing colocated executable silently fell
-            # back to the built-in DXT5 encoder. That payload passes the helper's
-            # Python decoder but is not a proven NASCAR 15 Paint Select format.
-            # Refuse to commit unless the exact historical texconv path ran.
-            if str(preview.get('encoder') or '').strip().casefold() != 'texconv dxt5':
-                raise ValueError(
-                    'Game-safe Paint Select thumbnail creation requires the bundled '
-                    'texconv.exe. The rc8/rc10 helper fell back to an unproven encoder; '
-                    'all game-file changes were rolled back.'
-                )
-
-            state = mod.load_state(EXTRA_SCHEME_STATE)
-            item = next((x for x in state.get('schemes', []) if int(x.get('uid', -1)) == int(identity['uid'])), None)
-            if item is None:
-                raise ValueError('new scheme state record was not saved')
-            item['native_runtime_layout_version'] = 2
-            item['native_runtime_created'] = int(time.time())
-            item['structure_donor_uid'] = donor_uid
-            item['creation_pipeline'] = 'exact_v0.9_applypatch_plus_v0.10_fixed_template'
-            item['uid_range'] = 'sub_25600'
-            mod.save_state(EXTRA_SCHEME_STATE, state)
-            _extra_update_preview_state(mod, int(identity['uid']), preview, thumb_source_name)
-            _extra_seal_persisted_snapshot()
-
-            try:
-                _SCHEDULE_SOURCE_CACHE.clear(); _SCHEDULE_CACHE.clear(); _clear_ui_thumb_cache()
-            except Exception:
-                pass
-            app_remaining = EXTRA_SCHEME_LIMIT_PER_DRIVER - created_count - 1
-            native_remaining = int(preview.get('remaining_native_paint_slots', 0))
-            remaining = max(0, min(app_remaining, native_remaining))
-            return jsonify(dict(
-                ok=True, scheme=result['scheme'], database=result['database'], assets=result['assets'],
-                preparation=prep, thumbnail_preparation=thumb_prep,
-                sd_levels=sd_levels, sd_changed_bytes=sd_changed,
-                hd_levels=hd_levels, hd_changed_bytes=hd_changed,
-                preview=preview, created_count=created_count + 1, created_remaining=remaining,
-                state_reconciliation=state_reconciliation,
-                verification=dict(
-                    database_readback=True, asset_readback=True,
-                    native_script_name=str(identity['script_name']),
-                    native_script_name_length=len(str(identity['script_name'])),
-                    native_sd_entry_length=len(f"LIVERY_{identity['script_name']}.ARC"),
-                    native_hd_entry_length=len(f"HDLIVERY_{identity['script_name']}.ARC"),
-                    stock_name_envelope=True, native_hd_layout=True,
-                    uid_below_25600=True, exact_v09_applypatch=True,
-                    exact_v010_fixed_template=True, dynamic_native_template=True, paired_driver_art=True, fixed_resource_count=True,
-                    custom_thumbnail_written=True, thumbnail_source_saved=True, thumbnail_readback=True,
-                    thumbnail_encoder=str(preview.get('encoder') or ''), texconv_thumbnail_required=True,
-                    unified_creation_guard=True, spare_custom_team_locked=True,
-                    moved_stock_team_experimental=bool(guard.get('experimental_moved_driver')),
-                    in_game_tested=False,
-                ),
-                note=(f'The additional scheme was installed and verified. '
-                      f'{remaining} additional scheme slot(s) remain for this team. '
-                      + ('This driver was moved from its original team. ' if guard.get('experimental_moved_driver') else '')
-                      + 'Launch NASCAR 15 and confirm the scheme before creating another.'),
-            ))
-        except Exception as ex:
-            if snapshot is not None:
-                rollback_errors = _extra_transaction_restore(snapshot)
-            detail = str(ex)
-            if rollback_errors:
-                detail += ' | Rollback warnings: ' + '; '.join(rollback_errors)
-            elif snapshot:
-                _extra_clear_persisted_snapshot()
-            return jsonify(dict(ok=False, error=detail, rolled_back=bool(snapshot and not rollback_errors))), 400
-        finally:
-            if temp_thumb and os.path.exists(temp_thumb):
-                try: os.remove(temp_thumb)
-                except Exception: pass
-
+            _clear_ui_thumb_cache()
+        except Exception:
+            pass
+        return jsonify(result)
+    except Exception as ex:
+        return jsonify(dict(ok=False, error=str(ex))), 400
 
 @app.route('/api/extra_schemes/runtime_repair', methods=['POST'])
 def extra_schemes_runtime_repair():
@@ -16319,268 +8788,31 @@ def extra_schemes_runtime_repair():
 
     EVENTINIT and thumbnail containers are deliberately untouched.
     """
-    originals = []
-    db_rollback = None
     try:
-        if _extra_game_running():
-            raise RuntimeError('NASCAR15.exe is running. Close the game before repairing created paint slots')
-        g, reg = _extra_game_and_registry()
-        mod = extra_scheme_mod()
-        state = mod.load_state(EXTRA_SCHEME_STATE)
-        active = [x for x in state.get('schemes', []) if not x.get('superseded_by')]
-        protected = []
-        for item in active:
-            guard = _stable_paint_creation_guard(int(item.get('driver_uid', -1)))
-            if guard.get('locked'):
-                protected.append((int(item.get('uid', -1)), int(item.get('driver_uid', -1))))
-        if protected:
-            raise ValueError(
-                'Repairing added paint slots is not available for custom teams yet: ' +
-                ', '.join(f'UID {uid} (driver {driver_uid})' for uid, driver_uid in protected[:12]) +
-                '. Restore a known-good game state or move back only through a validated future build.')
-        if not active:
-            raise ValueError('there are no app-created schemes to repair')
-        proven = mod.proven_extra_donor(g)
-        pair = mod.donor_asset_pair(g, proven['script_name'])
-        arc2 = need(reg, '2')['ar']
-        cdf2_path = need(reg, '2')['cdf']
-        cdf2 = mod.v06.parse_cdf_v6(open(cdf2_path, 'rb').read())
-        prepared = []
-        skipped = []
-        for item in active:
-            source_name = os.path.basename(str(item.get('source_png') or ''))
-            source = os.path.join(EXTRA_SCHEME_IMAGES, source_name)
-            if not source_name or not os.path.exists(source):
-                skipped.append(dict(uid=int(item.get('uid', -1)),
-                                    name=str(item.get('name') or item.get('uid') or 'Unnamed'),
-                                    source_png=(source_name or None),
-                                    reason='saved paint source PNG is missing'))
-                continue
-            image = Image.open(source).convert('RGB')
-            if image.size != (2048,1024):
-                image = image.resize((2048,1024), Image.Resampling.LANCZOS if hasattr(Image,'Resampling') else Image.LANCZOS)
-            sd_wrapper, sd_levels, sd_changed = _native_sd_patch_wrapper(pair['sd'], image, None)
-            hd_wrapper, hd_levels, hd_changed = _native_hd_patch_wrapper_public_v1(pair['hd'], image)
-            rows = []
-            for name,payload in ((item['sd_entry'],bytes(sd_wrapper)),(item['hd_entry'],bytes(hd_wrapper))):
-                _idx, rec = mod.v06.find_v6_file(cdf2, name)
-                if int(rec.data_size) != len(payload):
-                    raise ValueError(f'{name} size no longer matches its indexed slot')
-                rows.append((name,int(rec.data_offset),payload))
-            prepared.append((item,rows,sd_levels,hd_levels,sd_changed,hd_changed))
-
-        if not prepared:
-            return jsonify(dict(ok=True, repaired=0, skipped=skipped, schemes=[],
-                                note='No repairable paint source PNGs were found. Nothing was written.'))
-
-        # Snapshot every affected asset region for same-process rollback.
-        with open(arc2,'rb') as fh:
-            for _item,rows,*_rest in prepared:
-                for name,off,payload in rows:
-                    fh.seek(off); before=fh.read(len(payload))
-                    if len(before)!=len(payload): raise ValueError(f'short pre-repair read for {name}')
-                    originals.append((off,before))
-        with open(arc2,'r+b') as fh:
-            for _item,rows,*_rest in prepared:
-                for name,off,payload in rows:
-                    fh.seek(off);fh.write(payload)
-            fh.flush()
-            for _item,rows,*_rest in prepared:
-                for name,off,payload in rows:
-                    fh.seek(off)
-                    if fh.read(len(payload))!=payload:
-                        raise ValueError(f'asset readback mismatch for {name}')
-
-        ba,bc = _extra_ai_backup_paths(reg)
-        # The DB repair appends a new PYC revision and repoints cdfiles.dat.
-        # Snapshot the small rollback metadata before that step so any later
-        # Python/UI error cannot leave a half-completed repair behind.
-        arc0_path = need(reg, '0')['ar']
-        cdf0_path = need(reg, '0')['cdf']
-        state_before = open(EXTRA_SCHEME_STATE, 'rb').read() if os.path.exists(EXTRA_SCHEME_STATE) else None
-        db_rollback = dict(
-            archive=arc0_path,
-            archive_size=os.path.getsize(arc0_path),
-            cdf=cdf0_path,
-            cdf_bytes=open(cdf0_path, 'rb').read(),
-            state_bytes=state_before,
-        )
-        db = mod.rebuild_managed_database_from_clean_base(
-            g, EXTRA_SCHEME_STATE,
-            backup_archive=ba, backup_cdf=bc,
-            donor_uid=int(proven['uid']),
-        )
-        team_links = _team_reapply_saved_links()
-        state = mod.load_state(EXTRA_SCHEME_STATE)
-        repaired_at = int(time.time())
-        by_uid={int(x['uid']):x for x in state.get('schemes',[]) if x.get('uid') is not None}
-        details=[]
-        for item,rows,sd_levels,hd_levels,sd_changed,hd_changed in prepared:
-            row=by_uid.get(int(item['uid']))
-            if row is not None:
-                row['native_runtime_layout_version']=1
-                row['native_runtime_repaired']=repaired_at
-                row['preview_status']='disabled_unproven'
-            details.append(dict(uid=int(item['uid']),name=item.get('name'),
-                                sd_changed_bytes=sd_changed,hd_changed_bytes=hd_changed,
-                                sd_levels=sd_levels,hd_levels=hd_levels))
-        mod.save_state(EXTRA_SCHEME_STATE,state)
-        try:
-            _SCHEDULE_SOURCE_CACHE.clear();_SCHEDULE_CACHE.clear();_clear_ui_thumb_cache()
+        with _EXTRA_CREATE_LOCK:
+            result = _shared_managed_paint_editor().repair_runtime()
+        try: _clear_ui_thumb_cache()
         except Exception: pass
-        return jsonify(dict(ok=True,repaired=len(details),skipped=skipped,database=db,team_links=team_links,schemes=details,
-                            note=('Rebuilt every repairable app-created slot with the proven DLC donor recipe and native SD/HD mip maps. '
-                                  + (f'{len(skipped)} orphaned source file(s) were skipped and reported. ' if skipped else '')
-                                  + 'Saved team links were reapplied; AI paint schedule and thumbnails were not touched.')))
+        return jsonify(result)
     except Exception as ex:
-        rollback_errors=[]
-        if originals:
-            try:
-                _g,_reg=_extra_game_and_registry(); arc2=need(_reg,'2')['ar']
-                with open(arc2,'r+b') as fh:
-                    for off,before in originals:
-                        fh.seek(off);fh.write(before)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-            except Exception as rb:
-                rollback_errors.append(f'paint bytes: {rb}')
-        if db_rollback:
-            try:
-                with open(db_rollback['archive'], 'r+b') as fh:
-                    fh.truncate(int(db_rollback['archive_size']))
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                atomic_write_bytes(db_rollback['cdf'], db_rollback['cdf_bytes'],
-                                   '.runtime_repair_rollback.tmp')
-                if db_rollback['state_bytes'] is None:
-                    if os.path.exists(EXTRA_SCHEME_STATE):
-                        os.remove(EXTRA_SCHEME_STATE)
-                else:
-                    atomic_write_bytes(EXTRA_SCHEME_STATE, db_rollback['state_bytes'],
-                                       '.runtime_repair_rollback.tmp')
-            except Exception as rb:
-                rollback_errors.append(f'database index: {rb}')
-        if rollback_errors:
-            return jsonify(dict(ok=False, rollback_failed=True,
-                                error=str(RollbackFailed(ex, '; '.join(rollback_errors))))), 500
-        return jsonify(dict(ok=False,error=str(ex))),400
-
+        return jsonify(dict(ok=False, error=str(ex))), 400
 
 @app.route('/api/extra_schemes/thumbnail/<int:uid>', methods=['POST'])
 def extra_scheme_thumbnail(uid):
-    snapshot = None
-    temp_thumb = None
-    with _EXTRA_CREATE_LOCK:
-        try:
-            if _extra_game_running():
-                raise RuntimeError('NASCAR15.exe is running. Close the game before changing a paint thumbnail')
-            g, reg = _extra_game_and_registry()
-            mod = extra_scheme_mod()
-            state = mod.load_state(EXTRA_SCHEME_STATE)
-            item = next((x for x in state.get('schemes', [])
-                         if int(x.get('uid', -1)) == int(uid) and not x.get('superseded_by')), None)
-            if item is None:
-                raise ValueError('that app-created scheme was not found')
-            catalog = mod.catalog(g, EXTRA_SCHEME_STATE)
-            driver = next((d for d in catalog.get('drivers', [])
-                           if int(d.get('uid', -1)) == int(item.get('driver_uid', -2))), None)
-            if driver is None:
-                raise ValueError('the scheme driver is no longer in the live catalog')
-            thumbnail_guard = _stable_paint_creation_guard(int(item['driver_uid']))
-            if thumbnail_guard.get('locked'):
-                raise ValueError(
-                    'Custom thumbnails are not available for drivers on custom teams yet. '
-                    'Nothing was changed.')
-
-            upload = request.files.get('file')
-            prepared = None
-            preparation = None
+    try:
+        upload = request.files.get('file')
+        with _EXTRA_CREATE_LOCK, tempfile.TemporaryDirectory(prefix='nascar_thumbnail_') as folder:
+            source = None
             if upload:
-                prepared, preparation = _extra_prepare_thumbnail_source(
-                    upload.read(), request.form.get('quality') or 'auto')
-                fd, temp_thumb = tempfile.mkstemp(prefix='n15_custom_thumb_', suffix='.png')
-                os.close(fd)
-                prepared.save(temp_thumb, 'PNG')
-
-            tm = extra_thumbnail_mod()
-            preview_container, current_team_driver = _team_preview_container_for_driver(int(item['driver_uid']))
-            existing = tm.find_target(g, uid, target_container_name=preview_container)
-            # FIX (v1.0.2-dev9): a donor supplies the native wrapper/identity
-            # recipe needed to CREATE a slot.  When the slot already exists and is
-            # itself a structurally valid self-identifying 256x256 DXT5 resource,
-            # it is its own donor -- rebuilding it from itself and writing new
-            # pixels is exactly what a replace means.  Previously the donor search
-            # ran unconditionally and excluded the target, so replacing the
-            # thumbnail on the only healthy resource in the bank failed with
-            # "No structurally safe 256x256 native thumbnail exists in this team
-            # bank" even though the target itself qualified.
-            donor = None
-            if existing:
-                try:
-                    self_identity = tm.inspect_thumbnail_identity(
-                        g, uid, target_container_name=preview_container)
-                except Exception:
-                    self_identity = {}
-                if self_identity.get('same_bank_valid'):
-                    donor = {'uid': int(uid), 'container': preview_container,
-                             'entry': f'PAINTSCHEME_{int(uid)}',
-                             'identity_name': self_identity.get('identity_name'),
-                             'self_donor': True}
-            if donor is None:
-                donor = _extra_thumbnail_donor(
-                    g, driver, exclude_uid=uid, target_container=preview_container)
-            _extra_backups(reg, ('1',))
-            snapshot = _extra_transaction_snapshot(reg, ('1',), inplace_thumbnail=existing)
-            _extra_persist_snapshot(snapshot, f"Replace/repair thumbnail for paint UID {uid}")
-            source_name = f"{uid}__{item.get('script_name','SCHEME')}.thumbnail.png"
-            source_path = os.path.join(EXTRA_SCHEME_IMAGES, source_name)
-            if os.path.exists(source_path):
-                snapshot.setdefault('image_overwrites', {})[source_name] = open(source_path, 'rb').read()
-
-            saved_custom_path = None
-            if prepared is None and item.get('thumbnail_source_png'):
-                candidate = os.path.join(
-                    EXTRA_SCHEME_IMAGES,
-                    os.path.basename(str(item.get('thumbnail_source_png'))))
-                if os.path.exists(candidate):
-                    saved_custom_path = candidate
-            effective_thumb = temp_thumb if prepared is not None else saved_custom_path
-            report = tm.install_or_replace_thumbnail(
-                g, uid, int(donor['uid']), effective_thumb,
-                target_container_name=preview_container)
-            if prepared is not None:
-                prepared.save(source_path, 'PNG')
-            elif saved_custom_path is None:
-                _extra_save_live_native_thumbnail(g, uid, preview_container, source_path)
-            report['team_uid'] = int(current_team_driver['team_uid'])
-            _extra_update_preview_state(mod, uid, report, source_name)
-            try: _clear_ui_thumb_cache()
-            except Exception: pass
-            if prepared is not None:
-                note = ('Custom thumbnail rebuilt from the proven native donor recipe, appended '
-                        'as a complete new team-bank revision, and repointed in cdfiles1.dat.')
-            elif saved_custom_path is not None:
-                note = ('The saved custom thumbnail was rebuilt through the proven pre-team route. '
-                        'The old team-bank revision was left untouched and the CDF now points to the new one.')
-            else:
-                note = ('No saved custom thumbnail was available, so the target was rebuilt as an exact '
-                        'native donor clone in a new appended/repointed team-bank revision.')
-            return jsonify(dict(ok=True, uid=uid, preview=report,
-                                preparation=preparation, note=note))
-        except Exception as ex:
-            rollback_errors = _extra_transaction_restore(snapshot) if snapshot else []
-            detail = str(ex)
-            if rollback_errors:
-                detail += ' | Rollback warnings: ' + '; '.join(rollback_errors)
-            elif snapshot:
-                _extra_clear_persisted_snapshot()
-            return jsonify(dict(ok=False, error=detail,
-                                rolled_back=bool(snapshot and not rollback_errors))), 400
-        finally:
-            if temp_thumb and os.path.exists(temp_thumb):
-                try: os.remove(temp_thumb)
-                except OSError: pass
-
+                source = os.path.join(folder, 'thumbnail.png')
+                upload.save(source)
+            result = _shared_managed_paint_editor().replace_thumbnail(
+                int(uid), source, quality=str(request.form.get('quality') or 'auto'))
+        try: _clear_ui_thumb_cache()
+        except Exception: pass
+        return jsonify(result)
+    except Exception as ex:
+        return jsonify(dict(ok=False, error=str(ex))), 400
 
 @app.route('/api/extra_schemes/previews/repair', methods=['POST'])
 def extra_scheme_preview_repair():
@@ -16742,115 +8974,6 @@ def extra_scheme_thumbnail_source(uid):
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 400
 
-def _extra_remove_scheme_from_live_files(uid, game, reg, exact_preflight_error=''):
-    """Remove one rediscovered added scheme while preserving unrelated live DB edits."""
-    snapshot = None
-    try:
-        mod = extra_scheme_mod()
-        _extra_reconcile_state_with_live_database(mod, game)
-        state = mod.load_state(EXTRA_SCHEME_STATE)
-        item = next((x for x in state.get('schemes', [])
-                     if int(x.get('uid', -1)) == int(uid) and not x.get('superseded_by')), None)
-        if item is None:
-            raise ValueError('that active added paint scheme was not found in the live game files')
-
-        snapshot = _extra_transaction_snapshot(reg, ('0',))
-        _extra_persist_snapshot(
-            snapshot, f"Delete added paint UID {uid}",
-            operation={'type': 'delete_live', 'uid': int(uid)})
-
-        removed_assignments = 0
-        for event_key, rows in list((state.get('assignments') or {}).items()):
-            if not isinstance(rows, dict):
-                continue
-            for driver_key, value in list(rows.items()):
-                try:
-                    match = int(value) == int(uid)
-                except Exception:
-                    match = False
-                if match:
-                    rows.pop(driver_key, None)
-                    removed_assignments += 1
-            if not rows:
-                state['assignments'].pop(event_key, None)
-
-        ai_was_applied = bool((state.get('ai') or {}).get('applied'))
-        item['superseded_by'] = 'removed_by_user'
-        item['removed_at'] = int(time.time())
-        item['removed_reason'] = 'user requested live-file deletion'
-        retired = {int(x) for x in state.get('retired_uids', []) if x is not None}
-        retired.add(int(uid))
-        state['retired_uids'] = sorted(retired)
-        mod.save_state(EXTRA_SCHEME_STATE, state)
-
-        try:
-            removed = mod.remove_managed_livery_from_live_base(game, int(uid))
-            removed['delete_method'] = str((removed.get('meta') or {}).get('strategy') or 'live_applypatch_inverse')
-        except Exception as live_delete_error:
-            # The live surgical routes preserve every unrelated record. A clean
-            # rebuild remains a final compatibility fallback only when the live
-            # database still matches its clean non-scheme records exactly.
-            try:
-                proven = mod.proven_extra_donor(game)
-                ba, bc = _extra_ai_backup_paths(reg)
-                removed = mod.rebuild_managed_database_from_clean_base(
-                    game, EXTRA_SCHEME_STATE,
-                    backup_archive=ba, backup_cdf=bc,
-                    donor_uid=int(proven['uid']))
-                removed['delete_method'] = 'verified_clean_base_rebuild'
-                removed['live_inverse_unavailable'] = str(live_delete_error)
-            except Exception as clean_delete_error:
-                raise ValueError(
-                    'Live surgical delete failed: ' + str(live_delete_error)
-                    + ' | Clean-base fallback unavailable: ' + str(clean_delete_error)
-                ) from clean_delete_error
-        schedule = None
-        if ai_was_applied:
-            ba, bc = _extra_ai_backup_paths(reg)
-            schedule = mod.apply_ai(
-                game, EXTRA_SCHEME_STATE,
-                backup_archive=ba, backup_cdf=bc)
-
-        live_ctx = mod.base.load_context(str(game))
-        if any(r.class_name == 'LIVERIE_c'
-               and int(mod.base.pointer_int(live_ctx, r.uid)) == int(uid)
-               for r in live_ctx.records):
-            raise ValueError('delete readback failed: the livery UID is still present')
-
-        _extra_seal_persisted_snapshot(
-            operation={'type': 'delete_live', 'uid': int(uid)})
-        try:
-            _SCHEDULE_SOURCE_CACHE.clear(); _SCHEDULE_CACHE.clear(); _clear_ui_thumb_cache()
-        except Exception:
-            pass
-        return jsonify(dict(
-            ok=True,
-            removed_uid=int(uid),
-            exact_rollback=False,
-            live_file_delete=True,
-            assignments_removed=int(removed_assignments),
-            installed_schedule_updated=bool(schedule),
-            database=removed,
-            note=(
-                'The added scheme was removed from the live game database without changing '
-                'your other team, race, name, or settings edits. Its unused paint and menu-image '
-                'bytes remain safely unreferenced, and this UID is retired so it cannot be reused. '
-                'Undo Last Paint Change can restore the scheme.'
-            )
-        ))
-    except Exception as ex:
-        rollback_errors = _extra_transaction_restore(snapshot) if snapshot else []
-        detail = str(ex)
-        if exact_preflight_error:
-            detail += ' | Exact checkpoint unavailable: ' + str(exact_preflight_error)
-        if rollback_errors:
-            detail += ' | Rollback failed: ' + '; '.join(rollback_errors)
-        elif snapshot:
-            _extra_clear_persisted_snapshot()
-        return jsonify(dict(ok=False, error=detail,
-                            rolled_back=bool(snapshot and not rollback_errors))), 400
-
-
 @app.route('/api/extra_schemes/remove/<int:uid>', methods=['POST'])
 def extra_scheme_remove(uid):
     """Delete an added scheme from the live game, with exact rollback when possible.
@@ -16861,67 +8984,18 @@ def extra_scheme_remove(uid):
     database, preserving every unrelated record and permanently retiring the
     dormant asset UID.
     """
-    redo_tmp = None
     try:
-        if _extra_game_running():
-            raise RuntimeError('NASCAR15.exe is running. Close the game before removing an added paint scheme')
         with _EXTRA_CREATE_LOCK:
-            game, reg = _extra_game_and_registry()
-            exact_preflight_error = ''
-            snapshot = manifest = None
-            try:
-                snapshot, manifest = _extra_load_persisted_snapshot(reg)
-            except Exception as ex:
-                exact_preflight_error = str(ex)
-
-            operation = (manifest or {}).get('operation') or {}
-            exact_candidate = bool(
-                manifest
-                and manifest.get('format') == 'nascar15-extra-scheme-rollback-v2'
-                and manifest.get('mode', 'restore_pre') == 'restore_pre'
-                and operation.get('type') == 'create'
-                and int(operation.get('uid', -1)) == int(uid)
-            )
-            if exact_candidate:
-                try:
-                    _extra_verify_manifest_post_state(manifest)
-                    redo_tmp = _extra_prepare_delete_redo(manifest, uid)
-                except Exception as ex:
-                    exact_preflight_error = str(ex)
-                    if redo_tmp and os.path.isdir(redo_tmp):
-                        shutil.rmtree(redo_tmp, ignore_errors=True)
-                    redo_tmp = None
-                else:
-                    errors = _extra_transaction_restore(snapshot)
-                    if errors:
-                        raise RuntimeError('exact slot removal reported: ' + '; '.join(errors))
-                    if os.path.isdir(EXTRA_SCHEME_ROLLBACK_DIR):
-                        shutil.rmtree(EXTRA_SCHEME_ROLLBACK_DIR)
-                    os.replace(redo_tmp, EXTRA_SCHEME_ROLLBACK_DIR)
-                    redo_tmp = None
-                    try:
-                        _SCHEDULE_SOURCE_CACHE.clear(); _SCHEDULE_CACHE.clear(); _clear_ui_thumb_cache()
-                    except Exception:
-                        pass
-                    return jsonify(dict(
-                        ok=True, removed_uid=int(uid), exact_rollback=True,
-                        note=(
-                            'The scheme was removed by restoring the exact files from before it was created. '
-                            'Undo Last Paint Change can restore it byte-for-byte.'
-                        )
-                    ))
-
-            return _extra_remove_scheme_from_live_files(
-                int(uid), game, reg, exact_preflight_error=exact_preflight_error)
+            result = _shared_managed_paint_editor().remove(int(uid))
+        try: _clear_ui_thumb_cache()
+        except Exception: pass
+        return jsonify(result)
     except Exception as ex:
-        if redo_tmp and os.path.isdir(redo_tmp):
-            shutil.rmtree(redo_tmp, ignore_errors=True)
         return jsonify(dict(ok=False, error=str(ex), rolled_back=False)), 400
-
 
 @app.route('/api/extra_schemes/undo_status')
 def extra_scheme_undo_status():
-    return jsonify(dict(ok=True, **_extra_rollback_status()))
+    return jsonify(dict(ok=True, **_shared_managed_paint_editor().undo_status()))
 
 
 @app.route('/api/extra_schemes/undo', methods=['POST'])
@@ -16930,28 +9004,12 @@ def extra_scheme_undo():
         if _extra_game_running():
             raise RuntimeError('NASCAR15.exe is running. Close the game before undoing a paint change')
         with _EXTRA_CREATE_LOCK:
-            _g, rollback_reg = _extra_game_and_registry()
-            snapshot, manifest = _extra_load_persisted_snapshot(rollback_reg)
-            mode = manifest.get('mode', 'restore_pre')
-            if mode == 'redo_post':
-                _extra_reapply_deleted_slot(snapshot, manifest)
-                action = manifest.get('label')
-                note = 'The deleted paint slot was restored byte-for-byte, including its archive tails, CDF pointers, app state, and saved images.'
-            else:
-                if manifest.get('post_state'):
-                    _extra_verify_manifest_post_state(manifest)
-                errors = _extra_transaction_restore(snapshot)
-                if errors:
-                    raise RuntimeError('paint rollback reported: ' + '; '.join(errors))
-                _extra_clear_persisted_snapshot()
-                action = manifest.get('label')
-                note = 'The previous paint transaction was restored exactly, including CDF pointers, app state, and saved images.'
+            result = _shared_managed_paint_editor().undo()
             try:
-                _SCHEDULE_SOURCE_CACHE.clear(); _SCHEDULE_CACHE.clear(); _clear_ui_thumb_cache()
+                _clear_ui_thumb_cache()
             except Exception:
                 pass
-            return jsonify(dict(ok=True, verified=True, undone=action,
-                                created=manifest.get('created'), note=note))
+            return jsonify(result)
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 400
 
@@ -17011,18 +9069,14 @@ def _extra_unsafe_assigned_thumbnail_uids():
 @app.route('/api/ai_paints/assignments', methods=['GET', 'POST'])
 def ai_paint_assignments_api():
     try:
-        mod = extra_scheme_mod()
+        editor = _shared_managed_paint_editor()
         if request.method == 'GET':
-            g, reg = _extra_game_and_registry()
-            ba, bc = _extra_ai_backup_paths(reg)
-            return jsonify(dict(ok=True, assignments=mod.assignments(EXTRA_SCHEME_STATE),
+            return jsonify(dict(ok=True, assignments=editor.assignments(),
                                 state=_extra_state_public().get('ai', {}),
-                                base_status=mod.ai_base_status(
-                                    g, EXTRA_SCHEME_STATE,
-                                    backup_archive=ba, backup_cdf=bc)))
+                                base_status=editor.ai_status()))
         q = request.get_json(force=True) or {}
-        clean = mod.save_assignments(EXTRA_SCHEME_STATE, q.get('assignments') or {})
-        return jsonify(dict(ok=True, assignments=clean,
+        result = editor.save_assignments(q.get('assignments') or {})
+        return jsonify(dict(result,
                             note='Assignments saved in the app. Use Preview, then Apply to write EVENTINIT.PYC.'))
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 400
@@ -17034,12 +9088,7 @@ def ai_paint_preview_api():
         # AI selection consumes the live livery/database identity, not the
         # Paint Select thumbnail. A damaged menu tile is reported separately and
         # must never block a valid race assignment.
-        g, reg = _extra_game_and_registry()
-        ba, bc = _extra_ai_backup_paths(reg)
-        out = extra_scheme_mod().ai_plan(
-            g, EXTRA_SCHEME_STATE, backup_archive=ba, backup_cdf=bc
-        )
-        return jsonify(out)
+        return jsonify(_shared_managed_paint_editor().preview_ai())
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 400
 
@@ -17047,23 +9096,9 @@ def ai_paint_preview_api():
 @app.route('/api/ai_paints/apply', methods=['POST'])
 def ai_paint_apply_api():
     try:
-        if _extra_game_running():
-            raise RuntimeError('NASCAR15.exe is running. Close the game before applying AI paint assignments')
         # Thumbnail health is presentation-only; validate/apply the live
         # livery and EVENTINIT schedule independently.
-        g, reg = _extra_game_and_registry()
-        ba, bc = _extra_ai_backup_paths(reg)
-        # Validate/capture the clean reusable function before creating any new
-        # archive backup. This avoids blessing an already-patched standalone
-        # probe as a supposedly pristine first backup.
-        extra_scheme_mod().ensure_ai_base(
-            g, EXTRA_SCHEME_STATE, backup_archive=ba, backup_cdf=bc
-        )
-        _extra_backups(reg, ('0',))
-        ba, bc = _extra_ai_backup_paths(reg)
-        out = extra_scheme_mod().apply_ai(
-            g, EXTRA_SCHEME_STATE, backup_archive=ba, backup_cdf=bc
-        )
+        out = _shared_managed_paint_editor().apply_ai()
         payload = dict(out)
         payload['ok'] = True
         payload['note'] = ('AI paint schedule installed. Races and drivers without an assignment '
@@ -17076,11 +9111,7 @@ def ai_paint_apply_api():
 @app.route('/api/ai_paints/restore', methods=['POST'])
 def ai_paint_restore_api():
     try:
-        if _extra_game_running():
-            raise RuntimeError('NASCAR15.exe is running. Close the game before restoring AI paint logic')
-        g, reg = _extra_game_and_registry()
-        _extra_backups(reg, ('0',))
-        out = extra_scheme_mod().restore_ai(g, EXTRA_SCHEME_STATE)
+        out = _shared_managed_paint_editor().restore_ai()
         payload = dict(out)
         payload['ok'] = True
         payload['note'] = ('Original AI paint selection restored. Your saved schedule remains in the app '
@@ -17099,19 +9130,7 @@ def extra_schemes_export():
     is expanded in the next packaging pass.
     """
     try:
-        import zipfile
-        state = _extra_state_public()
-        out = io.BytesIO()
-        with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
-            z.writestr('extra_schemes_v1.json', json.dumps(state, indent=2).encode('utf-8'))
-            for item in state.get('schemes', []):
-                name = os.path.basename(str(item.get('source_png') or ''))
-                path = os.path.join(EXTRA_SCHEME_IMAGES, name)
-                if name and os.path.exists(path):
-                    z.write(path, 'paints/' + name)
-            z.writestr('README.txt',
-                b'NASCAR 15 Modding App extra-scheme library and named-race AI assignments. '
-                b'Import/install support is handled by the Modding App; no copyrighted game archive is included.\n')
+        out = io.BytesIO(_shared_managed_paint_editor().export_library_bytes())
         out.seek(0)
         return send_file(out, mimetype='application/zip', as_attachment=True,
                          download_name='nascar15_extra_schemes_and_ai_paints.zip')
@@ -17142,22 +9161,15 @@ def bank_verify_mod():
     global _BANK_VERIFY_MOD
     if _BANK_VERIFY_MOD is not None:
         return _BANK_VERIFY_MOD
-    path = component_path(BANK_VERIFY_HELPER)
-    if not os.path.exists(path):
-        raise RuntimeError(f'{BANK_VERIFY_HELPER} is missing from the internal tools folder')
-    spec = importlib.util.spec_from_file_location('n15_bank_verify', path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules['n15_bank_verify'] = mod
-    spec.loader.exec_module(mod)
-    _BANK_VERIFY_MOD = mod
-    return mod
+    _BANK_VERIFY_MOD = _load_internal_module(
+        BANK_VERIFY_HELPER, 'n15_bank_verify'
+    )
+    return _BANK_VERIFY_MOD
 
 
-TEAM_MANAGER_HELPER = 'nascar15_team_manager_v1.py'
 TEAM_ASSETS_HELPER = 'nascar15_team_assets_v1.py'
 TEAM_MANAGER_STATE = os.path.join(USER_DIR, 'team_manager_state.json')
 TEAM_ASSET_ROLLBACK_DIR = os.path.join(USER_DIR, 'team_asset_rollback_v1')
-_TEAM_MANAGER_MOD = None
 _TEAM_ASSETS_MOD = None
 _TEAM_MANAGER_LOCK = threading.RLock()
 
@@ -17246,38 +9258,19 @@ def _public_custom_team_locked(team_uid):
     return bool(not PUBLIC_CUSTOM_TEAMS_ENABLED and int(team_uid) in SUPPORTED_SPARE_TEAM_UIDS)
 
 
-def team_manager_mod():
-    global _TEAM_MANAGER_MOD
-    if _TEAM_MANAGER_MOD is not None:
-        return _TEAM_MANAGER_MOD
-    path = component_path(TEAM_MANAGER_HELPER)
-    if not os.path.exists(path):
-        raise RuntimeError('team manager helper is missing: ' + TEAM_MANAGER_HELPER)
-    spec = importlib.util.spec_from_file_location('nascar15_team_manager_runtime', path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError('could not load the team manager helper')
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    _TEAM_MANAGER_MOD = mod
-    return mod
 
 
 def team_assets_mod():
     global _TEAM_ASSETS_MOD
     if _TEAM_ASSETS_MOD is not None:
         return _TEAM_ASSETS_MOD
-    path = component_path(TEAM_ASSETS_HELPER)
-    if not os.path.exists(path):
-        raise RuntimeError('team presentation helper is missing: ' + TEAM_ASSETS_HELPER)
-    spec = importlib.util.spec_from_file_location('nascar15_team_assets_runtime', path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError('could not load the team presentation helper')
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    _TEAM_ASSETS_MOD = mod
-    return mod
+    _TEAM_ASSETS_MOD = _load_internal_module(
+        TEAM_ASSETS_HELPER,
+        'nascar15_team_assets_runtime',
+        'team presentation helper is missing: ' + TEAM_ASSETS_HELPER,
+        'could not load the team presentation helper',
+    )
+    return _TEAM_ASSETS_MOD
 
 
 def _team_state_load():
@@ -17313,10 +9306,7 @@ def _team_state_load():
 
 
 def _team_state_save(state):
-    tmp = TEAM_MANAGER_STATE + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(state, f, indent=2)
-    os.replace(tmp, TEAM_MANAGER_STATE)
+    atomic_write_json(TEAM_MANAGER_STATE, state, indent=2)
 
 
 def _team_driver_labels():
@@ -17381,10 +9371,7 @@ def _team_asset_statuses_direct(game, team_uids):
 
 
 def _team_friendly_catalog():
-    _v, _row, pyc = _pyc_live_blob(DBFILE)
-    mod = team_manager_mod()
-    data = mod.catalog(pyc)
-    data['legacy_team_patch'] = mod.legacy_patch_status(pyc)
+    data = _shared_team_editor().catalog()
     cfg = load_cfg()
     renames = cfg.get('renames', {}) if isinstance(cfg.get('renames', {}), dict) else {}
     base_labels = _team_driver_labels()
@@ -17487,36 +9474,10 @@ def _team_friendly_catalog():
 def _team_install_changes(changes, source_name='Teams editor'):
     if _extra_game_running():
         raise RuntimeError('NASCAR15.exe is running. Close the game before changing teams')
-    mod = team_manager_mod()
-    v, row, current = _pyc_live_blob(DBFILE)
-    rebuilt, meta = mod.build_changes(current, changes)
-    if meta.get('noop'):
-        return dict(ok=True, changed=False, verified=True, patch=meta)
-    fd, tmp = tempfile.mkstemp(prefix='n15_team_', suffix='.PYC')
-    os.close(fd)
-    try:
-        with open(tmp, 'wb') as f:
-            f.write(rebuilt)
-        _rp_backup_pair(v)
-        with _RP_LOCK:
-            result = _rp_install_one('0', v, row, tmp, source_name=source_name, allow_magic=True)
-        _v2, _row2, live = _pyc_live_blob(DBFILE)
-        check = mod.catalog(live)
-        cfg_map = {int(d['config_uid']): int(d['team_uid']) for d in check.get('drivers', [])}
-        team_map = {int(t['uid']): int(t['manufacturer_uid']) if t.get('manufacturer_uid') is not None else None for t in check.get('teams', [])}
-        for ch in meta.get('changes', []):
-            if ch['class_name'] == 'DRIVERCONFIG_c':
-                got = cfg_map.get(int(ch['uid']))
-            else:
-                got = team_map.get(int(ch['uid']))
-            if got != int(ch['target_uid']):
-                raise RuntimeError(f"installed team edit failed readback for {ch['class_name']} UID {ch['uid']}")
-        return dict(ok=True, changed=True, verified=True, patch=meta, install=result)
-    finally:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+    result = _shared_team_editor().apply(changes)
+    return dict(ok=True, changed=result['changed'], verified=True,
+                patch={'changes': result['changes'], 'recovery': result.get('recovery')},
+                install=result.get('write'), source=source_name)
 
 
 def _team_reapply_saved_links():
@@ -17555,53 +9516,15 @@ def _team_reapply_saved_links():
 
 
 def _team_asset_snapshot(reg):
-    snap = {'groups': {}, 'state_exists': os.path.exists(TEAM_MANAGER_STATE),
-            'state_bytes': open(TEAM_MANAGER_STATE, 'rb').read() if os.path.exists(TEAM_MANAGER_STATE) else None,
-            'extra_state_captured': True,
-            'extra_state_exists': os.path.exists(EXTRA_SCHEME_STATE),
-            'extra_state_bytes': open(EXTRA_SCHEME_STATE, 'rb').read() if os.path.exists(EXTRA_SCHEME_STATE) else None}
-    for key in ('0', '1'):
-        v = need(reg, key)
-        snap['groups'][key] = {'archive': v['ar'], 'size': os.path.getsize(v['ar']),
-                               'cdf': v['cdf'], 'cdf_bytes': open(v['cdf'], 'rb').read()}
-    return snap
+    return _shared_team_asset_transaction().snapshot(('0', '1'))
 
 
 def _team_asset_restore(snap):
-    errors = []
-    for key, item in (snap or {}).get('groups', {}).items():
-        try:
-            with open(item['archive'], 'r+b') as fh:
-                fh.truncate(int(item['size'])); fh.flush(); os.fsync(fh.fileno())
-            _extra_atomic_bytes(item['cdf'], item['cdf_bytes'])
-        except Exception as ex:
-            errors.append(f'{key}: {ex}')
-    try:
-        if snap.get('state_exists'):
-            _extra_atomic_bytes(TEAM_MANAGER_STATE, snap.get('state_bytes') or b'')
-        elif os.path.exists(TEAM_MANAGER_STATE):
-            os.remove(TEAM_MANAGER_STATE)
-    except Exception as ex:
-        errors.append('state: ' + str(ex))
-    try:
-        if snap.get('extra_state_captured'):
-            if snap.get('extra_state_exists'):
-                _extra_atomic_bytes(EXTRA_SCHEME_STATE, snap.get('extra_state_bytes') or b'')
-            elif os.path.exists(EXTRA_SCHEME_STATE):
-                os.remove(EXTRA_SCHEME_STATE)
-    except Exception as ex:
-        errors.append('extra scheme state: ' + str(ex))
-    return errors
+    return _shared_team_asset_transaction().restore(snap) if snap else []
 
 
 def _team_asset_clear_persisted_snapshot():
-    existed = os.path.isdir(TEAM_ASSET_ROLLBACK_DIR)
-    try:
-        if existed:
-            shutil.rmtree(TEAM_ASSET_ROLLBACK_DIR)
-        return bool(existed)
-    except Exception:
-        return False
+    return _shared_team_asset_checkpoint().clear()
 
 
 def _team_snapshot_created_epoch(meta):
@@ -17615,131 +9538,19 @@ def _team_snapshot_created_epoch(meta):
 
 
 def _team_snapshot_restore_block(meta):
-    if int((meta or {}).get('safety_version') or 0) >= 2:
-        captured = {int(x) for x in ((meta or {}).get('captured_active_scheme_uids') or [])}
-        try:
-            state = extra_scheme_mod().load_state(EXTRA_SCHEME_STATE)
-            current = {int(x.get('uid')) for x in state.get('schemes', [])
-                       if x.get('uid') is not None and not x.get('superseded_by')}
-        except Exception:
-            current = set()
-        added = sorted(current - captured)
-        if added:
-            ids = ', '.join(str(x) for x in added[:8])
-            return (f'This restore point is older than paint slots you have since added ({ids}). '
-                    'Using it would leave the game and the app disagreeing about what exists.')
-    else:
-        try:
-            state = extra_scheme_mod().load_state(EXTRA_SCHEME_STATE)
-            active = [x for x in state.get('schemes', []) if not x.get('superseded_by')]
-        except Exception:
-            active = []
-        if active:
-            return ('This legacy restore point did not capture app-created paint state and is disabled '
-                    'to prevent archive/state desynchronization.')
-    return None
+    return _shared_team_asset_checkpoint().restore_block(meta)
 
 
 def _team_asset_persist_snapshot(snap, label):
-    """Persist an append/repoint rollback without copying multi-hundred-MB archives."""
-    tmp = TEAM_ASSET_ROLLBACK_DIR + '.tmp'
-    if os.path.isdir(tmp):
-        shutil.rmtree(tmp)
-    os.makedirs(tmp, exist_ok=True)
-    captured_active_uids = []
-    if snap.get('extra_state_exists') and snap.get('extra_state_bytes'):
-        try:
-            captured_state = json.loads((snap.get('extra_state_bytes') or b'{}').decode('utf-8'))
-            captured_active_uids = sorted(int(x.get('uid')) for x in captured_state.get('schemes', [])
-                                          if x.get('uid') is not None and not x.get('superseded_by'))
-        except Exception:
-            captured_active_uids = []
-    manifest = {
-        'format': 'nascar15-team-asset-rollback-v1',
-        'safety_version': 2,
-        'created': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
-        'created_epoch': time.time(),
-        'label': str(label or 'Team presentation change'),
-        'groups': {},
-        'state_exists': bool(snap.get('state_exists')),
-        'extra_state_captured': True,
-        'extra_state_exists': bool(snap.get('extra_state_exists')),
-        'captured_active_scheme_uids': captured_active_uids,
-    }
-    for key, item in (snap or {}).get('groups', {}).items():
-        name = f'cdf_{key}.bin'
-        with open(os.path.join(tmp, name), 'wb') as fh:
-            fh.write(item['cdf_bytes'])
-        manifest['groups'][str(key)] = {
-            'archive': os.path.abspath(item['archive']),
-            'size': int(item['size']),
-            'cdf': os.path.abspath(item['cdf']),
-            'cdf_backup': name,
-        }
-    if snap.get('state_exists'):
-        with open(os.path.join(tmp, 'team_state.bin'), 'wb') as fh:
-            fh.write(snap.get('state_bytes') or b'')
-        manifest['state_backup'] = 'team_state.bin'
-    if snap.get('extra_state_exists'):
-        with open(os.path.join(tmp, 'extra_scheme_state.bin'), 'wb') as fh:
-            fh.write(snap.get('extra_state_bytes') or b'')
-        manifest['extra_state_backup'] = 'extra_scheme_state.bin'
-    with open(os.path.join(tmp, 'manifest.json'), 'w', encoding='utf-8') as fh:
-        json.dump(manifest, fh, indent=2)
-    if os.path.isdir(TEAM_ASSET_ROLLBACK_DIR):
-        shutil.rmtree(TEAM_ASSET_ROLLBACK_DIR)
-    os.replace(tmp, TEAM_ASSET_ROLLBACK_DIR)
-    return manifest
+    return _shared_team_asset_checkpoint().persist(snap, label)
 
 
 def _team_asset_rollback_info():
-    path = os.path.join(TEAM_ASSET_ROLLBACK_DIR, 'manifest.json')
-    try:
-        raw = json.load(open(path, 'r', encoding='utf-8'))
-        blocked = _team_snapshot_restore_block(raw)
-        return {'available': not bool(blocked), 'created': raw.get('created'),
-                'label': raw.get('label'), 'blocked_reason': blocked,
-                'safety_version': int(raw.get('safety_version') or 0)}
-    except Exception:
-        return {'available': False}
+    return _shared_team_asset_checkpoint().info()
 
 
 def _team_asset_load_persisted_snapshot(reg):
-    path = os.path.join(TEAM_ASSET_ROLLBACK_DIR, 'manifest.json')
-    raw = json.load(open(path, 'r', encoding='utf-8'))
-    if raw.get('format') != 'nascar15-team-asset-rollback-v1':
-        raise ValueError('the saved team rollback has an unknown format')
-    blocked = _team_snapshot_restore_block(raw)
-    if blocked:
-        raise ValueError(blocked)
-    snap = {'groups': {}, 'state_exists': bool(raw.get('state_exists')), 'state_bytes': None,
-            'extra_state_captured': bool(raw.get('extra_state_captured')),
-            'extra_state_exists': bool(raw.get('extra_state_exists')), 'extra_state_bytes': None}
-    for key, item in (raw.get('groups') or {}).items():
-        live = need(reg, str(key))
-        expected_archive = os.path.normcase(os.path.abspath(item['archive']))
-        expected_cdf = os.path.normcase(os.path.abspath(item['cdf']))
-        if os.path.normcase(os.path.abspath(live['ar'])) != expected_archive or os.path.normcase(os.path.abspath(live['cdf'])) != expected_cdf:
-            raise ValueError('the saved rollback belongs to a different NASCAR 15 installation')
-        cdf_backup = os.path.join(TEAM_ASSET_ROLLBACK_DIR, item['cdf_backup'])
-        saved_size = int(item['size'])
-        if os.path.getsize(live['ar']) < saved_size:
-            raise ValueError(
-                f'ARCHIVE{key} is smaller than the saved pre-change size; refusing an unsafe team undo')
-        cdf_bytes = open(cdf_backup, 'rb').read()
-        if len(cdf_bytes) < 64 or cdf_bytes[:4] != b'filC':
-            raise ValueError(f'the saved CDF backup for ARCHIVE{key} is invalid')
-        snap['groups'][str(key)] = {
-            'archive': live['ar'], 'size': saved_size, 'cdf': live['cdf'],
-            'cdf_bytes': cdf_bytes,
-        }
-    if snap['state_exists']:
-        state_name = raw.get('state_backup') or 'team_state.bin'
-        snap['state_bytes'] = open(os.path.join(TEAM_ASSET_ROLLBACK_DIR, state_name), 'rb').read()
-    if snap['extra_state_captured'] and snap['extra_state_exists']:
-        extra_name = raw.get('extra_state_backup') or 'extra_scheme_state.bin'
-        snap['extra_state_bytes'] = open(os.path.join(TEAM_ASSET_ROLLBACK_DIR, extra_name), 'rb').read()
-    return snap, raw
+    return _shared_team_asset_checkpoint().load()
 
 
 def _team_original_team_map():
@@ -17753,7 +9564,7 @@ def _team_original_team_map():
         row = _rp_find_row(rows, DBFILE)
         with open(archive, 'rb') as fh:
             fh.seek(row['offset']); pyc = fh.read(row['size'])
-        cat = team_manager_mod().catalog(pyc)
+        cat = _shared_team_editor().catalog_payload(pyc)
         return {int(d['config_uid']): int(d['team_uid']) for d in cat.get('drivers', [])}
     except Exception:
         return {}
@@ -17771,7 +9582,7 @@ def _team_original_manufacturer_map():
         row = _rp_find_row(rows, DBFILE)
         with open(archive, 'rb') as fh:
             fh.seek(row['offset']); pyc = fh.read(row['size'])
-        cat = team_manager_mod().catalog(pyc)
+        cat = _shared_team_editor().catalog_payload(pyc)
         return {int(t['uid']): int(t['manufacturer_uid']) for t in cat.get('teams', [])}
     except Exception:
         return {}
@@ -17857,8 +9668,7 @@ def _team_original_source_uid_for_driver(driver):
 
 def _team_fast_driver_links():
     """Read only the live DRIVERCONFIG team links, without presentation scans."""
-    _v, _row, pyc = _pyc_live_blob(DBFILE)
-    raw = team_manager_mod().catalog(pyc)
+    raw = _shared_team_editor().catalog()
     return {
         int(d['driver_uid']): {
             'driver_uid': int(d['driver_uid']),
@@ -18104,7 +9914,7 @@ def _team_history_label(kind, catalog, uid, old_uid, new_uid):
 @app.route('/api/teams/catalog')
 def teams_catalog_api():
     try:
-        return jsonify(dict(ok=True, **_team_friendly_catalog()))
+        return jsonify(dict(ok=True, **_shared_team_presentation_editor().catalog()))
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 400
 
@@ -18113,258 +9923,44 @@ def teams_catalog_api():
 def teams_move_driver_api():
     try:
         q = request.get_json(force=True) or {}
-        config_uid = int(q.get('config_uid'))
-        target_uid = int(q.get('team_uid'))
-        dry = bool(q.get('dry_run'))
-        with _TEAM_MANAGER_LOCK:
-            before = _team_friendly_catalog()
-            driver = next((x for x in before.get('drivers', []) if int(x['config_uid']) == config_uid), None)
-            team = next((x for x in before.get('teams', []) if int(x['uid']) == target_uid), None)
-            if driver is None:
-                raise ValueError('2015 Cup driver configuration was not found')
-            if team is None:
-                raise ValueError('destination team was not found')
-            old_uid = int(driver['team_uid'])
-            preview = dict(kind='driver_team', config_uid=config_uid, driver=driver.get('car_label'),
-                           old_team_uid=old_uid, old_team=driver.get('team_label'),
-                           new_team_uid=target_uid, new_team=team.get('label'),
-                           affected_schemes='native schemes attached to this 2015 Cup driver configuration')
-            created_uids = [int(x) for x in (driver.get('created_scheme_uids') or [])]
-            public_custom_target = bool(target_uid != old_uid and _public_custom_team_locked(target_uid))
-            move_blocked = bool(target_uid != old_uid and (created_uids or public_custom_target))
-            if move_blocked:
-                preview['allowed'] = False
-                preview['app_created_scheme_uids'] = created_uids
-                preview['public_custom_team_locked'] = public_custom_target
-                preview['blocked_reason'] = (
-                    PUBLIC_CUSTOM_TEAM_MESSAGE if public_custom_target else
-                    'Cannot move this driver yet — they have extra paint slots you added: ' +
-                    ', '.join(map(str, created_uids)) +
-                    '. Moving them would require the unresolved moved-team thumbnail path.')
-            else:
-                preview['allowed'] = True
-                preview['recovery_move'] = bool(_public_custom_team_locked(old_uid) and not _public_custom_team_locked(target_uid))
-            if dry:
-                return jsonify(dict(ok=True, dry_run=True, preview=preview))
-            if target_uid == old_uid:
-                return jsonify(dict(ok=True, verified=True, changed=False, preview=preview,
-                                    note='Driver is already assigned to that team; no files or saved state changed.'))
-            if move_blocked:
-                raise ValueError(preview['blocked_reason'])
-            if target_uid in UNSUPPORTED_TEAM_UIDS:
-                raise ValueError('Dodge/custom Dodge is not supported by the game')
-            g, reg = _extra_game_and_registry()
-            snapshot = _team_asset_snapshot(reg)
-            rollback_manifest = _team_asset_persist_snapshot(snapshot, f"Move {driver.get('car_label')} to {team.get('label')}")
-            try:
-                assets = _team_prepare_transfer_assets(g, driver, old_uid, target_uid)
-                result = _team_install_changes([
-                    dict(class_name='DRIVERCONFIG_c', uid=config_uid, field='TEAM', target_uid=target_uid)
-                ], f"Move {driver.get('car_label')} to {team.get('label')}")
-                state = _team_state_load()
-                if result.get('changed'):
-                    state['driver_teams'][str(config_uid)] = target_uid
-                    state['driver_source_teams'].setdefault(str(config_uid), int(assets.get('source_team_uid', old_uid)))
-                if target_uid in SUPPORTED_SPARE_TEAM_UIDS:
-                    state['team_logo_donors'].setdefault(str(target_uid), int(assets.get('source_team_uid', old_uid)))
-                if result.get('changed'):
-                    state['history'].append(dict(kind='driver_team', uid=config_uid, old_uid=old_uid,
-                                                 new_uid=target_uid, label=_team_history_label('driver_team', before, config_uid, old_uid, target_uid),
-                                                 rollback_label=rollback_manifest.get('label'),
-                                                 rollback_created=rollback_manifest.get('created'),
-                                                 rollback_created_epoch=rollback_manifest.get('created_epoch'),
-                                                 created=datetime.datetime.now().isoformat(timespec='seconds')))
-                state['history'] = state['history'][-100:]
-                _team_state_save(state)
-                # The driver's live team link and destination Paint Select bank
-                # changed together.  Drop every cached livery/thumbnail lookup so
-                # Existing Paints immediately shows the moved driver's current
-                # thumbnail instead of the old-team cached image.
-                _clear_ui_thumb_cache()
-            except Exception:
-                restore_errors = _team_asset_restore(snapshot)
-                if not restore_errors:
-                    _team_asset_clear_persisted_snapshot()
-                if restore_errors:
-                    raise RuntimeError('team transfer failed; rollback also reported: ' + '; '.join(restore_errors))
-                raise
-            return jsonify(dict(ok=True, verified=True, changed=result.get('changed', False), preview=preview, result=result, assets=assets))
+        result = _shared_team_presentation_editor().move_driver(
+            int(q.get('config_uid')), int(q.get('team_uid')),
+            dry_run=bool(q.get('dry_run')),
+        )
+        if not result.get('dry_run'):
+            _clear_ui_thumb_cache()
+        return jsonify(result)
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 400
-
 
 @app.route('/api/teams/set_manufacturer', methods=['POST'])
 def teams_set_manufacturer_api():
     try:
         q = request.get_json(force=True) or {}
-        team_uid = int(q.get('team_uid'))
-        target_uid = int(q.get('manufacturer_uid'))
-        dry = bool(q.get('dry_run'))
-        with _TEAM_MANAGER_LOCK:
-            before = _team_friendly_catalog()
-            team = next((x for x in before.get('teams', []) if int(x['uid']) == team_uid), None)
-            manufacturer = next((x for x in before.get('manufacturers', []) if int(x['uid']) == target_uid), None)
-            if team is None:
-                raise ValueError('team was not found')
-            _public_custom_team_guard(team_uid, 'change the manufacturer for this reserve team')
-            if manufacturer is None:
-                raise ValueError('manufacturer was not found')
-            if target_uid in UNSUPPORTED_MANUFACTURER_UIDS:
-                raise ValueError('Dodge is not supported by NASCAR 15 team/car assets')
-            old_uid = int(team['manufacturer_uid'])
-            preview = dict(kind='team_manufacturer', team_uid=team_uid, team=team.get('label'),
-                           old_manufacturer_uid=old_uid, old_manufacturer=team.get('manufacturer_label'),
-                           new_manufacturer_uid=target_uid, new_manufacturer=manufacturer.get('label'),
-                           affected_drivers=[x.get('car_label') for x in team.get('drivers', [])],
-                           body_model_note='The game will use the matching manufacturer body package.')
-            if dry:
-                return jsonify(dict(ok=True, dry_run=True, preview=preview))
-            g, reg = _extra_game_and_registry()
-            snapshot = _team_asset_snapshot(reg)
-            rollback_manifest = _team_asset_persist_snapshot(snapshot, f"Set {team.get('label')} manufacturer to {manufacturer.get('label')}")
-            try:
-                result = _team_install_changes([
-                    dict(class_name='RACETEAM_c', uid=team_uid, field='MANUFACTURER', target_uid=target_uid)
-                ], f"Set {team.get('label')} manufacturer to {manufacturer.get('label')}")
-                state = _team_state_load()
-                state['team_manufacturers'][str(team_uid)] = target_uid
-                if result.get('changed'):
-                    state['history'].append(dict(kind='team_manufacturer', uid=team_uid, old_uid=old_uid,
-                                                 new_uid=target_uid, label=_team_history_label('team_manufacturer', before, team_uid, old_uid, target_uid),
-                                                 rollback_label=rollback_manifest.get('label'),
-                                                 rollback_created=rollback_manifest.get('created'),
-                                                 rollback_created_epoch=rollback_manifest.get('created_epoch'),
-                                                 created=datetime.datetime.now().isoformat(timespec='seconds')))
-                state['history'] = state['history'][-100:]
-                _team_state_save(state)
-            except Exception:
-                restore_errors = _team_asset_restore(snapshot)
-                if not restore_errors:
-                    _team_asset_clear_persisted_snapshot()
-                if restore_errors:
-                    raise RuntimeError('manufacturer change failed; rollback also reported: ' + '; '.join(restore_errors))
-                raise
-            return jsonify(dict(ok=True, verified=True, changed=result.get('changed', False), preview=preview, result=result,
-                                paint_warning='Existing stock paint templates remain authored for the old body; Smart Import now blocks old-body auto alignment.'))
+        return jsonify(_shared_team_presentation_editor().set_manufacturer(
+            int(q.get('team_uid')), int(q.get('manufacturer_uid')),
+            dry_run=bool(q.get('dry_run')),
+        ))
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 400
-
 
 @app.route('/api/teams/prepare', methods=['POST'])
 def teams_prepare_assets_api():
     try:
-        if _extra_game_running():
-            raise RuntimeError('NASCAR15.exe is running. Close the game before rebuilding team presentation assets')
         q = request.get_json(force=True) or {}
-        team_uid = int(q.get('team_uid'))
-        if team_uid in UNSUPPORTED_TEAM_UIDS:
-            raise ValueError('the Dodge spare slot is not supported')
-        _public_custom_team_guard(team_uid, 'build or repair reserve-team presentation assets')
-        with _TEAM_MANAGER_LOCK:
-            catalog = _team_friendly_catalog()
-            team = next((x for x in catalog.get('teams', []) if int(x['uid']) == team_uid), None)
-            if team is None:
-                raise ValueError('team was not found')
-            drivers = list(team.get('drivers') or [])
-            if not drivers:
-                raise ValueError('move at least one driver into this team before building its paint container')
-            g, reg = _extra_game_and_registry()
-            snapshot = _team_asset_snapshot(reg)
-            _team_asset_persist_snapshot(snapshot, f"Build or repair presentation assets for {team.get('label')}")
-            reports = []
-            state = _team_state_load()
-            originals = _team_original_team_map()
-            try:
-                for driver in drivers:
-                    source_uid = int(state.get('driver_source_teams', {}).get(str(driver['config_uid']),
-                                     originals.get(int(driver['config_uid']), driver['team_uid'])))
-                    liveries = _team_driver_native_livery_uids(g, int(driver['driver_uid']))
-                    driver_report = team_assets_mod().ensure_driver_assets(
-                        g, team_uid, source_uid, int(driver['driver_uid']), liveries)
-                    driver_report['transfer_strategy'] = 'public_v1_direct_revision'
-                    if SPARE_TEAM_PAINT_CREATION_ENABLED:
-                        driver_report['created_thumbnails_rebuilt'] = _team_rebuild_created_thumbnails(
-                            g, int(driver['driver_uid']), team_uid)
-                        driver_report['created_thumbnail_guard'] = 'spare-team paint creation enabled'
-                    else:
-                        driver_report['created_thumbnails_rebuilt'] = []
-                        driver_report['created_thumbnail_guard'] = 'skipped by stable baseline'
-                    reports.append(driver_report)
-                    state['driver_source_teams'].setdefault(str(driver['config_uid']), source_uid)
-                donor = int(state.get('team_logo_donors', {}).get(str(team_uid),
-                            reports[0].get('source_team_uid', TEAM_DEFAULT_LOGO_DONORS.get(team_uid, team_uid))))
-                logo = team_assets_mod().ensure_team_logo(g, team_uid, donor)
-                state['team_logo_donors'][str(team_uid)] = donor
-                _team_state_save(state)
-            except Exception:
-                restore_errors = _team_asset_restore(snapshot)
-                if not restore_errors:
-                    _team_asset_clear_persisted_snapshot()
-                if restore_errors:
-                    raise RuntimeError('team asset repair failed; rollback also reported: ' + '; '.join(restore_errors))
-                raise
-            return jsonify(dict(ok=True, verified=True, team_uid=team_uid,
-                                drivers=len(drivers), reports=reports, logo=logo))
+        return jsonify(_shared_team_presentation_editor().prepare_team(
+            int(q.get('team_uid')),
+        ))
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 400
-
 
 @app.route('/api/teams/rename', methods=['POST'])
 def teams_rename_api():
     try:
         q = request.get_json(force=True) or {}
-        team_uid = int(q.get('team_uid'))
-        new_name = str(q.get('name') or '').strip()
-        if not new_name:
-            raise ValueError('enter a team name')
-        if len(new_name) > 80:
-            raise ValueError('team name must be 80 characters or fewer')
-        if team_uid in UNSUPPORTED_TEAM_UIDS:
-            raise ValueError('the Dodge spare slot is not supported')
-        _public_custom_team_guard(team_uid, 'rename this reserve team')
-        with _TEAM_MANAGER_LOCK:
-            before = _team_friendly_catalog()
-            team = next((x for x in before.get('teams', []) if int(x['uid']) == team_uid), None)
-            if team is None:
-                raise ValueError('team was not found')
-            current = str(team.get('label') or '').strip()
-            original = str(team.get('original_label') or current).strip()
-            if new_name == current:
-                return jsonify(dict(ok=True, changed=False, name=new_name))
-            _g, reg = registry()
-            patched = 0
-            errors = []
-            for candidate in dict.fromkeys([current, original]):
-                if not candidate or candidate == new_name:
-                    continue
-                try:
-                    patched = patch_name_exp(reg, candidate, new_name)
-                    if patched:
-                        break
-                except Exception as ex:
-                    errors.append(str(ex))
-            # The three stock spare RACETEAM records use localization tokens
-            # that have no matching display-string entry in some installs.
-            # Persist the UID-based name regardless; patch the game text only
-            # where a real live entry exists instead of rejecting the rename.
-            state = _team_state_load()
-            state['team_names'][str(team_uid)] = new_name
-            state['history'].append(dict(kind='team_name', uid=team_uid, old_name=current,
-                                         new_name=new_name, patched=int(patched),
-                                         game_text_patched=bool(patched),
-                                         label=f'{current} → {new_name}',
-                                         created=datetime.datetime.now().isoformat(timespec='seconds')))
-            state['history'] = state['history'][-100:]
-            _team_state_save(state)
-            cfg = load_cfg(); cfg.setdefault('renames', {})[original] = new_name; save_cfg(cfg)
-            warning = None
-            if not patched:
-                warning = ('Saved by stable team UID. This stock spare slot has no '
-                           'matching live text-table entry, so there was no in-game '
-                           'localization string to patch.')
-            return jsonify(dict(ok=True, changed=True, name=new_name, patched=patched,
-                                game_text_patched=bool(patched), warning=warning,
-                                text_errors=errors[-3:]))
+        return jsonify(_shared_team_presentation_editor().rename_team(
+            int(q.get('team_uid')), str(q.get('name') or ''),
+        ))
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 400
 
@@ -18417,254 +10013,95 @@ def _prepare_team_logo_auto(image, target_size):
 @app.route('/api/teams/logo/<int:team_uid>')
 def teams_logo_png(team_uid):
     try:
-        g, reg = registry()
-        if not g:
-            raise RuntimeError('NASCAR 15 game folder is not selected')
-        _arcid, _off, _size, raw = menu_container(reg, 'teams', live=True)
-        entries, _ = C.parse_multi_arc(raw)
-        resolved_name = _team_logo_entry_name(team_uid, entries)
-        entry = next((e for e in entries if e['name'] == resolved_name), None) if resolved_name else None
-        if entry is None:
-            raise ValueError('team logo is not installed')
-        image = C.multi_read_png(raw, entry)
+        image = _shared_team_presentation_editor().read_logo(team_uid)
         if request.args.get('display'):
-            image = _ui_fit_preview_crop(image, (320, 180), (286, 156),
-                                         alpha_first=True, threshold=8)
-        out = io.BytesIO(); image.save(out, format='PNG'); out.seek(0)
-        return send_file(out, mimetype='image/png', as_attachment=bool(request.args.get('download')), download_name=f'TEAM_{int(team_uid)}.png', max_age=0)
+            image = _ui_fit_preview_crop(
+                image, (320, 180), (286, 156), alpha_first=True, threshold=8,
+            )
+        out = io.BytesIO()
+        image.save(out, format='PNG')
+        out.seek(0)
+        return send_file(
+            out, mimetype='image/png',
+            as_attachment=bool(request.args.get('download')),
+            download_name=f'TEAM_{int(team_uid)}.png', max_age=0,
+        )
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 404
-
 
 @app.route('/api/teams/logo', methods=['POST'])
 def teams_logo_install_api():
     try:
-        if _extra_game_running():
-            raise RuntimeError('NASCAR15.exe is running. Close the game before changing team logos')
-        team_uid = int(request.form.get('team_uid'))
-        if team_uid in UNSUPPORTED_TEAM_UIDS:
-            raise ValueError('the Dodge spare slot is not supported')
-        _public_custom_team_guard(team_uid, 'install or replace a reserve-team logo')
-        f = request.files.get('file')
-        if not f:
+        upload = request.files.get('file')
+        if not upload:
             raise ValueError('choose a logo image')
-        raw = f.read()
-        if not raw:
-            raise ValueError('logo image is empty')
-        image = Image.open(io.BytesIO(raw)); image.load()
-        fd, temp_path = tempfile.mkstemp(prefix='n15_team_logo_', suffix='.png')
-        os.close(fd)
-        try:
-            with _TEAM_MANAGER_LOCK:
-                g, reg = _extra_game_and_registry()
-                state = _team_state_load()
-                donor = int(state.get('team_logo_donors', {}).get(str(team_uid), TEAM_DEFAULT_LOGO_DONORS.get(team_uid, team_uid)))
-                assets = team_assets_mod()
-                spec = assets.team_logo_spec(g, team_uid, donor)
-                prepared, prep = _prepare_team_logo_auto(
-                    image, (int(spec['width']), int(spec['height'])))
-                prep['native_entry'] = spec.get('entry')
-                prep['native_format'] = spec.get('format')
-                prepared.save(temp_path, 'PNG')
-                snapshot = _team_asset_snapshot(reg)
-                _team_asset_persist_snapshot(snapshot, f"Install or replace TEAM_{team_uid} logo")
-                try:
-                    status = assets.team_asset_status(g, team_uid)
-                    if status.get('logo_ready'):
-                        result = assets.replace_team_logo(g, team_uid, temp_path)
-                    else:
-                        result = assets.ensure_team_logo(g, team_uid, donor, temp_path)
-                    state['team_logo_donors'][str(team_uid)] = donor
-                    _team_state_save(state)
-                except Exception:
-                    restore_errors = _team_asset_restore(snapshot)
-                    if not restore_errors:
-                        _team_asset_clear_persisted_snapshot()
-                    if restore_errors:
-                        raise RuntimeError('team logo install failed; rollback also reported: ' + '; '.join(restore_errors))
-                    raise
-            try: _clear_ui_thumb_cache()
-            except Exception: pass
-            return jsonify(dict(ok=True, verified=True, result=result, preparation=prep,
-                                rollback_available=True))
-        finally:
-            try: os.remove(temp_path)
-            except OSError: pass
+        with tempfile.TemporaryDirectory(prefix='n15_team_logo_upload_') as folder:
+            source = os.path.join(folder, os.path.basename(upload.filename or 'logo.png'))
+            upload.save(source)
+            result = _shared_team_presentation_editor().replace_logo(
+                int(request.form.get('team_uid')), source,
+            )
+        _clear_ui_thumb_cache()
+        return jsonify(result)
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 400
-
 
 @app.route('/api/teams/driver_art/<int:driver_key>/<kind>')
 def teams_driver_art_png(driver_key, kind):
     try:
-        g, _reg = _extra_game_and_registry()
-        driver = _team_driver_by_art_key(driver_key)
-        if not driver:
-            raise ValueError('driver was not found in the current 2015 Cup team catalog')
-        assets = team_assets_mod()
-        resolved = assets.resolve_driver_art_container(
-            g, int(driver['team_uid']), int(driver['driver_uid']))
-        image = assets.read_driver_art_image(
-            g, int(resolved['team_uid']), int(driver['driver_uid']), kind)
+        image = _shared_team_presentation_editor().read_driver_art(driver_key, kind)
         if request.args.get('display'):
             alpha_first = str(kind).lower() not in ('number', '3dnum', 'card')
-            image = _ui_fit_preview_crop(image, (360, 180), (326, 154),
-                                         alpha_first=alpha_first, threshold=8)
-        out = io.BytesIO(); image.save(out, format='PNG'); out.seek(0)
-        filename = f"{assets.driver_art_resource_name(driver['driver_uid'], kind)}.png"
-        response = send_file(out, mimetype='image/png',
-                             as_attachment=bool(request.args.get('download')),
-                             download_name=filename, max_age=0)
-        response.headers['X-N15-Art-Container'] = str(resolved['container'])
+            image = _ui_fit_preview_crop(
+                image, (360, 180), (326, 154),
+                alpha_first=alpha_first, threshold=8,
+            )
+        out = io.BytesIO()
+        image.save(out, format='PNG')
+        out.seek(0)
+        response = send_file(
+            out, mimetype='image/png',
+            as_attachment=bool(request.args.get('download')),
+            download_name=f'DRIVER_{int(driver_key)}_{kind}.png', max_age=0,
+        )
         response.headers['Cache-Control'] = 'no-store, max-age=0'
         return response
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 404
 
-
 @app.route('/api/teams/driver_art', methods=['POST'])
 def teams_driver_art_install_api():
-    temp_path = None
     try:
-        if _extra_game_running():
-            raise RuntimeError('NASCAR15.exe is running. Close the game before changing Driver Select art')
         raw_key = request.form.get('config_uid') or request.form.get('driver_uid')
         if raw_key is None:
             raise ValueError('driver key is missing')
-        driver_key = int(raw_key)
-        kind = str(request.form.get('kind') or '').strip().lower()
-        f = request.files.get('file')
-        if not f:
+        upload = request.files.get('file')
+        if not upload:
             raise ValueError('choose an image')
-        raw = f.read()
-        if not raw:
-            raise ValueError('image is empty')
-        image = Image.open(io.BytesIO(raw)); image.load()
-        with _TEAM_MANAGER_LOCK:
-            g, reg = _extra_game_and_registry()
-            driver = _team_driver_by_art_key(driver_key)
-            if not driver:
-                raise ValueError('driver was not found in the current team catalog')
-            _public_custom_team_guard(int(driver['team_uid']), 'replace Driver Select art for a reserve-team driver')
-            driver_uid = int(driver['driver_uid'])
-            assets = team_assets_mod()
-            art_team_uid = int(driver['team_uid'])
-            art_container = f"2DRIVERSELECTTD_{art_team_uid}.ARC"
-            source_uid = _team_original_source_uid_for_driver(driver)
-            snapshot = _team_asset_snapshot(reg)
-            _team_asset_persist_snapshot(snapshot, f"Replace Driver Select art for {driver.get('car_label')}")
-            try:
-                try:
-                    spec = assets.driver_art_spec(g, art_team_uid, driver_uid, kind)
-                except Exception:
-                    # Missing art must be installed into the CURRENT team, not edited
-                    # in the original-team fallback bank.
-                    liveries = _team_driver_native_livery_uids(g, driver_uid)
-                    installed = assets.ensure_driver_assets(
-                        g, art_team_uid, source_uid, driver_uid, liveries)
-                    installed['transfer_strategy'] = 'public_v1_direct_revision'
-                    # Stable baseline: do not write app-created thumbnails into moved/custom team banks.
-                    spec = assets.driver_art_spec(g, art_team_uid, driver_uid, kind)
-                mode = str(request.form.get('resize_mode') or 'fit').lower()
-                prepared, prep = prepare_import_image(
-                    image, (int(spec['width']), int(spec['height'])), mode,
-                    preserve_alpha=True, background=(0, 0, 0, 0))
-                prep['native_entry'] = spec['entry']; prep['native_format'] = spec['format']
-                prep['art_container'] = art_container
-                if kind in ('number', '3dnum', 'card'):
-                    prep['workflow'] = '3d_number_texture'
-                    prep['kind_label'] = '3D Number Texture'
-                    prep['template_recommended'] = True
-                    sw, sh = map(int, prep.get('source', [0, 0]))
-                    if [sw, sh] != [int(spec['width']), int(spec['height'])]:
-                        prep['note'] = ('Best results come from Export → edit that 512×256 template → Import. '
-                                        'General images are fit onto a transparent 512×256 canvas automatically.')
-                elif kind in ('tile', 'paint', 'driverpaint'):
-                    prep['workflow'] = 'driver_carousel_tile'
-                    prep['kind_label'] = 'Driver Carousel Tile'
-                    prep['native_overlap_tail'] = 64
-                fd, temp_path = tempfile.mkstemp(prefix='n15_driver_art_', suffix='.png')
-                os.close(fd); prepared.save(temp_path, 'PNG')
-                result = assets.replace_driver_art(g, art_team_uid, driver_uid, kind, temp_path)
-            except Exception:
-                restore_errors = _team_asset_restore(snapshot)
-                if not restore_errors:
-                    _team_asset_clear_persisted_snapshot()
-                if restore_errors:
-                    raise RuntimeError('driver art install failed; rollback also reported: ' + '; '.join(restore_errors))
-                raise
-        try: _clear_ui_thumb_cache()
-        except Exception: pass
-        return jsonify(dict(ok=True, verified=True, result=result, preparation=prep,
-                            team_uid=int(driver['team_uid']), art_team_uid=art_team_uid,
-                            art_container=art_container,
-                            config_uid=int(driver['config_uid']), driver_uid=driver_uid,
-                            kind=kind, kind_label=('3D Number Texture' if kind in ('number','3dnum','card') else 'Driver Carousel Tile'),
-                            rollback_available=True))
+        with tempfile.TemporaryDirectory(prefix='n15_driver_art_upload_') as folder:
+            source = os.path.join(folder, os.path.basename(upload.filename or 'art.png'))
+            upload.save(source)
+            result = _shared_team_presentation_editor().replace_driver_art(
+                int(raw_key), str(request.form.get('kind') or ''), source,
+                resize_mode=str(request.form.get('resize_mode') or 'fit'),
+            )
+        _clear_ui_thumb_cache()
+        return jsonify(result)
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 400
-    finally:
-        if temp_path:
-            try: os.remove(temp_path)
-            except OSError: pass
-
 
 @app.route('/api/teams/driver_art/repair', methods=['POST'])
 def teams_driver_art_repair_api():
     try:
-        if _extra_game_running():
-            raise RuntimeError('NASCAR15.exe is running. Close the game before repairing Driver Select art')
         q = request.get_json(force=True) or {}
         raw_key = q.get('config_uid', q.get('driver_uid'))
         if raw_key is None:
             raise ValueError('driver key is missing')
-        driver_key = int(raw_key)
-        with _TEAM_MANAGER_LOCK:
-            g, reg = _extra_game_and_registry()
-            driver = _team_driver_by_art_key(driver_key)
-            if not driver:
-                raise ValueError('driver was not found in the current team catalog')
-            _public_custom_team_guard(int(driver['team_uid']), 'repair Driver Select art for a reserve-team driver')
-            driver_uid = int(driver['driver_uid'])
-            assets = team_assets_mod()
-            destination_uid = int(driver['team_uid'])
-            destination_container = f"2DRIVERSELECTTD_{destination_uid}.ARC"
-            source_uid = _team_original_source_uid_for_driver(driver)
-            snapshot = _team_asset_snapshot(reg)
-            _team_asset_persist_snapshot(snapshot, f"Repair Driver Select art for {driver.get('car_label')}")
-            try:
-                liveries = _team_driver_native_livery_uids(g, driver_uid)
-                result = assets.ensure_driver_assets(
-                    g, destination_uid, source_uid, driver_uid, liveries)
-                result['transfer_strategy'] = 'public_v1_direct_revision'
-                if SPARE_TEAM_PAINT_CREATION_ENABLED:
-                    result['created_thumbnails_rebuilt'] = _team_rebuild_created_thumbnails(
-                        g, driver_uid, destination_uid)
-                    result['created_thumbnail_guard'] = 'spare-team paint creation enabled'
-                else:
-                    result['created_thumbnails_rebuilt'] = []
-                    result['created_thumbnail_guard'] = 'skipped by stable baseline'
-            except Exception:
-                restore_errors = _team_asset_restore(snapshot)
-                if not restore_errors:
-                    _team_asset_clear_persisted_snapshot()
-                if restore_errors:
-                    raise RuntimeError('driver art repair failed; rollback also reported: ' + '; '.join(restore_errors))
-                raise
-        try: _clear_ui_thumb_cache()
-        except Exception: pass
-        repaired_resources = list(dict.fromkeys(
-            list(result.get('resources_added', [])) + list(result.get('resources_repaired', []))))
-        return jsonify(dict(ok=True, verified=True, result=result,
-                            repaired=repaired_resources,
-                            config_uid=int(driver['config_uid']), driver_uid=driver_uid,
-                            team_uid=int(driver['team_uid']),
-                            art_team_uid=destination_uid,
-                            art_container=destination_container,
-                            source_team_uid=source_uid, livery_uids=liveries, rollback_available=True))
+        result = _shared_team_presentation_editor().repair_driver_art(int(raw_key))
+        _clear_ui_thumb_cache()
+        return jsonify(result)
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 400
-
 
 @app.route('/api/teams/restore_assets', methods=['POST'])
 def teams_restore_assets_api():
@@ -18672,16 +10109,10 @@ def teams_restore_assets_api():
         if _extra_game_running():
             raise RuntimeError('NASCAR15.exe is running. Close the game before restoring team assets')
         with _TEAM_MANAGER_LOCK:
-            _g, reg = _extra_game_and_registry()
-            snap, meta = _team_asset_load_persisted_snapshot(reg)
-            errors = _team_asset_restore(snap)
-            if errors:
-                raise RuntimeError('team asset rollback reported: ' + '; '.join(errors))
-            _team_asset_clear_persisted_snapshot()
+            result = _shared_team_presentation_recovery().restore()
             try: _clear_ui_thumb_cache()
             except Exception: pass
-            return jsonify(dict(ok=True, verified=True, restored=meta.get('label'),
-                                created=meta.get('created')))
+            return jsonify(result)
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 400
 
@@ -18689,124 +10120,20 @@ def teams_restore_assets_api():
 @app.route('/api/teams/repair_legacy', methods=['POST'])
 def teams_repair_legacy_api():
     try:
-        with _TEAM_MANAGER_LOCK:
-            result = _team_reapply_saved_links()
-            return jsonify(dict(ok=True, verified=True, result=result,
-                                note='Removed the unsafe late ApplyPatch team hook and reapplied saved links through the stock STORE_ATTR operands.'))
+        return jsonify(_shared_team_presentation_editor().repair_saved_links())
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 400
-
-
-
-def _team_history_matches_persisted_rollback(item, meta):
-    """True only when the one-level archive snapshot belongs to this history item."""
-    if not item or not meta:
-        return False
-    item_label = str(item.get('rollback_label') or '').strip()
-    meta_label = str(meta.get('label') or '').strip()
-    if not item_label or item_label != meta_label:
-        return False
-    item_epoch = float(item.get('rollback_created_epoch') or 0.0)
-    meta_epoch = float(meta.get('created_epoch') or 0.0)
-    if item_epoch and meta_epoch:
-        return abs(item_epoch - meta_epoch) < 0.01
-    item_created = str(item.get('rollback_created') or '').strip()
-    meta_created = str(meta.get('created') or '').strip()
-    return bool(item_created and item_created == meta_created)
-
 
 
 @app.route('/api/teams/undo', methods=['POST'])
 def teams_undo_api():
     try:
-        if _extra_game_running():
-            raise RuntimeError('NASCAR15.exe is running. Close the game before undoing a team change')
-        with _TEAM_MANAGER_LOCK:
-            state = _team_state_load()
-            history = state.get('history', [])
-            if not history:
-                raise ValueError('there is no team edit to undo')
-            item = history[-1]
-            kind = item.get('kind')
-            uid = int(item['uid'])
-            if kind == 'team_name':
-                old_name = str(item.get('old_name') or '').strip()
-                new_name = str(item.get('new_name') or '').strip()
-                if not old_name or not new_name:
-                    raise ValueError('the latest team-name history entry is incomplete')
-                _g, reg = registry()
-                patched = 0
-                if int(item.get('patched', 1) or 0) > 0 or item.get('game_text_patched'):
-                    try:
-                        patched = patch_name_exp(reg, new_name, old_name)
-                    except Exception:
-                        patched = 0
-                original = TEAM_DISPLAY_NAMES.get(uid, old_name)
-                if old_name == original:
-                    state.get('team_names', {}).pop(str(uid), None)
-                else:
-                    state.setdefault('team_names', {})[str(uid)] = old_name
-                cfg = load_cfg(); cfg.setdefault('renames', {})[original] = old_name; save_cfg(cfg)
-                history.pop(); state['history'] = history; _team_state_save(state)
-                return jsonify(dict(ok=True, verified=True, undone=item, result=dict(changed=True, patched=patched)))
-            old_uid = int(item['old_uid'])
-
-            # A move/manufacturer operation can append resources and relocate the
-            # live database.  When its matching one-level snapshot still exists,
-            # restore the complete archive/CDF/state transaction instead of merely
-            # flipping the database link back and leaving dormant appended data.
-            manifest_path = os.path.join(TEAM_ASSET_ROLLBACK_DIR, 'manifest.json')
-            if os.path.exists(manifest_path):
-                try:
-                    rollback_meta = json.load(open(manifest_path, 'r', encoding='utf-8'))
-                except Exception as ex:
-                    raise ValueError('the saved team undo checkpoint is unreadable: ' + str(ex))
-                if _team_history_matches_persisted_rollback(item, rollback_meta):
-                    _g, rollback_reg = _extra_game_and_registry()
-                    snap, restored_meta = _team_asset_load_persisted_snapshot(rollback_reg)
-                    restore_errors = _team_asset_restore(snap)
-                    if restore_errors:
-                        raise RuntimeError('exact team undo reported: ' + '; '.join(restore_errors))
-                    _team_asset_clear_persisted_snapshot()
-                    try: _clear_ui_thumb_cache()
-                    except Exception: pass
-                    return jsonify(dict(ok=True, verified=True, exact=True, undone=item,
-                                        restored=restored_meta.get('label'),
-                                        created=restored_meta.get('created'),
-                                        note='Restored the exact pre-change archives, CDF indexes, and app state.'))
-                # A newer art/logo/repair operation owns the one-level checkpoint.
-                # Do not consume it or pretend a DB-only reversal is the same thing.
-                raise ValueError(
-                    'A newer team-art or presentation change has the active undo checkpoint: ' +
-                    str(rollback_meta.get('label') or 'unknown change') +
-                    '. Undo that change first, then retry the team-history undo.')
-
-            if kind == 'driver_team':
-                if _public_custom_team_locked(old_uid):
-                    raise ValueError(PUBLIC_CUSTOM_TEAM_MESSAGE + ' Undo would move the driver back into a reserve team.')
-                driver = _team_driver_by_config_uid(uid)
-                created_uids = [int(x) for x in ((driver or {}).get('created_scheme_uids') or [])]
-                current_uid = int((driver or {}).get('team_uid', -1))
-                if current_uid != old_uid and created_uids:
-                    raise ValueError(
-                        'Cannot undo this yet — the driver has extra paint slots you added: ' +
-                        ', '.join(map(str, created_uids)) +
-                        '. Undoing the team link would bypass the protected thumbnail migration path.')
-                change = dict(class_name='DRIVERCONFIG_c', uid=uid, field='TEAM', target_uid=old_uid)
-                state['driver_teams'][str(uid)] = old_uid
-            elif kind == 'team_manufacturer':
-                change = dict(class_name='RACETEAM_c', uid=uid, field='MANUFACTURER', target_uid=old_uid)
-                state['team_manufacturers'][str(uid)] = old_uid
-            else:
-                raise ValueError('the latest history entry cannot be undone')
-            result = _team_install_changes([change], 'Undo team editor change')
-            history.pop()
-            state['history'] = history
-            _team_state_save(state)
-            return jsonify(dict(ok=True, verified=True, exact=False, undone=item, result=result,
-                                note='The original exact checkpoint was unavailable; the live database link was reversed transactionally.'))
+        result = _shared_team_presentation_editor().undo()
+        _clear_ui_thumb_cache()
+        return jsonify(result)
     except Exception as ex:
         return jsonify(dict(ok=False, error=str(ex))), 400
+
 
 # ==================== end v0.9.30.5 ====================
 
